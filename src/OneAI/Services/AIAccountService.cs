@@ -1,4 +1,5 @@
 ﻿using Microsoft.EntityFrameworkCore;
+using OneAI.Constants;
 using OneAI.Data;
 using OneAI.Entities;
 using OneAI.Models;
@@ -522,5 +523,279 @@ public class AIAccountService
             LastUsedAt = account.LastUsedAt,
             UsageCount = account.UsageCount
         };
+    }
+
+    /// <summary>
+    /// 刷新 OpenAI 账户的配额状态
+    /// </summary>
+    /// <param name="id">账户 ID</param>
+    /// <returns>账户配额状态，如果账户不存在或刷新失败则返回 null</returns>
+    public async Task<AccountQuotaStatusDto?> RefreshOpenAIQuotaStatusAsync(int id)
+    {
+        var account = await _appDbContext.AIAccounts.FindAsync(id);
+        if (account == null)
+        {
+            _logger.LogWarning("尝试刷新不存在的账户 {AccountId} 的配额状态", id);
+            return null;
+        }
+
+        if (account.Provider != "OpenAI")
+        {
+            _logger.LogWarning("账户 {AccountId} 不是 OpenAI 账户，无法刷新 OpenAI 配额", id);
+            return null;
+        }
+
+        try
+        {
+            var accessToken = account.GetOpenAiOauth()!.AccessToken;
+            var address = string.IsNullOrEmpty(account.BaseUrl)
+                ? "https://chatgpt.com/backend-api/codex"
+                : account.BaseUrl;
+
+            // 构造一个简单的请求来获取配额信息
+            var headers = new Dictionary<string, string>
+            {
+                { "Authorization", "Bearer " + accessToken },
+                { "User-Agent", "codex_cli_rs/0.76.0 (Windows 10.0.26200; x86_64) vscode/1.105.1" },
+                { "openai-beta", "responses=experimental" },
+                { "originator", "codex_cli_rs" }
+            };
+
+            using var httpClient = new HttpClient();
+            httpClient.DefaultRequestHeaders.Clear();
+            foreach (var header in headers)
+            {
+                httpClient.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value);
+            }
+
+            // 发送一个简单的 HEAD 请求来获取配额头信息
+            var response = await httpClient.GetAsync($"{address.TrimEnd('/')}/responses");
+
+            // 提取配额信息
+            var quotaInfo = AccountQuotaCacheService.ExtractFromHeaders(account.Id, response.Headers);
+            if (quotaInfo != null)
+            {
+                _quotaCache.UpdateQuota(quotaInfo);
+
+                _logger.LogInformation(
+                    "成功刷新账户 {AccountId} 的 OpenAI 配额状态",
+                    account.Id);
+
+                return new AccountQuotaStatusDto
+                {
+                    AccountId = account.Id,
+                    HasCacheData = true,
+                    HealthScore = quotaInfo.GetHealthScore(),
+                    PrimaryUsedPercent = quotaInfo.PrimaryUsedPercent,
+                    SecondaryUsedPercent = quotaInfo.SecondaryUsedPercent,
+                    PrimaryResetAfterSeconds = quotaInfo.PrimaryResetAfterSeconds,
+                    SecondaryResetAfterSeconds = quotaInfo.SecondaryResetAfterSeconds,
+                    StatusDescription = quotaInfo.GetStatusDescription(),
+                    LastUpdatedAt = quotaInfo.LastUpdatedAt
+                };
+            }
+
+            _logger.LogWarning("无法从响应头提取账户 {AccountId} 的配额信息", account.Id);
+            return new AccountQuotaStatusDto
+            {
+                AccountId = account.Id,
+                HasCacheData = false
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "刷新账户 {AccountId} 的 OpenAI 配额状态失败", id);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 刷新 Gemini Antigravity 账户的配额状态
+    /// </summary>
+    /// <param name="id">账户 ID</param>
+    /// <returns>账户配额状态，如果账户不存在或刷新失败则返回 null</returns>
+    public async Task<AccountQuotaStatusDto?> RefreshAntigravityQuotaStatusAsync(int id)
+    {
+        var account = await _appDbContext.AIAccounts.FindAsync(id);
+        if (account == null)
+        {
+            _logger.LogWarning("尝试刷新不存在的账户 {AccountId} 的配额状态", id);
+            return null;
+        }
+
+        if (account.Provider != AIProviders.GeminiAntigravity)
+        {
+            _logger.LogWarning("账户 {AccountId} 不是 Gemini Antigravity 账户，无法刷新配额", id);
+            return null;
+        }
+
+        try
+        {
+            var geminiOauth = account.GetGeminiOauth();
+            if (geminiOauth == null)
+            {
+                _logger.LogWarning("账户 {AccountId} 没有 Gemini OAuth 凭证", id);
+                return null;
+            }
+
+            var accessToken = geminiOauth.Token;
+            if (string.IsNullOrEmpty(accessToken))
+            {
+                _logger.LogWarning("账户 {AccountId} 的 Access Token 为空", id);
+                return null;
+            }
+
+            // 调用 Antigravity API 获取配额信息
+            var apiUrl = $"{Services.GeminiOAuth.GeminiAntigravityOAuthConfig.AntigravityApiUrl}/v1internal:fetchAvailableModels";
+
+            using var httpClient = new HttpClient();
+            httpClient.DefaultRequestHeaders.Clear();
+            httpClient.DefaultRequestHeaders.Add("User-Agent", Services.GeminiOAuth.GeminiAntigravityOAuthConfig.UserAgent);
+            httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {accessToken}");
+            httpClient.Timeout = TimeSpan.FromSeconds(30);
+
+            var requestContent = new StringContent("{}", System.Text.Encoding.UTF8, "application/json");
+            var response = await httpClient.PostAsync(apiUrl, requestContent);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorBody = await response.Content.ReadAsStringAsync();
+                _logger.LogError("Antigravity API 返回错误 {StatusCode}: {Error}",
+                    (int)response.StatusCode, errorBody);
+                return null;
+            }
+
+            var responseBody = await response.Content.ReadAsStringAsync();
+            using var jsonDoc = System.Text.Json.JsonDocument.Parse(responseBody);
+            var root = jsonDoc.RootElement;
+
+            // 解析 models 字段获取配额信息
+            if (!root.TryGetProperty("models", out var modelsElement) || modelsElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+            {
+                _logger.LogWarning("Antigravity API 响应中没有 models 字段");
+                return new AccountQuotaStatusDto
+                {
+                    AccountId = account.Id,
+                    HasCacheData = false
+                };
+            }
+
+            // 查找第一个包含 quotaInfo 的模型（优先选择 gemini 开头的模型）
+            string? selectedModel = null;
+            double remainingFraction = 0;
+            string? resetTimeRaw = null;
+
+            // 第一遍：查找 gemini 开头的模型
+            foreach (var modelProperty in modelsElement.EnumerateObject())
+            {
+                if (modelProperty.Name.ToLower().StartsWith("gemini") &&
+                    modelProperty.Value.TryGetProperty("quotaInfo", out var quotaInfo))
+                {
+                    selectedModel = modelProperty.Name;
+                    if (quotaInfo.TryGetProperty("remainingFraction", out var remaining))
+                    {
+                        remainingFraction = remaining.GetDouble();
+                    }
+                    if (quotaInfo.TryGetProperty("resetTime", out var resetTime))
+                    {
+                        resetTimeRaw = resetTime.GetString();
+                    }
+                    break;
+                }
+            }
+
+            // 第二遍：如果没找到 gemini 模型，使用第一个有 quotaInfo 的模型
+            if (selectedModel == null)
+            {
+                foreach (var modelProperty in modelsElement.EnumerateObject())
+                {
+                    if (modelProperty.Value.TryGetProperty("quotaInfo", out var quotaInfo))
+                    {
+                        selectedModel = modelProperty.Name;
+                        if (quotaInfo.TryGetProperty("remainingFraction", out var remaining))
+                        {
+                            remainingFraction = remaining.GetDouble();
+                        }
+                        if (quotaInfo.TryGetProperty("resetTime", out var resetTime))
+                        {
+                            resetTimeRaw = resetTime.GetString();
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if (selectedModel == null)
+            {
+                _logger.LogWarning("Antigravity API 响应中没有找到包含配额信息的模型");
+                return new AccountQuotaStatusDto
+                {
+                    AccountId = account.Id,
+                    HasCacheData = false
+                };
+            }
+
+            // 计算配额百分比
+            remainingFraction = Math.Max(0, Math.Min(1, remainingFraction));
+            var remainingPercent = (int)Math.Round(remainingFraction * 100);
+            var usedPercent = (int)Math.Round((1 - remainingFraction) * 100);
+            var healthScore = Math.Max(0, Math.Min(100, 100 - usedPercent));
+
+            // 计算重置时间（秒）
+            int? resetAfterSeconds = null;
+            if (!string.IsNullOrEmpty(resetTimeRaw))
+            {
+                try
+                {
+                    var resetTime = DateTime.Parse(resetTimeRaw.Replace("Z", "+00:00"));
+                    var delta = resetTime.ToUniversalTime() - DateTime.UtcNow;
+                    resetAfterSeconds = Math.Max(0, (int)delta.TotalSeconds);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "解析重置时间失败: {ResetTime}", resetTimeRaw);
+                }
+            }
+
+            // 构建状态描述
+            var statusDescription = $"{selectedModel} 剩余 {remainingPercent}%";
+            if (resetAfterSeconds.HasValue && resetAfterSeconds > 0)
+            {
+                var hours = resetAfterSeconds.Value / 3600;
+                var minutes = (resetAfterSeconds.Value % 3600) / 60;
+                if (hours > 0)
+                {
+                    statusDescription += $" ({hours}小时{minutes}分钟后重置)";
+                }
+                else
+                {
+                    statusDescription += $" ({minutes}分钟后重置)";
+                }
+            }
+
+            _logger.LogInformation(
+                "成功刷新账户 {AccountId} 的 Antigravity 配额状态: {Status}",
+                account.Id, statusDescription);
+
+            // 注意：Antigravity 的配额系统与 OpenAI 不同
+            // 这里我们将 remaining 映射到 Primary，并设置合理的重置时间
+            return new AccountQuotaStatusDto
+            {
+                AccountId = account.Id,
+                HasCacheData = true,
+                HealthScore = healthScore,
+                PrimaryUsedPercent = usedPercent,
+                SecondaryUsedPercent = usedPercent,
+                PrimaryResetAfterSeconds = resetAfterSeconds ?? 0,
+                SecondaryResetAfterSeconds = resetAfterSeconds ?? 0,
+                StatusDescription = statusDescription,
+                LastUpdatedAt = DateTime.UtcNow
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "刷新账户 {AccountId} 的 Antigravity 配额状态失败", id);
+            return null;
+        }
     }
 }

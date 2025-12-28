@@ -20,10 +20,10 @@ public class OAuthTokenRefreshBackgroundService(
     : BackgroundService
 {
     // 检查间隔：每 5 分钟检查一次
-    private readonly TimeSpan _checkInterval = TimeSpan.FromMinutes(5);
+    private readonly TimeSpan _checkInterval = TimeSpan.FromMinutes(1);
 
     // 提前刷新时间：当 token 还有 1 小时过期时就开始刷新
-    private readonly TimeSpan _refreshThreshold = TimeSpan.FromHours(1);
+    private readonly TimeSpan _refreshThreshold = TimeSpan.FromMinutes(30);
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -56,10 +56,12 @@ public class OAuthTokenRefreshBackgroundService(
         var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
         var openAiOAuthService = scope.ServiceProvider.GetRequiredService<OpenAIOAuthService>();
         var geminiOAuthService = scope.ServiceProvider.GetRequiredService<GeminiOAuthService>();
+        var geminiAntigravityOAuthService = scope.ServiceProvider.GetRequiredService<GeminiAntigravityOAuthService>();
 
         // 获取所有启用的 OAuth 账户（OpenAI 和 Gemini）
         var oauthAccounts = await dbContext.AIAccounts
-            .Where(a => (a.Provider == AIProviders.OpenAI || a.Provider == AIProviders.Gemini) && a.IsEnabled)
+            .Where(a => (a.Provider == AIProviders.OpenAI || a.Provider == AIProviders.Gemini ||
+                         a.Provider == AIProviders.GeminiAntigravity) && a.IsEnabled)
             .ToListAsync(cancellationToken);
 
         if (!oauthAccounts.Any())
@@ -91,6 +93,10 @@ public class OAuthTokenRefreshBackgroundService(
                 else if (account.Provider == AIProviders.Gemini)
                 {
                     result = await ProcessGeminiAccount(account, geminiOAuthService);
+                }
+                else if (account.Provider == AIProviders.GeminiAntigravity)
+                {
+                    result = await ProcessGeminiAntigravityAccount(account, geminiAntigravityOAuthService);
                 }
                 else
                 {
@@ -185,6 +191,94 @@ public class OAuthTokenRefreshBackgroundService(
         {
             logger.LogDebug(
                 "OpenAI 账户 {AccountId} ({Name}) Token 尚未到刷新阈值，跳过 (剩余: {Minutes} 分钟, 阈值: {Threshold} 分钟)",
+                account.Id,
+                account.Name ?? "未命名",
+                timeUntilExpiry.TotalMinutes,
+                _refreshThreshold.TotalMinutes);
+            return new ProcessResult(Refreshed: false, Skipped: true, Error: false);
+        }
+    }
+
+    private async Task<ProcessResult> ProcessGeminiAntigravityAccount(
+        AIAccount account,
+        GeminiAntigravityOAuthService geminiAntigravityOAuthService)
+    {
+        var oauthData = account.GetGeminiOauth();
+
+        if (oauthData == null || string.IsNullOrEmpty(oauthData.RefreshToken))
+        {
+            return new ProcessResult(Refreshed: false, Skipped: true, Error: false);
+        }
+
+
+        // 检查 token 是否即将过期
+        // Gemini OAuth 存储的是 ISO 8601 格式的过期时间
+        if (string.IsNullOrEmpty(oauthData.Expiry))
+        {
+            return new ProcessResult(Refreshed: false, Skipped: true, Error: false);
+        }
+
+        DateTime expiresAt;
+        try
+        {
+            expiresAt = DateTime.Parse(oauthData.Expiry).ToUniversalTime();
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(
+                ex,
+                "Gemini 账户 {AccountId} ({Name}) 过期时间格式无效: {Expiry}，跳过",
+                account.Id,
+                account.Name ?? "未命名",
+                oauthData.Expiry);
+            return new ProcessResult(Refreshed: false, Skipped: true, Error: false);
+        }
+
+        var now = DateTime.UtcNow;
+        var timeUntilExpiry = expiresAt - now;
+
+        logger.LogDebug(
+            "Gemini 账户 {AccountId} ({Name}) Token 将在 {Minutes} 分钟后过期 (过期时间: {ExpiresAt})",
+            account.Id,
+            account.Name ?? "未命名",
+            timeUntilExpiry.TotalMinutes,
+            expiresAt);
+
+        // 如果 token 即将过期（或已过期），则刷新
+        if (timeUntilExpiry <= _refreshThreshold)
+        {
+            logger.LogInformation(
+                "Gemini 账户 {AccountId} ({Name}) 的 Token 即将过期，开始刷新... (剩余时间: {Minutes} 分钟)",
+                account.Id,
+                account.Name ?? "未命名",
+                timeUntilExpiry.TotalMinutes);
+
+            try
+            {
+                await geminiAntigravityOAuthService.RefreshGeminiAntigravityOAuthTokenAsync(account);
+
+                logger.LogInformation(
+                    "成功刷新 Gemini 账户 {AccountId} ({Name}) 的 OAuth Token",
+                    account.Id,
+                    account.Name ?? "未命名");
+
+                return new ProcessResult(Refreshed: true, Skipped: false, Error: false);
+            }
+            catch (Exception ex)
+            {
+                logger.LogError(
+                    ex,
+                    "刷新 Gemini 账户 {AccountId} ({Name}) 的 OAuth Token 失败",
+                    account.Id,
+                    account.Name ?? "未命名");
+
+                return new ProcessResult(Refreshed: false, Skipped: false, Error: true);
+            }
+        }
+        else
+        {
+            logger.LogDebug(
+                "Gemini 账户 {AccountId} ({Name}) Token 尚未到刷新阈值，跳过 (剩余: {Minutes} 分钟, 阈值: {Threshold} 分钟)",
                 account.Id,
                 account.Name ?? "未命名",
                 timeUntilExpiry.TotalMinutes,

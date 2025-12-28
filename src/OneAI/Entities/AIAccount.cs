@@ -34,7 +34,7 @@ public class AIAccount
     /// 邮箱
     /// </summary>
     public string? Email { get; set; }
-    
+
     /// <summary>
     /// 基础 URL（可选，用于自定义 API 端点）
     /// </summary>
@@ -103,7 +103,8 @@ public class AIAccount
 
     public GeminiOAuthCredentialsDto? GetGeminiOauth()
     {
-        if (string.IsNullOrEmpty(OAuthToken) || Provider != AIProviders.Gemini)
+        if (string.IsNullOrEmpty(OAuthToken) ||
+            (Provider != AIProviders.Gemini && Provider != AIProviders.GeminiAntigravity))
         {
             return null;
         }

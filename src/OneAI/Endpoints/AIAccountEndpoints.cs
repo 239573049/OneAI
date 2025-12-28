@@ -54,6 +54,26 @@ public static class AIAccountEndpoints
             .Produces<ApiResponse<Dictionary<int, AccountQuotaStatusDto>>>(200)
             .Produces<ApiResponse>(401)
             .Produces<ApiResponse>(500);
+
+        // 刷新 OpenAI 账户配额状态
+        group.MapPost("/{id}/refresh-openai-quota", RefreshOpenAIQuotaStatus)
+            .WithName("RefreshOpenAIQuotaStatus")
+            .WithSummary("刷新OpenAI账户配额状态")
+            .WithDescription("手动刷新指定OpenAI账户的配额状态信息")
+            .Produces<ApiResponse<AccountQuotaStatusDto>>(200)
+            .Produces<ApiResponse>(401)
+            .Produces<ApiResponse>(404)
+            .Produces<ApiResponse>(500);
+
+        // 刷新 Gemini Antigravity 账户配额状态
+        group.MapPost("/{id}/refresh-antigravity-quota", RefreshAntigravityQuotaStatus)
+            .WithName("RefreshAntigravityQuotaStatus")
+            .WithSummary("刷新Gemini Antigravity账户配额状态")
+            .WithDescription("手动刷新指定Gemini Antigravity账户的配额状态信息")
+            .Produces<ApiResponse<AccountQuotaStatusDto>>(200)
+            .Produces<ApiResponse>(401)
+            .Produces<ApiResponse>(404)
+            .Produces<ApiResponse>(500);
     }
 
     /// <summary>
@@ -129,6 +149,52 @@ public static class AIAccountEndpoints
         catch (Exception ex)
         {
             return ApiResponse<Dictionary<int, AccountQuotaStatusDto>>.Fail($"获取配额状态失败: {ex.Message}", 500);
+        }
+    }
+
+    /// <summary>
+    /// 刷新 OpenAI 账户配额状态
+    /// </summary>
+    private static async Task<ApiResponse<AccountQuotaStatusDto>> RefreshOpenAIQuotaStatus(
+        int id,
+        AIAccountService accountService)
+    {
+        try
+        {
+            var status = await accountService.RefreshOpenAIQuotaStatusAsync(id);
+            if (status == null)
+            {
+                return ApiResponse<AccountQuotaStatusDto>.Fail("账户不存在或刷新失败", 404);
+            }
+
+            return ApiResponse<AccountQuotaStatusDto>.Success(status, "刷新配额状态成功");
+        }
+        catch (Exception ex)
+        {
+            return ApiResponse<AccountQuotaStatusDto>.Fail($"刷新配额状态失败: {ex.Message}", 500);
+        }
+    }
+
+    /// <summary>
+    /// 刷新 Gemini Antigravity 账户配额状态
+    /// </summary>
+    private static async Task<ApiResponse<AccountQuotaStatusDto>> RefreshAntigravityQuotaStatus(
+        int id,
+        AIAccountService accountService)
+    {
+        try
+        {
+            var status = await accountService.RefreshAntigravityQuotaStatusAsync(id);
+            if (status == null)
+            {
+                return ApiResponse<AccountQuotaStatusDto>.Fail("账户不存在或刷新失败", 404);
+            }
+
+            return ApiResponse<AccountQuotaStatusDto>.Success(status, "刷新配额状态成功");
+        }
+        catch (Exception ex)
+        {
+            return ApiResponse<AccountQuotaStatusDto>.Fail($"刷新配额状态失败: {ex.Message}", 500);
         }
     }
 }

@@ -21,7 +21,13 @@
       "Bash(findstr:*)",
       "Bash(taskkill:*)",
       "Bash(cmd //c \"taskkill /F /IM OneAI.exe\")",
-      "Bash(dotnet clean:*)"
+      "Bash(dotnet clean:*)",
+      "Bash(npm run dev:*)",
+      "Bash(timeout 10 cmd /c \"ping 127.0.0.1 -n 6 > nul && netstat -ano | findstr :5124\")",
+      "Bash(cmd //c \"taskkill /F /IM OneAI.exe 2>nul\")",
+      "Bash(cmd //c \"taskkill /F /PID 42880\")",
+      "Bash(git add:*)",
+      "Bash(docker build:*)"
     ]
   }
 }

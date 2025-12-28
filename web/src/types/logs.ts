@@ -87,3 +87,54 @@ export interface LogStatistics {
     end: string;
   };
 }
+
+// 每小时总体统计DTO
+export interface HourlySummaryDto {
+  hourStartTime: string;
+  totalRequests: number;
+  successRequests: number;
+  failedRequests: number;
+  successRate: number;
+  totalTokens: number;
+  avgDurationMs: number;
+  p95DurationMs?: number;
+}
+
+// 按模型分组的小时统计DTO
+export interface HourlyByModelDto {
+  hourStartTime: string;
+  model: string;
+  provider?: string;
+  totalRequests: number;
+  successRequests: number;
+  successRate: number;
+  totalTokens: number;
+  avgDurationMs: number;
+}
+
+// 按账户分组的小时统计DTO
+export interface HourlyByAccountDto {
+  hourStartTime: string;
+  accountId: number;
+  accountName?: string;
+  provider?: string;
+  totalRequests: number;
+  successRequests: number;
+  successRate: number;
+  totalTokens: number;
+  rateLimitedRequests: number;
+}
+
+// 聚合统计信息
+export interface AggregatedStatistics {
+  totalRequests: number;
+  successRequests: number;
+  failedRequests: number;
+  successRate: number;
+  totalTokens: number;
+  avgDurationMs: number;
+  timeRange: {
+    start: string;
+    end: string;
+  };
+}

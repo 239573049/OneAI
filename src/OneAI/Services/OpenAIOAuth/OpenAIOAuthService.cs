@@ -120,7 +120,7 @@ public class OpenAIOAuthService(
             RefreshToken = refreshResponse.RefreshToken,
             AccessToken = refreshResponse.AccessToken,
             Scopes = account.GetOpenAiOauth().Scopes,
-            ExpiresAt = refreshResponse.ExpiresIn,
+            ExpiresAt = DateTimeOffset.Now.ToUnixTimeSeconds() + refreshResponse.ExpiresIn,
             IsMax = true,
             UserInfo = account.GetOpenAiOauth().UserInfo,
         });

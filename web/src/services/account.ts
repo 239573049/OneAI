@@ -32,6 +32,20 @@ export const accountService = {
   getAccountQuotaStatuses(accountIds: number[]): Promise<Record<number, AccountQuotaStatus>> {
     return post<Record<number, AccountQuotaStatus>>('/accounts/quota-statuses', accountIds)
   },
+
+  /**
+   * 刷新 OpenAI 账户配额状态
+   */
+  refreshOpenAIQuotaStatus(accountId: number): Promise<AccountQuotaStatus> {
+    return post<AccountQuotaStatus>(`/accounts/${accountId}/refresh-openai-quota`, {})
+  },
+
+  /**
+   * 刷新 Antigravity 账户配额状态
+   */
+  refreshAntigravityQuotaStatus(accountId: number): Promise<AccountQuotaStatus> {
+    return post<AccountQuotaStatus>(`/accounts/${accountId}/refresh-antigravity-quota`, {})
+  },
 }
 
 /**
@@ -61,6 +75,27 @@ export const openaiOAuthService = {
 export const geminiOAuthService = {
   /**
    * 生成 Gemini OAuth 授权链接
+   */
+  generateOAuthUrl(proxy?: any): Promise<GenerateOAuthUrlResponse> {
+    return post<GenerateOAuthUrlResponse>('/gemini/oauth/authorize', {
+      proxy: proxy || null
+    })
+  },
+
+  /**
+   * 交换授权码获取 Token 并创建账户
+   */
+  exchangeOAuthCode(request: ExchangeOAuthCodeRequest): Promise<AIAccountDto> {
+    return post<AIAccountDto>('/gemini/oauth/callback', request)
+  },
+}
+
+/**
+ * Gemini Antigravity OAuth 服务
+ */
+export const geminiAntigravityOAuthService = {
+  /**
+   * 生成 Gemini Antigravity OAuth 授权链接
    */
   generateOAuthUrl(proxy?: any): Promise<GenerateOAuthUrlResponse> {
     return post<GenerateOAuthUrlResponse>('/gemini/oauth/authorize', {

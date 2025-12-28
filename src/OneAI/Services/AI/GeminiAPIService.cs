@@ -7,6 +7,7 @@ using OneAI.Services.Logging;
 using System.Net;
 using System.Text.Json;
 using OneAI.Services.AI.Gemini;
+using OneAI.Services.GeminiOAuth;
 
 namespace OneAI.Services.AI;
 
@@ -17,7 +18,8 @@ public class GeminiAPIService(
     AccountQuotaCacheService quotaCache,
     AIRequestLogService requestLogService,
     ILogger<GeminiAPIService> logger,
-    IConfiguration configuration)
+    IConfiguration configuration,
+    GeminiOAuthService geminiOAuthService)
 {
     // 静态HttpClient实例 - 避免套接字耗尽，提高性能
     private static readonly HttpClient HttpClient = new();
@@ -82,7 +84,7 @@ public class GeminiAPIService(
                     if (lastAccountId.HasValue)
                     {
                         account = await aiAccountService.TryGetAccountById(lastAccountId.Value);
-                        if (account != null && account.Provider == AIProviders.Gemini)
+                        if (account is { Provider: AIProviders.Gemini })
                         {
                             sessionStickinessUsed = true;
                             logger.LogInformation(
@@ -127,7 +129,7 @@ public class GeminiAPIService(
 
                 AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
 
-                var geminiOAuth = account.GetGeminiOauth();
+                var geminiOAuth = await GetValidGeminiOAuthAsync(account, aiAccountService);
                 if (geminiOAuth == null)
                 {
                     if (!string.IsNullOrEmpty(lastErrorMessage))
@@ -136,10 +138,15 @@ public class GeminiAPIService(
                         return;
                     }
 
-                    lastErrorMessage = $"账户 {account.Id} 没有有效的 Gemini OAuth 凭证";
+                    lastErrorMessage = $"账户 {account.Id} Gemini Token 无效或已过期且刷新失败";
                     lastStatusCode = HttpStatusCode.Unauthorized;
 
                     logger.LogWarning(lastErrorMessage);
+
+                    if (attempt < maxRetries)
+                    {
+                        continue;
+                    }
 
                     break;
                 }
@@ -152,14 +159,18 @@ public class GeminiAPIService(
                                                  "Gemini CodeAssistEndpoint is not configured");
                     var action = "generateContent";
                     var url = $"{codeAssistEndpoint}/v1internal:{action}";
+                    var userAgent = GetUserAgent();
 
-                    var response = await SendGeminiRequest(
+                    using var response = await SendGeminiRequest(
                         url,
                         input,
                         geminiOAuth.Token,
                         geminiOAuth.ProjectId,
                         model,
-                        isStream: false);
+                        isStream: false,
+                        userAgent: userAgent);
+
+                    var timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
 
                     await requestLogService.UpdateRetry(logId, attempt, account.Id);
 
@@ -222,25 +233,91 @@ public class GeminiAPIService(
                         "成功处理 Gemini 请求 (账户: {AccountId}, 模型: {Model}, 尝试: {Attempt}/{MaxRetries})",
                         account.Id,
                         model,
-                        attempt,maxRetries);
+                        attempt, maxRetries);
 
                     if (!string.IsNullOrEmpty(conversationId))
                     {
                         quotaCache.SetConversationAccount(conversationId, account.Id);
                     }
 
-                    await requestLogService.RecordSuccess(
-                        logId,
-                        stopwatch,
-                        (int)response.StatusCode,
-                        timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
+                    var responseText = await response.Content.ReadAsStringAsync(context.RequestAborted);
+                    if (!TryParseJson(responseText, out var doc))
+                    {
+                        lastErrorMessage = "Gemini 响应不是有效的 JSON";
+                        lastStatusCode = HttpStatusCode.BadGateway;
 
-                    // 流式传输响应
-                    context.Response.ContentType = "application/json";
-                    context.Response.StatusCode = (int)response.StatusCode;
+                        logger.LogError(
+                            "Gemini 响应不是有效的 JSON (账户: {AccountId}, 尝试: {Attempt}/{MaxRetries}): {Body}",
+                            account.Id,
+                            attempt,
+                            maxRetries,
+                            responseText);
 
-                    await response.Content.CopyToAsync(context.Response.Body);
-                    return;
+                        if (attempt < maxRetries)
+                        {
+                            continue;
+                        }
+
+                        await requestLogService.RecordFailure(
+                            logId,
+                            stopwatch,
+                            (int)lastStatusCode,
+                            lastErrorMessage);
+
+                        break;
+                    }
+
+                    using (doc)
+                    {
+                        if (!TryGetResponseAndCandidate(doc.RootElement, out var responseElement, out var candidate))
+                        {
+                            lastErrorMessage = "Gemini 响应缺少 response/candidates 字段";
+                            lastStatusCode = HttpStatusCode.BadGateway;
+
+                            logger.LogError(
+                                "Gemini 响应缺少 response/candidates 字段 (账户: {AccountId}, 尝试: {Attempt}/{MaxRetries}): {Body}",
+                                account.Id,
+                                attempt,
+                                maxRetries,
+                                responseText);
+
+                            if (attempt < maxRetries)
+                            {
+                                continue;
+                            }
+
+                            await requestLogService.RecordFailure(
+                                logId,
+                                stopwatch,
+                                (int)lastStatusCode,
+                                lastErrorMessage);
+
+                            break;
+                        }
+
+                        _ = TryGetUsageMetadata(
+                            responseElement,
+                            candidate,
+                            out var promptTokens,
+                            out var completionTokens,
+                            out var totalTokens);
+
+                        await requestLogService.RecordSuccess(
+                            logId,
+                            stopwatch,
+                            (int)response.StatusCode,
+                            timeToFirstByteMs: timeToFirstByteMs,
+                            promptTokens: promptTokens,
+                            completionTokens: completionTokens,
+                            totalTokens: totalTokens);
+
+                        context.Response.ContentType = "application/json";
+                        context.Response.StatusCode = (int)response.StatusCode;
+                        await context.Response.WriteAsync(responseElement.GetRawText(), context.RequestAborted);
+                        return;
+                    }
+
+                    // 走到这里说明解析失败但不再重试，交由外层统一失败处理
                 }
                 catch (Exception ex)
                 {
@@ -314,6 +391,7 @@ public class GeminiAPIService(
         string? conversationId,
         AIAccountService aiAccountService)
     {
+        AIProviderAsyncLocal.AIProviderIds = new List<int>();
         const int maxRetries = 15;
         string? lastErrorMessage = null;
         HttpStatusCode? lastStatusCode = null;
@@ -349,7 +427,8 @@ public class GeminiAPIService(
                     if (lastAccountId.HasValue)
                     {
                         account = await aiAccountService.TryGetAccountById(lastAccountId.Value);
-                        if (account != null && account.Provider == AIProviders.Gemini)
+                        if (account != null
+                            && account.Provider is AIProviders.Gemini)
                         {
                             sessionStickinessUsed = true;
                             logger.LogInformation(
@@ -392,10 +471,12 @@ public class GeminiAPIService(
                     break;
                 }
 
-                var geminiOAuth = account.GetGeminiOauth();
+                AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
+
+                var geminiOAuth = await GetValidGeminiOAuthAsync(account, aiAccountService);
                 if (geminiOAuth == null)
                 {
-                    lastErrorMessage = $"账户 {account.Id} 没有有效的 Gemini OAuth 凭证";
+                    lastErrorMessage = $"账户 {account.Id} Gemini Token 无效或已过期且刷新失败";
                     lastStatusCode = HttpStatusCode.Unauthorized;
 
                     logger.LogWarning(lastErrorMessage);
@@ -416,14 +497,16 @@ public class GeminiAPIService(
                                                  "Gemini CodeAssistEndpoint is not configured");
                     var action = "streamGenerateContent";
                     var url = $"{codeAssistEndpoint}/v1internal:{action}?alt=sse";
+                    var userAgent = GetUserAgent();
 
-                    var response = await SendGeminiRequest(
+                    using var response = await SendGeminiRequest(
                         url,
                         input,
                         geminiOAuth.Token,
                         geminiOAuth.ProjectId,
                         model,
-                        isStream: true);
+                        isStream: true,
+                        userAgent: userAgent);
 
                     await requestLogService.UpdateRetry(logId, attempt, account.Id);
 
@@ -481,8 +564,52 @@ public class GeminiAPIService(
                     try
                     {
                         await using var stream = await response.Content.ReadAsStreamAsync(context.RequestAborted);
-                        await stream.CopyToAsync(context.Response.Body, context.RequestAborted);
-                        await context.Response.Body.FlushAsync();
+                        using var reader = new StreamReader(stream);
+
+                        while (true)
+                        {
+                            context.RequestAborted.ThrowIfCancellationRequested();
+
+                            var line = await reader.ReadLineAsync();
+                            if (line == null)
+                            {
+                                break;
+                            }
+
+                            if (!TryParseSseDataLine(line, out var prefix, out var data))
+                            {
+                                await WriteSseLineAsync(context, line, context.RequestAborted);
+                                continue;
+                            }
+
+                            if (string.Equals(data, "[DONE]", StringComparison.OrdinalIgnoreCase))
+                            {
+                                await WriteSseLineAsync(context, line, context.RequestAborted);
+                                await WriteSseLineAsync(context, string.Empty, context.RequestAborted);
+                                break;
+                            }
+
+                            if (string.IsNullOrWhiteSpace(data) || !TryParseJson(data, out var doc))
+                            {
+                                await WriteSseLineAsync(context, line, context.RequestAborted);
+                                continue;
+                            }
+
+                            using (doc)
+                            {
+                                if (TryGetResponseAndCandidate(doc.RootElement, out var responseElement, out _))
+                                {
+                                    await WriteSseLineAsync(
+                                        context,
+                                        prefix + responseElement.GetRawText(),
+                                        context.RequestAborted);
+                                }
+                                else
+                                {
+                                    await WriteSseLineAsync(context, line, context.RequestAborted);
+                                }
+                            }
+                        }
                     }
                     catch (OperationCanceledException)
                     {
@@ -567,13 +694,14 @@ public class GeminiAPIService(
     /// <summary>
     /// 发送 Gemini API 请求
     /// </summary>
-    private async Task<HttpResponseMessage> SendGeminiRequest(
+    private static async Task<HttpResponseMessage> SendGeminiRequest(
         string url,
         GeminiInput input,
         string accessToken,
         string? projectId,
         string model,
-        bool isStream)
+        bool isStream,
+        string userAgent)
     {
         // 构造符合Gemini内部API格式的请求体
         var geminiPayload = new
@@ -594,10 +722,226 @@ public class GeminiAPIService(
 
         // 添加请求头
         requestMessage.Headers.Add("Authorization", $"Bearer {accessToken}");
-        requestMessage.Headers.Add("User-Agent", GetUserAgent());
+        requestMessage.Headers.Add("User-Agent", userAgent);
 
         return await HttpClient.SendAsync(requestMessage,
             isStream ? HttpCompletionOption.ResponseHeadersRead : HttpCompletionOption.ResponseContentRead);
+    }
+
+    private async Task<GeminiOAuthCredentialsDto?> GetValidGeminiOAuthAsync(
+        AIAccount account,
+        AIAccountService aiAccountService)
+    {
+        var geminiOAuth = account.GetGeminiOauth();
+        if (geminiOAuth == null)
+        {
+            return null;
+        }
+
+        if (!IsGeminiTokenExpired(geminiOAuth))
+        {
+            return geminiOAuth;
+        }
+
+        try
+        {
+            await RefreshGeminiOAuthTokenAsync(account);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Gemini 账户 {AccountId} Token 刷新失败，已禁用账户", account.Id);
+            await aiAccountService.DisableAccount(account.Id);
+            return null;
+        }
+
+        geminiOAuth = account.GetGeminiOauth();
+        if (geminiOAuth == null || string.IsNullOrWhiteSpace(geminiOAuth.Token))
+        {
+            logger.LogWarning("Gemini 账户 {AccountId} Token 刷新后仍无效，已禁用账户", account.Id);
+            await aiAccountService.DisableAccount(account.Id);
+            return null;
+        }
+
+        return geminiOAuth;
+    }
+
+    private Task RefreshGeminiOAuthTokenAsync(AIAccount account)
+    {
+        return account.Provider switch
+        {
+            AIProviders.Gemini => geminiOAuthService.RefreshGeminiOAuthTokenAsync(account),
+            _ => throw new InvalidOperationException($"Unsupported Gemini provider: {account.Provider}")
+        };
+    }
+
+    private static bool IsGeminiTokenExpired(GeminiOAuthCredentialsDto geminiOAuth)
+    {
+        if (string.IsNullOrWhiteSpace(geminiOAuth.Expiry))
+        {
+            return false;
+        }
+
+        return DateTime.TryParse(geminiOAuth.Expiry, out var expiryUtc)
+               && expiryUtc.ToUniversalTime() <= DateTime.UtcNow;
+    }
+
+    private static bool TryGetResponseAndCandidate(
+        JsonElement root,
+        out JsonElement response,
+        out JsonElement candidate)
+    {
+        response = default;
+        candidate = default;
+
+        if (!root.TryGetProperty("response", out response) || response.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        if (!response.TryGetProperty("candidates", out var candidates)
+            || candidates.ValueKind != JsonValueKind.Array)
+        {
+            return false;
+        }
+
+        var first = candidates.EnumerateArray().FirstOrDefault();
+        if (first.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        candidate = first;
+        return true;
+    }
+
+    private static bool TryGetUsageMetadata(
+        JsonElement response,
+        JsonElement candidate,
+        out int? promptTokens,
+        out int? completionTokens,
+        out int? totalTokens)
+    {
+        promptTokens = null;
+        completionTokens = null;
+        totalTokens = null;
+
+        var responseUsage = GetUsageMetadata(response, "usageMetadata");
+        var candidateUsage = GetUsageMetadata(candidate, "usageMetadata");
+
+        var responseScore = GetUsageScore(responseUsage);
+        var candidateScore = GetUsageScore(candidateUsage);
+
+        var usage = candidateScore > responseScore ? candidateUsage : responseUsage;
+        if (usage == null)
+        {
+            return false;
+        }
+
+        var usageValue = usage.Value;
+
+        if (usageValue.TryGetProperty("promptTokenCount", out var promptProp))
+        {
+            promptTokens = promptProp.GetInt32();
+        }
+
+        if (usageValue.TryGetProperty("candidatesTokenCount", out var completionProp))
+        {
+            completionTokens = completionProp.GetInt32();
+        }
+
+        if (usageValue.TryGetProperty("totalTokenCount", out var totalProp))
+        {
+            totalTokens = totalProp.GetInt32();
+        }
+
+        return promptTokens.HasValue || completionTokens.HasValue || totalTokens.HasValue;
+    }
+
+    private static JsonElement? GetUsageMetadata(JsonElement element, string name)
+    {
+        if (element.ValueKind == JsonValueKind.Object
+            && element.TryGetProperty(name, out var usage)
+            && usage.ValueKind == JsonValueKind.Object)
+        {
+            return usage;
+        }
+
+        return null;
+    }
+
+    private static int GetUsageScore(JsonElement? element)
+    {
+        if (element == null)
+        {
+            return 0;
+        }
+
+        var score = 0;
+        if (element.Value.TryGetProperty("promptTokenCount", out _))
+        {
+            score++;
+        }
+
+        if (element.Value.TryGetProperty("candidatesTokenCount", out _))
+        {
+            score++;
+        }
+
+        if (element.Value.TryGetProperty("totalTokenCount", out _))
+        {
+            score++;
+        }
+
+        return score;
+    }
+
+    private static bool TryParseJson(string payload, out JsonDocument doc)
+    {
+        try
+        {
+            doc = JsonDocument.Parse(payload);
+            return true;
+        }
+        catch (JsonException)
+        {
+            doc = default!;
+            return false;
+        }
+    }
+
+    private static bool TryParseSseDataLine(string line, out string prefix, out string data)
+    {
+        prefix = string.Empty;
+        data = string.Empty;
+
+        if (string.IsNullOrEmpty(line))
+        {
+            return false;
+        }
+
+        var trimmed = line.TrimStart();
+        if (!trimmed.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var leadingLength = line.Length - trimmed.Length;
+        var dataIndex = 5;
+        while (dataIndex < trimmed.Length && char.IsWhiteSpace(trimmed[dataIndex]))
+        {
+            dataIndex++;
+        }
+
+        prefix = line[..leadingLength] + trimmed[..dataIndex];
+        data = trimmed.Length <= dataIndex ? string.Empty : trimmed[dataIndex..];
+        return true;
+    }
+
+    private static async Task WriteSseLineAsync(HttpContext context, string line, CancellationToken ct)
+    {
+        await context.Response.WriteAsync(line, ct);
+        await context.Response.WriteAsync("\n", ct);
+        await context.Response.Body.FlushAsync(ct);
     }
 
     /// <summary>

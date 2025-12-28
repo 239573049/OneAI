@@ -1,4 +1,6 @@
 ﻿using System.Net;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Authorization;
 using OneAI.Constants;
 using OneAI.Core;
@@ -7,6 +9,7 @@ using OneAI.Entities;
 using OneAI.Extensions;
 using OneAI.Services.AI.Models.Responses.Input;
 using OneAI.Services.Logging;
+using OneAI.Services.OpenAIOAuth;
 using Thor.Abstractions.Responses;
 
 namespace OneAI.Services.AI;
@@ -21,15 +24,18 @@ public class ResponsesService
 
     private readonly AccountQuotaCacheService _quotaCache;
     private readonly AIRequestLogService _requestLogService;
+    private readonly OpenAIOAuthService _openAiOAuthService;
     private readonly ILogger<ResponsesService> _logger;
 
     public ResponsesService(
         AccountQuotaCacheService quotaCache,
         AIRequestLogService requestLogService,
+        OpenAIOAuthService openAiOAuthService,
         ILogger<ResponsesService> logger)
     {
         _quotaCache = quotaCache;
         _requestLogService = requestLogService;
+        _openAiOAuthService = openAiOAuthService;
         _logger = logger;
     }
 
@@ -54,6 +60,9 @@ public class ResponsesService
 
         try
         {
+            // 每个请求只初始化一次：用于在重试链路中排除已尝试过的账户
+            AIProviderAsyncLocal.AIProviderIds = new List<int>(maxRetries);
+
             for (int attempt = 1; attempt <= maxRetries; attempt++)
             {
                 // 检查响应是否已经开始写入（一旦开始写入Body就不能重试）
@@ -70,9 +79,6 @@ public class ResponsesService
 
                     return;
                 }
-
-                // 重置AIProviderIds（每次尝试时清空）
-                AIProviderAsyncLocal.AIProviderIds = new List<int>();
 
                 _logger.LogDebug("尝试第 {Attempt}/{MaxRetries} 次获取账户", attempt, maxRetries);
 
@@ -92,7 +98,7 @@ public class ResponsesService
 
                         account = await aiAccountService.TryGetAccountById(lastAccountId.Value);
 
-                        if (account != null)
+                        if (account != null && account.Provider == AIProviders.OpenAI)
                         {
                             sessionStickinessUsed = true;
                             _logger.LogInformation(
@@ -106,6 +112,7 @@ public class ResponsesService
                                 "会话 {ConversationId} 的上次账户 {AccountId} 不可用，将智能选择新账户",
                                 conversationId,
                                 lastAccountId.Value);
+                            account = null;
                         }
                     }
                 }
@@ -118,19 +125,20 @@ public class ResponsesService
 
                 if (account == null)
                 {
-                    lastErrorMessage = $"无法为模型 {request.Model} 获取可用账户（尝试 {attempt}/{maxRetries}）";
-                    lastStatusCode = HttpStatusCode.ServiceUnavailable;
+                    const string noAccountMessage = "账户池都无可用";
+                    _logger.LogWarning(noAccountMessage);
 
-                    _logger.LogWarning(lastErrorMessage);
+                    await _requestLogService.RecordFailure(
+                        logId,
+                        stopwatch,
+                        StatusCodes.Status503ServiceUnavailable,
+                        noAccountMessage);
 
-                    // 如果还有重试机会，继续下一次尝试
-                    if (attempt < maxRetries)
-                    {
-                        continue;
-                    }
-
-                    // 最后一次尝试失败，返回错误
-                    break;
+                    await WriteOpenAiErrorResponse(
+                        context,
+                        noAccountMessage,
+                        StatusCodes.Status503ServiceUnavailable);
+                    return;
                 }
 
                 AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
@@ -139,7 +147,77 @@ public class ResponsesService
 
                 if (account.Provider == AIProviders.OpenAI)
                 {
-                    var accessToken = account.GetOpenAiOauth()!.AccessToken;
+                    var oauth = account.GetOpenAiOauth();
+                    if (oauth == null || string.IsNullOrWhiteSpace(oauth.AccessToken))
+                    {
+                        _logger.LogWarning("OpenAI 账户 {AccountId} 缺少 OAuth AccessToken，已禁用该账户", account.Id);
+                        await aiAccountService.DisableAccount(account.Id);
+                        lastErrorMessage = $"账户 {account.Id} 缺少 OAuth AccessToken（尝试 {attempt}/{maxRetries}）";
+                        lastStatusCode = HttpStatusCode.Unauthorized;
+
+                        if (attempt < maxRetries)
+                        {
+                            continue;
+                        }
+
+                        await _requestLogService.RecordFailure(
+                            logId,
+                            stopwatch,
+                            (int)lastStatusCode,
+                            lastErrorMessage);
+                        break;
+                    }
+
+                    if (IsOpenAiTokenExpired(oauth))
+                    {
+                        _logger.LogInformation("OpenAI 账户 {AccountId} AccessToken 已过期，尝试刷新后再请求", account.Id);
+                        try
+                        {
+                            await _openAiOAuthService.RefreshOpenAiOAuthTokenAsync(account);
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "OpenAI 账户 {AccountId} Token 刷新失败，已禁用该账户", account.Id);
+                            await aiAccountService.DisableAccount(account.Id);
+                            lastErrorMessage = $"账户 {account.Id} Token 刷新失败（尝试 {attempt}/{maxRetries}）";
+                            lastStatusCode = HttpStatusCode.Unauthorized;
+
+                            if (attempt < maxRetries)
+                            {
+                                continue;
+                            }
+
+                            await _requestLogService.RecordFailure(
+                                logId,
+                                stopwatch,
+                                (int)lastStatusCode,
+                                lastErrorMessage);
+                            break;
+                        }
+
+                        oauth = account.GetOpenAiOauth();
+                        if (oauth == null || string.IsNullOrWhiteSpace(oauth.AccessToken))
+                        {
+                            _logger.LogWarning("OpenAI 账户 {AccountId} Token 刷新后仍无效，已禁用该账户", account.Id);
+                            await aiAccountService.DisableAccount(account.Id);
+                            lastErrorMessage = $"账户 {account.Id} Token 刷新后仍无效（尝试 {attempt}/{maxRetries}）";
+                            lastStatusCode = HttpStatusCode.Unauthorized;
+
+                            if (attempt < maxRetries)
+                            {
+                                continue;
+                            }
+
+                            await _requestLogService.RecordFailure(
+                                logId,
+                                stopwatch,
+                                (int)lastStatusCode,
+                                lastErrorMessage);
+                            break;
+                        }
+                    }
+
+                    var accessToken = oauth.AccessToken;
 
                     // 准备请求头和代理配置
                     var headers = new Dictionary<string, string>
@@ -327,8 +405,7 @@ public class ResponsesService
                                     error);
 
                                 // 直接返回错误，不再重试
-                                context.Response.StatusCode = (int)response.StatusCode;
-                                await context.Response.WriteAsync(error);
+                                await WriteOpenAiErrorResponse(context, error, (int)response.StatusCode);
                                 return;
                             }
 
@@ -575,8 +652,7 @@ public class ResponsesService
                                     error);
 
                                 // 直接返回错误，不再重试
-                                context.Response.StatusCode = (int)response.StatusCode;
-                                await context.Response.WriteAsync(error);
+                                await WriteOpenAiErrorResponse(context, error, (int)response.StatusCode);
                                 return;
                             }
 
@@ -661,7 +737,7 @@ public class ResponsesService
                 context.Response.StatusCode,
                 finalErrorMessage);
 
-            await context.Response.WriteAsync(finalErrorMessage);
+            await WriteOpenAiErrorResponse(context, finalErrorMessage, context.Response.StatusCode);
         }
         catch (Exception ex)
         {
@@ -686,9 +762,148 @@ public class ResponsesService
             // 如果响应还未开始，返回错误信息给客户端
             if (!context.Response.HasStarted)
             {
-                context.Response.StatusCode = 500;
-                await context.Response.WriteAsync($"服务器内部错误: {ex.Message}");
+                await WriteOpenAiErrorResponse(
+                    context,
+                    $"服务器内部错误: {ex.Message}",
+                    StatusCodes.Status500InternalServerError);
             }
         }
+        finally
+        {
+            // 确保每次请求结束后清理 AsyncLocal，避免污染后续异步链路
+            AIProviderAsyncLocal.AIProviderIds.Clear();
+        }
+    }
+
+    private static bool IsOpenAiTokenExpired(OpenAiOauth oauth)
+    {
+        if (oauth.ExpiresAt <= 0)
+        {
+            return false;
+        }
+
+        return oauth.ExpiresAt <= DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+    }
+
+    private static bool IsOpenAiErrorJson(string payload)
+    {
+        if (string.IsNullOrWhiteSpace(payload))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(payload);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            return doc.RootElement.TryGetProperty("error", out var error)
+                   && error.ValueKind == JsonValueKind.Object;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static bool TryExtractMessageFromJson(string payload, out string message)
+    {
+        message = string.Empty;
+
+        if (string.IsNullOrWhiteSpace(payload))
+        {
+            return false;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(payload);
+            var root = doc.RootElement;
+
+            if (root.ValueKind == JsonValueKind.String)
+            {
+                message = root.GetString() ?? string.Empty;
+                return !string.IsNullOrWhiteSpace(message);
+            }
+
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            if (root.TryGetProperty("message", out var topMessage) && topMessage.ValueKind == JsonValueKind.String)
+            {
+                message = topMessage.GetString() ?? string.Empty;
+                return !string.IsNullOrWhiteSpace(message);
+            }
+
+            if (root.TryGetProperty("detail", out var detail) && detail.ValueKind == JsonValueKind.String)
+            {
+                message = detail.GetString() ?? string.Empty;
+                return !string.IsNullOrWhiteSpace(message);
+            }
+
+            if (!root.TryGetProperty("error", out var error))
+            {
+                return false;
+            }
+
+            if (error.ValueKind == JsonValueKind.String)
+            {
+                message = error.GetString() ?? string.Empty;
+                return !string.IsNullOrWhiteSpace(message);
+            }
+
+            if (error.ValueKind != JsonValueKind.Object)
+            {
+                return false;
+            }
+
+            if (error.TryGetProperty("message", out var errorMessage) && errorMessage.ValueKind == JsonValueKind.String)
+            {
+                message = errorMessage.GetString() ?? string.Empty;
+                return !string.IsNullOrWhiteSpace(message);
+            }
+
+            return false;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private static async Task WriteOpenAiErrorResponse(HttpContext context, string message, int statusCode)
+    {
+        context.Response.ContentType = "application/json; charset=utf-8";
+        context.Response.StatusCode = statusCode;
+
+        var trimmed = message?.Trim();
+        if (!string.IsNullOrEmpty(trimmed) && IsOpenAiErrorJson(trimmed))
+        {
+            await context.Response.WriteAsync(trimmed);
+            return;
+        }
+
+        if (!string.IsNullOrEmpty(trimmed) && TryExtractMessageFromJson(trimmed, out var extracted))
+        {
+            message = extracted;
+        }
+
+        var payload = new JsonObject
+        {
+            ["error"] = new JsonObject
+            {
+                ["message"] = message,
+                ["type"] = "api_error",
+                ["param"] = null,
+                ["code"] = statusCode
+            }
+        };
+
+        await context.Response.WriteAsync(payload.ToJsonString());
     }
 }

@@ -19,7 +19,7 @@ export interface AIAccountDto {
 /**
  * 账户类型
  */
-export type AccountType = 'openai' | 'claude' | 'gemini'
+export type AccountType = 'openai' | 'claude' | 'gemini' | 'gemini-antigravity'
 
 /**
  * 生成OAuth URL响应

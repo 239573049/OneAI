@@ -21,13 +21,19 @@ public static class AIProviders
     public const string Gemini = "Gemini";
 
     /// <summary>
+    /// Google Gemini Antigravity（Google Code Assist / Antigravity API）
+    /// </summary>
+    public const string GeminiAntigravity = "Gemini-Antigravity";
+
+    /// <summary>
     /// 获取所有支持的提供商列表
     /// </summary>
     public static readonly string[] All =
     [
         OpenAI,
         Claude,
-        Gemini
+        Gemini,
+        GeminiAntigravity
     ];
 
     /// <summary>
@@ -48,6 +54,7 @@ public static class AIProviders
             OpenAI => "OpenAI (ChatGPT)",
             Claude => "Anthropic Claude",
             Gemini => "Google Gemini",
+            GeminiAntigravity => "Google Gemini (Antigravity)",
             _ => provider
         };
     }

@@ -45,13 +45,13 @@ public static class GeminiOAuthEndpoints
     /// </summary>
     private static IResult GenerateOAuthUrl(
         GenerateGeminiOAuthUrlRequest request,
-        GeminiOAuthHelper oAuthHelper,
+        GeminiAntigravityOAuthHelper oAuthHelper,
         IOAuthSessionService sessionService,
-        GeminiOAuthService authService)
+        GeminiAntigravityOAuthService authService)
     {
         try
         {
-            var result = authService.GenerateGeminiOAuthUrl(request, oAuthHelper, sessionService);
+            var result = authService.GenerateGeminiAntigravityOAuthUrl(request, oAuthHelper, sessionService);
             return Results.Json(ApiResponse<object>.Success(result, "授权链接生成成功"));
         }
         catch (Exception ex)
@@ -68,15 +68,15 @@ public static class GeminiOAuthEndpoints
     /// </summary>
     private static async Task<IResult> ExchangeOAuthCode(
         ExchangeGeminiOAuthCodeRequest request,
-        GeminiOAuthHelper oAuthHelper,
+        GeminiAntigravityOAuthHelper oAuthHelper,
         IOAuthSessionService sessionService,
-        GeminiOAuthService authService,
+        GeminiAntigravityOAuthService authService,
         AppDbContext dbContext)
     {
         try
         {
             // 创建账户（包含完整的项目ID自动检测逻辑）
-            var account = await authService.ExchangeGeminiOAuthCode(dbContext, request, oAuthHelper, sessionService);
+            var account = await authService.ExchangeGeminiAntigravityOAuthCode(dbContext, request, oAuthHelper, sessionService);
 
             // 返回账户信息
             return Results.Json(ApiResponse<AIAccountDto>.Success(new AIAccountDto

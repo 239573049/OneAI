@@ -13,8 +13,24 @@ using OneAI.Services.Logging;
 using OneAI.Services.OpenAIOAuth;
 using OneAI.Services.GeminiOAuth;
 using Scalar.AspNetCore;
+using Serilog;
+using Serilog.Context;
+using Serilog.Events;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// 配置 Serilog（统一接管 ILogger，并输出请求日志）
+builder.Host.UseSerilog((context, loggerConfiguration) =>
+{
+    loggerConfiguration
+        .MinimumLevel.Information()
+        .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+        .MinimumLevel.Override("Microsoft.AspNetCore", LogEventLevel.Warning)
+        .Enrich.FromLogContext()
+        .Enrich.WithProperty("Application", "OneAI")
+        .ReadFrom.Configuration(context.Configuration)
+        .WriteTo.Console();
+});
 
 // 配置主数据库
 builder.Services.AddDbContext<AppDbContext>(options =>
@@ -113,8 +129,8 @@ builder.Services.AddScoped<IJwtService, JwtService>();
 builder.Services.AddSingleton<IOAuthSessionService, InMemoryOAuthSessionService>();
 builder.Services.AddScoped<OpenAIOAuthService>();
 builder.Services.AddScoped<OpenAiOAuthHelper>();
-builder.Services.AddScoped<GeminiOAuthService>();
-builder.Services.AddScoped<GeminiOAuthHelper>();
+builder.Services.AddScoped<GeminiAntigravityOAuthService>();
+builder.Services.AddScoped<GeminiAntigravityOAuthHelper>();
 builder.Services.AddSingleton<AccountQuotaCacheService>(); // 单例模式，缓存在应用生命周期内共享
 builder.Services.AddScoped<AIAccountService>();
 builder.Services.AddScoped<AIRequestLogService>(); // AI请求日志服务（生产者）
@@ -124,7 +140,10 @@ builder.Services.AddHostedService<OAuthTokenRefreshBackgroundService>(); // OAut
 builder.Services.AddScoped<ResponsesService>();
 builder.Services.AddScoped<GeminiAPIService>();
 builder.Services.AddScoped<ISettingsService, SettingsService>();
-
+builder.Services.AddScoped<GeminiOAuthService>();
+builder.Services.AddScoped<GeminiOAuthHelper>();
+builder.Services.AddScoped<ChatCompletionsService>();
+builder.Services.AddScoped<AnthropicService>();
 // 配置 CORS
 builder.Services.AddCors(options =>
 {
@@ -161,6 +180,28 @@ builder.Services.AddOpenApi();
 var app = builder.Build();
 
 // 配置中间件管道
+app.Use((context, next) =>
+{
+    using (LogContext.PushProperty("TraceId", context.TraceIdentifier))
+    using (LogContext.PushProperty("ClientIp", context.Connection.RemoteIpAddress?.ToString()))
+    {
+        return next();
+    }
+});
+
+app.UseSerilogRequestLogging(options =>
+{
+    options.MessageTemplate =
+        "HTTP {RequestMethod} {RequestPath} responded {StatusCode} in {Elapsed:0.0000} ms (TraceId: {TraceId})";
+
+    options.EnrichDiagnosticContext = (diagnosticContext, httpContext) =>
+    {
+        diagnosticContext.Set("TraceId", httpContext.TraceIdentifier);
+        diagnosticContext.Set("ClientIp", httpContext.Connection.RemoteIpAddress?.ToString());
+        diagnosticContext.Set("UserAgent", httpContext.Request.Headers.UserAgent.ToString());
+    };
+});
+
 app.UseCors();
 
 // 启用响应压缩
@@ -206,6 +247,8 @@ using (var scope = app.Services.CreateScope())
 }
 
 app.MapAIEndpoints();
+
+app.MapAnthropicEndpoints();
 
 // 映射认证端点
 app.MapAuthEndpoints();

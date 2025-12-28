@@ -281,6 +281,11 @@ public class ThorChatCompletionsRequest : IOpenAiModels.ITemperature, IOpenAiMod
     [JsonPropertyName("user")]
     public string User { get; set; }
 
+    [JsonPropertyName("reasoning_effort")] public string? ReasoningEffort { get; set; }
+
+    [JsonPropertyName("prompt_cache_key")]
+    public string? PromptCacheKey { get; set; }
+
     /// <summary>
     ///     参数验证
     /// </summary>
