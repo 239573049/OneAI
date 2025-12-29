@@ -16,7 +16,8 @@ public class AnthropicService(
     AccountQuotaCacheService quotaCache,
     AIRequestLogService requestLogService,
     ILogger<AnthropicService> logger,
-    IConfiguration configuration)
+    IConfiguration configuration,
+    GeminiAntigravityOAuthService geminiAntigravityOAuthService)
 {
     private static readonly HttpClient HttpClient = new()
     {
@@ -132,7 +133,59 @@ public class AnthropicService(
                     lastErrorMessage = $"账户 {account.Id} 没有有效的 Gemini OAuth 凭证";
                     lastStatusCode = HttpStatusCode.Unauthorized;
                     logger.LogWarning(lastErrorMessage);
+
+                    await aiAccountService.DisableAccount(account.Id);
+
+                    if (attempt < MaxRetries)
+                    {
+                        continue;
+                    }
+
                     break;
+                }
+
+                if (IsGeminiTokenExpired(geminiOAuth))
+                {
+                    try
+                    {
+                        await geminiAntigravityOAuthService.RefreshGeminiAntigravityOAuthTokenAsync(account);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(
+                            ex,
+                            "Gemini Antigravity 账户 {AccountId} Token 刷新失败，已禁用账户",
+                            account.Id);
+
+                        lastErrorMessage = $"账户 {account.Id} Token 刷新失败: {ex.Message}";
+                        lastStatusCode = HttpStatusCode.Unauthorized;
+
+                        await aiAccountService.DisableAccount(account.Id);
+
+                        if (attempt < MaxRetries)
+                        {
+                            continue;
+                        }
+
+                        break;
+                    }
+
+                    geminiOAuth = account.GetGeminiOauth();
+                    if (geminiOAuth == null || string.IsNullOrWhiteSpace(geminiOAuth.Token))
+                    {
+                        lastErrorMessage = $"账户 {account.Id} Gemini Token 刷新后仍无效";
+                        lastStatusCode = HttpStatusCode.Unauthorized;
+                        logger.LogWarning(lastErrorMessage);
+
+                        await aiAccountService.DisableAccount(account.Id);
+
+                        if (attempt < MaxRetries)
+                        {
+                            continue;
+                        }
+
+                        break;
+                    }
                 }
 
                 var requestBody = BuildAntigravityRequestBody(
@@ -1561,6 +1614,17 @@ public class AnthropicService(
             doc = null!;
             return false;
         }
+    }
+
+    private static bool IsGeminiTokenExpired(GeminiOAuthCredentialsDto geminiOAuth)
+    {
+        if (string.IsNullOrWhiteSpace(geminiOAuth.Expiry))
+        {
+            return false;
+        }
+
+        return DateTime.TryParse(geminiOAuth.Expiry, out var expiryUtc)
+            && expiryUtc.ToUniversalTime() <= DateTime.UtcNow;
     }
 
     private static void UpdateUsageFromResponse(StreamingState state, JsonElement response, JsonElement candidate)

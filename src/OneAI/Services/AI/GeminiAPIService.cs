@@ -193,7 +193,7 @@ public class GeminiAPIService(
                         // 检查是否是客户端错误
                         bool isClientError = ClientErrorKeywords.Any(keyword => error.Contains(keyword));
 
-                        if (isClientError || response.StatusCode == HttpStatusCode.Unauthorized)
+                        if (response.StatusCode == HttpStatusCode.Unauthorized || response.StatusCode == HttpStatusCode.Forbidden)
                         {
                             await aiAccountService.DisableAccount(account.Id);
 
@@ -212,6 +212,20 @@ public class GeminiAPIService(
 
                                 break;
                             }
+                        }
+
+                        if (isClientError)
+                        {
+                            await requestLogService.RecordFailure(
+                                logId,
+                                stopwatch,
+                                (int)response.StatusCode,
+                                error);
+
+                            context.Response.ContentType = "application/json";
+                            context.Response.StatusCode = (int)response.StatusCode;
+                            await context.Response.WriteAsync(error, context.RequestAborted);
+                            return;
                         }
 
                         if (attempt < maxRetries)

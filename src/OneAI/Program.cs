@@ -136,7 +136,6 @@ builder.Services.AddScoped<AIAccountService>();
 builder.Services.AddScoped<AIRequestLogService>(); // AI请求日志服务（生产者）
 builder.Services.AddHostedService<AIRequestLogWriterService>(); // 日志写入后台服务（消费者）
 builder.Services.AddHostedService<AIRequestAggregationBackgroundService>(); // 数据聚合后台服务
-builder.Services.AddHostedService<OAuthTokenRefreshBackgroundService>(); // OAuth Token 刷新后台服务
 builder.Services.AddScoped<ResponsesService>();
 builder.Services.AddScoped<GeminiAPIService>();
 builder.Services.AddScoped<ISettingsService, SettingsService>();

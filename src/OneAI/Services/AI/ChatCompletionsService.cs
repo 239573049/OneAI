@@ -750,14 +750,29 @@ public sealed class ChatCompletionsService(
                         maxRetries,
                         error);
 
+                    var shouldDisableAccount =
+                        response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden;
+
                     var isClientError =
-                        response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
+                        shouldDisableAccount
                         || ClientErrorKeywords.Any(keyword =>
                             error.Contains(keyword, StringComparison.OrdinalIgnoreCase));
 
-                    if (isClientError)
+                    if (shouldDisableAccount)
                     {
                         await aiAccountService.DisableAccount(account.Id);
+                    }
+
+                    if (isClientError)
+                    {
+                        await requestLogService.RecordFailure(
+                            logId,
+                            stopwatch,
+                            (int)response.StatusCode,
+                            error);
+
+                        response.Dispose();
+                        throw new UpstreamRequestException(response.StatusCode, error);
                     }
 
                     response.Dispose();
