@@ -222,7 +222,11 @@ export default function ModelMappingPage() {
     if (mode === 'table') {
       const errors = validateConfig(config)
       if (errors.length > 0) {
-        setError(errors[0])
+        const errorMessage =
+          errors.length === 1
+            ? errors[0]
+            : `共发现 ${errors.length} 个配置错误：\n- ${errors.join('\n- ')}`
+        setError(errorMessage)
         return
       }
     }
