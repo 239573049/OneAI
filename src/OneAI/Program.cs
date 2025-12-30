@@ -131,6 +131,7 @@ builder.Services.AddScoped<OpenAIOAuthService>();
 builder.Services.AddScoped<OpenAiOAuthHelper>();
 builder.Services.AddScoped<GeminiAntigravityOAuthService>();
 builder.Services.AddScoped<GeminiAntigravityOAuthHelper>();
+builder.Services.AddScoped<IModelMappingService, ModelMappingService>();
 builder.Services.AddSingleton<AccountQuotaCacheService>(); // 单例模式，缓存在应用生命周期内共享
 builder.Services.AddScoped<AIAccountService>();
 builder.Services.AddScoped<AIRequestLogService>(); // AI请求日志服务（生产者）

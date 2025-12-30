@@ -24,6 +24,7 @@ public sealed class ChatCompletionsService(
     AIRequestLogService requestLogService,
     ILogger<ChatCompletionsService> logger,
     IConfiguration configuration,
+    IModelMappingService modelMappingService,
     GeminiOAuthService geminiOAuthService,
     GeminiAntigravityOAuthService geminiAntigravityOAuthService)
 {
@@ -74,7 +75,10 @@ public sealed class ChatCompletionsService(
         }
 
         var modelWithoutPrefix = StripFeaturePrefixes(originalModel);
-        var geminiModel = GetBaseModelName(modelWithoutPrefix);
+        var baseModelForMapping = GetBaseModelName(modelWithoutPrefix);
+        var mapping = await modelMappingService.ResolveOpenAiChatAsync(baseModelForMapping);
+        var geminiModel = mapping?.TargetModel ?? baseModelForMapping;
+        var preferredProvider = mapping?.TargetProvider;
 
         var (geminiRequestData, toolNameMapper) = BuildGeminiRequestData(request, modelWithoutPrefix);
         var geminiPayload = new JsonObject
@@ -101,6 +105,7 @@ public sealed class ChatCompletionsService(
                     geminiPayload,
                     conversationId,
                     aiAccountService,
+                    preferredProvider,
                     logId,
                     stopwatch);
                 return;
@@ -115,6 +120,7 @@ public sealed class ChatCompletionsService(
                     toolNameMapper,
                     conversationId,
                     aiAccountService,
+                    preferredProvider,
                     includeUsage: true,
                     logId,
                     stopwatch);
@@ -128,6 +134,7 @@ public sealed class ChatCompletionsService(
                 toolNameMapper,
                 conversationId,
                 aiAccountService,
+                preferredProvider,
                 logId,
                 stopwatch);
         }
@@ -619,7 +626,10 @@ public sealed class ChatCompletionsService(
             && expiryUtc.ToUniversalTime() <= DateTime.UtcNow;
     }
 
-    private async Task<AIAccount?> GetGeminiAccount(string? conversationId, AIAccountService aiAccountService)
+    private async Task<AIAccount?> GetGeminiAccount(
+        string? conversationId,
+        string? preferredProvider,
+        AIAccountService aiAccountService)
     {
         AIAccount? account = null;
 
@@ -631,6 +641,15 @@ public sealed class ChatCompletionsService(
                 account = await aiAccountService.TryGetAccountById(lastAccountId.Value);
                 if (account != null
                     && (account.Provider == AIProviders.Gemini || account.Provider == AIProviders.GeminiAntigravity))
+                {
+                    if (!string.IsNullOrWhiteSpace(preferredProvider)
+                        && !string.Equals(account.Provider, preferredProvider, StringComparison.Ordinal))
+                    {
+                        account = null;
+                    }
+                }
+
+                if (account != null)
                 {
                     logger.LogInformation(
                         "会话粘性成功：会话 {ConversationId} 复用 Gemini 账户 {AccountId}",
@@ -646,6 +665,16 @@ public sealed class ChatCompletionsService(
 
         if (account == null)
         {
+            if (string.Equals(preferredProvider, AIProviders.Gemini, StringComparison.Ordinal))
+            {
+                return await aiAccountService.GetAIAccountByProvider(AIProviders.Gemini);
+            }
+
+            if (string.Equals(preferredProvider, AIProviders.GeminiAntigravity, StringComparison.Ordinal))
+            {
+                return await aiAccountService.GetAIAccountByProvider(AIProviders.GeminiAntigravity);
+            }
+
             account = await aiAccountService.GetAIAccountByProvider(AIProviders.Gemini);
             if (account == null)
             {
@@ -663,6 +692,7 @@ public sealed class ChatCompletionsService(
         bool allowResponseStarted,
         string? conversationId,
         AIAccountService aiAccountService,
+        string? preferredProvider,
         long logId,
         Stopwatch stopwatch)
     {
@@ -679,7 +709,7 @@ public sealed class ChatCompletionsService(
                 break;
             }
 
-            var account = await GetGeminiAccount(conversationId, aiAccountService);
+            var account = await GetGeminiAccount(conversationId, preferredProvider, aiAccountService);
             if (account == null)
             {
                 lastErrorMessage = "账户池都无可用";
@@ -832,6 +862,7 @@ public sealed class ChatCompletionsService(
         ToolNameMapper toolNameMapper,
         string? conversationId,
         AIAccountService aiAccountService,
+        string? preferredProvider,
         long logId,
         Stopwatch stopwatch)
     {
@@ -842,6 +873,7 @@ public sealed class ChatCompletionsService(
             allowResponseStarted: false,
             conversationId,
             aiAccountService,
+            preferredProvider,
             logId,
             stopwatch);
 
@@ -871,6 +903,7 @@ public sealed class ChatCompletionsService(
         ToolNameMapper toolNameMapper,
         string? conversationId,
         AIAccountService aiAccountService,
+        string? preferredProvider,
         bool includeUsage,
         long logId,
         Stopwatch stopwatch)
@@ -882,6 +915,7 @@ public sealed class ChatCompletionsService(
             allowResponseStarted: false,
             conversationId,
             aiAccountService,
+            preferredProvider,
             logId,
             stopwatch);
 
@@ -942,6 +976,7 @@ public sealed class ChatCompletionsService(
         JsonObject geminiPayload,
         string? conversationId,
         AIAccountService aiAccountService,
+        string? preferredProvider,
         long logId,
         Stopwatch stopwatch)
     {
@@ -981,6 +1016,7 @@ public sealed class ChatCompletionsService(
                 geminiPayload,
                 conversationId,
                 aiAccountService,
+                preferredProvider,
                 logId,
                 stopwatch);
 
@@ -1081,6 +1117,7 @@ public sealed class ChatCompletionsService(
         JsonObject geminiPayload,
         string? conversationId,
         AIAccountService aiAccountService,
+        string? preferredProvider,
         long logId,
         Stopwatch stopwatch)
     {
@@ -1091,6 +1128,7 @@ public sealed class ChatCompletionsService(
             allowResponseStarted: true,
             conversationId,
             aiAccountService,
+            preferredProvider,
             logId,
             stopwatch);
 
