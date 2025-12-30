@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.EntityFrameworkCore;
 using OneAI.Constants;
 using OneAI.Data;
+using OneAI.Entities;
 using OneAI.Models;
 using OneAI.Services;
 
@@ -126,27 +127,59 @@ public static class SettingsEndpoints
             var setting = await dbContext.SystemSettings
                 .FirstOrDefaultAsync(s => s.Key == key);
 
+            // 若设置不存在则自动创建，兼容旧数据库缺少 model_mapping_rules 等键的情况
             if (setting == null)
-                return ApiResponse<SystemSettingsDto>.Fail("设置不存在", 404);
+            {
+                var defaultDescription = key switch
+                {
+                    SettingsKeys.Model_Mapping_Rules => "模型映射规则（JSON），用于 Anthropic 与 OpenAI Chat 的模型别名映射",
+                    _ => "用户自定义设置"
+                };
+                var defaultDataType = key switch
+                {
+                    SettingsKeys.Model_Mapping_Rules => "json",
+                    _ => "string"
+                };
 
-            if (!setting.IsEditable)
-                return ApiResponse<SystemSettingsDto>.Fail("此设置不可编辑", 400);
+                setting = new SystemSettings
+                {
+                    Key = key,
+                    Value = request.Value,
+                    Description = request.Description ?? defaultDescription,
+                    DataType = defaultDataType,
+                    IsEditable = true,
+                    CreatedAt = DateTime.UtcNow,
+                    UpdatedAt = DateTime.UtcNow
+                };
 
-            await settingsService.SetSettingAsync(key, request.Value, request.Description ?? setting.Description);
+                dbContext.SystemSettings.Add(setting);
+                await dbContext.SaveChangesAsync();
+                await settingsService.RefreshCacheAsync();
+            }
+            else
+            {
+                if (!setting.IsEditable)
+                    return ApiResponse<SystemSettingsDto>.Fail("此设置不可编辑", 400);
 
-            var updatedSetting = await dbContext.SystemSettings
-                .AsNoTracking()
-                .FirstOrDefaultAsync(s => s.Key == key);
+                await settingsService.SetSettingAsync(
+                    key,
+                    request.Value,
+                    request.Description ?? setting.Description);
+
+                setting = await dbContext.SystemSettings
+                    .AsNoTracking()
+                    .FirstOrDefaultAsync(s => s.Key == key);
+            }
 
             var dto = new SystemSettingsDto
             {
-                Key = updatedSetting!.Key,
-                Value = updatedSetting.Value,
-                Description = updatedSetting.Description,
-                DataType = updatedSetting.DataType,
-                IsEditable = updatedSetting.IsEditable,
-                CreatedAt = updatedSetting.CreatedAt,
-                UpdatedAt = updatedSetting.UpdatedAt
+                Key = setting!.Key,
+                Value = setting.Value,
+                Description = setting.Description,
+                DataType = setting.DataType,
+                IsEditable = setting.IsEditable,
+                CreatedAt = setting.CreatedAt,
+                UpdatedAt = setting.UpdatedAt
             };
 
             return ApiResponse<SystemSettingsDto>.Success(dto, "更新设置成功");

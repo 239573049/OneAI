@@ -268,6 +268,11 @@ app.MapGeminiAPIEndpoints();
 // 映射系统设置端点
 app.MapSettingsEndpoints();
 
+// 兼容前端埋点上报，避免 404 噪音
+app.MapPost("/api/event_logging/batch", () => Results.Json(new { success = true }))
+    .WithName("EventLoggingBatch")
+    .WithTags("系统");
+
 // 映射日志查询端点
 app.MapAIRequestLogEndpoints();
 

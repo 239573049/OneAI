@@ -1,5 +1,10 @@
 using System.Net;
 using System.Text;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Net.Security;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Linq;
@@ -20,10 +25,10 @@ public class AnthropicService(
     IModelMappingService modelMappingService,
     GeminiAntigravityOAuthService geminiAntigravityOAuthService)
 {
-    private static readonly HttpClient HttpClient = new()
-    {
-        Timeout = TimeSpan.FromMinutes(30)
-    };
+    private static readonly HttpClient HttpClient = CreateHttpClient();
+    private static readonly bool SkipTlsValidation =
+        Environment.GetEnvironmentVariable("ANTIGRAVITY_SKIP_TLS_VALIDATE")
+            ?.Equals("true", StringComparison.OrdinalIgnoreCase) == true;
     private const int MaxRetries = 15;
 
     private static readonly string[] ClientErrorKeywords =
@@ -31,6 +36,35 @@ public class AnthropicService(
         "invalid_request_error",
         "missing_required_parameter"
     ];
+
+    private static HttpClient CreateHttpClient()
+    {
+        var handler = new SocketsHttpHandler
+        {
+            AutomaticDecompression = DecompressionMethods.All,
+            PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+            AllowAutoRedirect = false,
+            SslOptions = new SslClientAuthenticationOptions
+            {
+                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                RemoteCertificateValidationCallback = SkipTlsValidation
+                    ? new RemoteCertificateValidationCallback((_, _, _, _) => true)
+                    : null
+            }
+        };
+
+        var client = new HttpClient(handler)
+        {
+            Timeout = TimeSpan.FromMinutes(30),
+            DefaultRequestVersion = HttpVersion.Version11,
+            DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower
+        };
+
+        client.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("gzip"));
+        client.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("deflate"));
+
+        return client;
+    }
 
     public async Task Execute(HttpContext context, AnthropicInput input, AIAccountService aiAccountService)
     {
@@ -697,7 +731,7 @@ public class AnthropicService(
         }
     }
 
-    private async Task<HttpResponseMessage> SendAntigravityRequest(
+    private async Task<HttpResponseMessage> SendAntigravityRequest(       
         string baseUrl,
         Dictionary<string, object?> requestBody,
         string accessToken,
@@ -712,12 +746,14 @@ public class AnthropicService(
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
         });
 
-        var request = new HttpRequestMessage(HttpMethod.Post, url)
+        var request = new HttpRequestMessage(HttpMethod.Post, url)        
         {
             Content = new StringContent(json, Encoding.UTF8, "application/json")
         };
 
-        request.Headers.Add("Authorization", $"Bearer {accessToken}");
+        request.Version = HttpVersion.Version11;
+        request.VersionPolicy = HttpVersionPolicy.RequestVersionOrLower;
+        request.Headers.Add("Authorization", $"Bearer {accessToken}");    
         request.Headers.Add("User-Agent", GeminiAntigravityOAuthConfig.UserAgent);
 
         return await HttpClient.SendAsync(
