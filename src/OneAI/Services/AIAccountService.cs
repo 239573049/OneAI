@@ -1,9 +1,12 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 using OneAI.Constants;
 using OneAI.Data;
 using OneAI.Entities;
+using OneAI.Extensions;
 using OneAI.Models;
 using OneAI.Services.AI;
+using OneAI.Services.OpenAIOAuth;
 
 namespace OneAI.Services;
 
@@ -11,15 +14,18 @@ public class AIAccountService
 {
     private readonly AppDbContext _appDbContext;
     private readonly AccountQuotaCacheService _quotaCache;
+    private readonly OpenAIOAuthService _openAiOAuthService;
     private readonly ILogger<AIAccountService> _logger;
 
     public AIAccountService(
         AppDbContext appDbContext,
         AccountQuotaCacheService quotaCache,
+        OpenAIOAuthService openAiOAuthService,
         ILogger<AIAccountService> logger)
     {
         _appDbContext = appDbContext;
         _quotaCache = quotaCache;
+        _openAiOAuthService = openAiOAuthService;
         _logger = logger;
     }
 
@@ -547,7 +553,35 @@ public class AIAccountService
 
         try
         {
-            var accessToken = account.GetOpenAiOauth()!.AccessToken;
+            var oauth = account.GetOpenAiOauth();
+            if (oauth == null)
+            {
+                _logger.LogWarning("账户 {AccountId} 没有 OpenAI OAuth 凭证，无法刷新 OpenAI 配额", account.Id);
+                return null;
+            }
+
+            if (string.IsNullOrWhiteSpace(oauth.AccessToken))
+            {
+                _logger.LogWarning("账户 {AccountId} 的 OpenAI AccessToken 为空，无法刷新 OpenAI 配额", account.Id);
+                return null;
+            }
+
+            var nowUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var isTokenExpired = oauth.ExpiresAt > 0 && oauth.ExpiresAt <= nowUnixSeconds;
+            if (isTokenExpired)
+            {
+                _logger.LogInformation("账户 {AccountId} OpenAI AccessToken 已过期，尝试刷新后再刷新配额", account.Id);
+                await _openAiOAuthService.RefreshOpenAiOAuthTokenAsync(account);
+
+                oauth = account.GetOpenAiOauth();
+                if (oauth == null || string.IsNullOrWhiteSpace(oauth.AccessToken))
+                {
+                    _logger.LogWarning("账户 {AccountId} OpenAI Token 刷新后仍无效，无法刷新 OpenAI 配额", account.Id);
+                    return null;
+                }
+            }
+
+            var accessToken = oauth.AccessToken;
             var address = string.IsNullOrEmpty(account.BaseUrl)
                 ? "https://chatgpt.com/backend-api/codex"
                 : account.BaseUrl;
@@ -563,13 +597,36 @@ public class AIAccountService
 
             using var httpClient = new HttpClient();
             httpClient.DefaultRequestHeaders.Clear();
-            foreach (var header in headers)
-            {
-                httpClient.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value);
-            }
 
             // 发送一个简单的 HEAD 请求来获取配额头信息
-            var response = await httpClient.GetAsync($"{address.TrimEnd('/')}/responses");
+            var response = await httpClient.HttpRequestRaw($"{address.TrimEnd('/')}/responses", new
+            {
+                model = "gpt-5.2",
+                instructions = AIPrompt.CodeXPrompt,
+                store = false,
+                stream = true,
+                input = new object[]
+                {
+                    new
+                    {
+                        role = "user",
+                        type = "message",
+                        content = new[]
+                        {
+                            new
+                            {
+                                type = "input_text",
+                                text = "Say 1"
+                            }
+                        }
+                    }
+                }
+            }, headers);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                throw new Exception(await response.Content.ReadAsStringAsync());
+            }
 
             // 提取配额信息
             var quotaInfo = AccountQuotaCacheService.ExtractFromHeaders(account.Id, response.Headers);
@@ -646,11 +703,13 @@ public class AIAccountService
             }
 
             // 调用 Antigravity API 获取配额信息
-            var apiUrl = $"{Services.GeminiOAuth.GeminiAntigravityOAuthConfig.AntigravityApiUrl}/v1internal:fetchAvailableModels";
+            var apiUrl =
+                $"{Services.GeminiOAuth.GeminiAntigravityOAuthConfig.AntigravityApiUrl}/v1internal:fetchAvailableModels";
 
             using var httpClient = new HttpClient();
             httpClient.DefaultRequestHeaders.Clear();
-            httpClient.DefaultRequestHeaders.Add("User-Agent", Services.GeminiOAuth.GeminiAntigravityOAuthConfig.UserAgent);
+            httpClient.DefaultRequestHeaders.Add("User-Agent",
+                Services.GeminiOAuth.GeminiAntigravityOAuthConfig.UserAgent);
             httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {accessToken}");
             httpClient.Timeout = TimeSpan.FromSeconds(30);
 
@@ -670,7 +729,8 @@ public class AIAccountService
             var root = jsonDoc.RootElement;
 
             // 解析 models 字段获取配额信息
-            if (!root.TryGetProperty("models", out var modelsElement) || modelsElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+            if (!root.TryGetProperty("models", out var modelsElement) ||
+                modelsElement.ValueKind != System.Text.Json.JsonValueKind.Object)
             {
                 _logger.LogWarning("Antigravity API 响应中没有 models 字段");
                 return new AccountQuotaStatusDto
@@ -699,10 +759,12 @@ public class AIAccountService
                         {
                             remainingFraction = remaining.GetDouble();
                         }
+
                         if (quotaInfo.TryGetProperty("resetTime", out var resetTime))
                         {
                             resetTimeRaw = resetTime.GetString();
                         }
+
                         break;
                     }
                 }
@@ -725,10 +787,12 @@ public class AIAccountService
                         {
                             remainingFraction = remaining.GetDouble();
                         }
+
                         if (quotaInfo.TryGetProperty("resetTime", out var resetTime))
                         {
                             resetTimeRaw = resetTime.GetString();
                         }
+
                         break;
                     }
                 }
@@ -842,13 +906,15 @@ public class AIAccountService
             return null;
         }
 
-        var apiUrl = $"{Services.GeminiOAuth.GeminiAntigravityOAuthConfig.AntigravityApiUrl}/v1internal:fetchAvailableModels";
+        var apiUrl =
+            $"{Services.GeminiOAuth.GeminiAntigravityOAuthConfig.AntigravityApiUrl}/v1internal:fetchAvailableModels";
 
         try
         {
             using var httpClient = new HttpClient();
             httpClient.DefaultRequestHeaders.Clear();
-            httpClient.DefaultRequestHeaders.Add("User-Agent", Services.GeminiOAuth.GeminiAntigravityOAuthConfig.UserAgent);
+            httpClient.DefaultRequestHeaders.Add("User-Agent",
+                Services.GeminiOAuth.GeminiAntigravityOAuthConfig.UserAgent);
             httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {accessToken}");
             httpClient.Timeout = TimeSpan.FromSeconds(30);
 
@@ -867,7 +933,8 @@ public class AIAccountService
             using var jsonDoc = System.Text.Json.JsonDocument.Parse(responseBody);
             var root = jsonDoc.RootElement;
 
-            if (!root.TryGetProperty("models", out var modelsElement) || modelsElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+            if (!root.TryGetProperty("models", out var modelsElement) ||
+                modelsElement.ValueKind != System.Text.Json.JsonValueKind.Object)
             {
                 _logger.LogWarning("Antigravity API 响应中没有 models 字段");
                 return new List<string>();

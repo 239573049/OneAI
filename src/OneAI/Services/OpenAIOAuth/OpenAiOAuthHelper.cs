@@ -247,7 +247,6 @@ public class OpenAiOAuthHelper(ILogger<OpenAiOAuthHelper> logger)
         try
         {
             httpClient.DefaultRequestHeaders.Clear();
-            httpClient.DefaultRequestHeaders.Add("Content-Type", "application/json");
             httpClient.DefaultRequestHeaders.Add("User-Agent", "OpenAI-CLI/1.0");
             httpClient.Timeout = TimeSpan.FromSeconds(30);
 
