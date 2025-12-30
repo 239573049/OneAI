@@ -844,39 +844,62 @@ public class AIAccountService
 
         var apiUrl = $"{Services.GeminiOAuth.GeminiAntigravityOAuthConfig.AntigravityApiUrl}/v1internal:fetchAvailableModels";
 
-        using var httpClient = new HttpClient();
-        httpClient.DefaultRequestHeaders.Clear();
-        httpClient.DefaultRequestHeaders.Add("User-Agent", Services.GeminiOAuth.GeminiAntigravityOAuthConfig.UserAgent);
-        httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {accessToken}");
-        httpClient.Timeout = TimeSpan.FromSeconds(30);
-
-        var requestContent = new StringContent("{}", System.Text.Encoding.UTF8, "application/json");
-        var response = await httpClient.PostAsync(apiUrl, requestContent);
-
-        if (!response.IsSuccessStatusCode)
+        try
         {
-            var errorBody = await response.Content.ReadAsStringAsync();
-            _logger.LogError("Antigravity API 返回错误 {StatusCode}: {Error}",
-                (int)response.StatusCode, errorBody);
+            using var httpClient = new HttpClient();
+            httpClient.DefaultRequestHeaders.Clear();
+            httpClient.DefaultRequestHeaders.Add("User-Agent", Services.GeminiOAuth.GeminiAntigravityOAuthConfig.UserAgent);
+            httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {accessToken}");
+            httpClient.Timeout = TimeSpan.FromSeconds(30);
+
+            var requestContent = new StringContent("{}", System.Text.Encoding.UTF8, "application/json");
+            var response = await httpClient.PostAsync(apiUrl, requestContent);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorBody = await response.Content.ReadAsStringAsync();
+                _logger.LogError("Antigravity API 返回错误 {StatusCode}: {Error}",
+                    (int)response.StatusCode, errorBody);
+                return null;
+            }
+
+            var responseBody = await response.Content.ReadAsStringAsync();
+            using var jsonDoc = System.Text.Json.JsonDocument.Parse(responseBody);
+            var root = jsonDoc.RootElement;
+
+            if (!root.TryGetProperty("models", out var modelsElement) || modelsElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+            {
+                _logger.LogWarning("Antigravity API 响应中没有 models 字段");
+                return new List<string>();
+            }
+
+            var models = new List<string>();
+            foreach (var modelProperty in modelsElement.EnumerateObject())
+            {
+                models.Add(modelProperty.Name);
+            }
+
+            return models;
+        }
+        catch (System.Net.Http.HttpRequestException ex)
+        {
+            _logger.LogError(ex, "调用 Antigravity API 获取模型列表时发生 HTTP 错误，账户 {AccountId}", id);
             return null;
         }
-
-        var responseBody = await response.Content.ReadAsStringAsync();
-        using var jsonDoc = System.Text.Json.JsonDocument.Parse(responseBody);
-        var root = jsonDoc.RootElement;
-
-        if (!root.TryGetProperty("models", out var modelsElement) || modelsElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+        catch (System.Threading.Tasks.TaskCanceledException ex)
         {
-            _logger.LogWarning("Antigravity API 响应中没有 models 字段");
-            return new List<string>();
+            _logger.LogError(ex, "调用 Antigravity API 获取模型列表超时或被取消，账户 {AccountId}", id);
+            return null;
         }
-
-        var models = new List<string>();
-        foreach (var modelProperty in modelsElement.EnumerateObject())
+        catch (System.Text.Json.JsonException ex)
         {
-            models.Add(modelProperty.Name);
+            _logger.LogError(ex, "解析 Antigravity API 响应失败，账户 {AccountId}", id);
+            return null;
         }
-
-        return models;
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "获取 Antigravity 模型列表时发生未知错误，账户 {AccountId}", id);
+            return null;
+        }
     }
 }
