@@ -930,6 +930,7 @@ export default function AccountManagementView() {
           if (!open) {
             setModels([])
             setModelsError(null)
+            setModelsAccountLabel('')
           }
           setModelsDialogOpen(open)
         }}
