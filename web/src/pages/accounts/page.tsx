@@ -10,6 +10,7 @@ import {
   CheckCircle,
   XCircle,
   RefreshCw,
+  Eye,
 } from 'lucide-react'
 import {
   Button as AnimateUIButton,
@@ -66,6 +67,11 @@ export default function AccountManagementView() {
   const [togglingId, setTogglingId] = useState<number | null>(null)
   const [refreshingQuotaId, setRefreshingQuotaId] = useState<number | null>(null)
   const [quotaStatuses, setQuotaStatuses] = useState<Record<number, AccountQuotaStatus>>({})
+  const [modelsDialogOpen, setModelsDialogOpen] = useState(false)
+  const [modelsLoading, setModelsLoading] = useState(false)
+  const [modelsError, setModelsError] = useState<string | null>(null)
+  const [models, setModels] = useState<string[]>([])
+  const [modelsAccountLabel, setModelsAccountLabel] = useState<string>('')
 
   useEffect(() => {
     fetchAccounts()
@@ -177,6 +183,25 @@ export default function AccountManagementView() {
       console.error('Failed to refresh Antigravity quota:', err)
     } finally {
       setRefreshingQuotaId(null)
+    }
+  }
+
+  const handleViewModels = async (account: AIAccountDto) => {
+    setModelsDialogOpen(true)
+    setModels([])
+    setModelsError(null)
+    setModelsAccountLabel(account.name || account.email || `账户 ${account.id}`)
+
+    try {
+      setModelsLoading(true)
+      const result = await accountService.getAntigravityModels(account.id)
+      setModels(result)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '获取可用模型失败'
+      setModelsError(message)
+      console.error('Failed to fetch antigravity models:', err)
+    } finally {
+      setModelsLoading(false)
     }
   }
 
@@ -496,23 +521,32 @@ export default function AccountManagementView() {
                               </DropdownMenuItem>
                             )}
                             {providerKey === 'gemini-antigravity' && (
-                              <DropdownMenuItem
-                                onClick={() => handleRefreshAntigravityQuota(account.id)}
-                                disabled={refreshingQuotaId === account.id}
-                                className="cursor-pointer gap-2 flex"
-                              >
-                                {refreshingQuotaId === account.id ? (
-                                  <>
-                                    <Loader className="h-4 w-4 animate-spin" />
-                                    <span>获取用量中</span>
-                                  </>
-                                ) : (
-                                  <>
-                                    <RefreshCw className="h-4 w-4" />
-                                    <span>获取用量</span>
-                                  </>
-                                )}
-                              </DropdownMenuItem>
+                              <>
+                                <DropdownMenuItem
+                                  onClick={() => handleRefreshAntigravityQuota(account.id)}
+                                  disabled={refreshingQuotaId === account.id}
+                                  className="cursor-pointer gap-2 flex"
+                                >
+                                  {refreshingQuotaId === account.id ? (
+                                    <>
+                                      <Loader className="h-4 w-4 animate-spin" />
+                                      <span>获取用量中</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <RefreshCw className="h-4 w-4" />
+                                      <span>获取用量</span>
+                                    </>
+                                  )}
+                                </DropdownMenuItem>
+                                <DropdownMenuItem
+                                  onClick={() => handleViewModels(account)}
+                                  className="cursor-pointer gap-2 flex"
+                                >
+                                  <Eye className="h-4 w-4" />
+                                  <span>查看可用模型</span>
+                                </DropdownMenuItem>
+                              </>
                             )}
                             <DropdownMenuItem
                               onClick={() => handleToggleStatus(account.id)}
@@ -888,6 +922,50 @@ export default function AccountManagementView() {
         onOpenChange={setAddDialogOpen}
         onAccountAdded={handleAccountAdded}
       />
+
+      {/* Antigravity Models Dialog */}
+      <Dialog
+        open={modelsDialogOpen}
+        onOpenChange={(open) => {
+          if (!open) {
+            setModels([])
+            setModelsError(null)
+            setModelsAccountLabel('')
+          }
+          setModelsDialogOpen(open)
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>可用模型</DialogTitle>
+            <DialogDescription>
+              {modelsAccountLabel ? `账户：${modelsAccountLabel}` : 'Gemini Antigravity 模型列表'}
+            </DialogDescription>
+          </DialogHeader>
+
+          {modelsLoading ? (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader className="h-4 w-4 animate-spin" />
+              <span>加载中...</span>
+            </div>
+          ) : modelsError ? (
+            <div className="text-sm text-red-600">{modelsError}</div>
+          ) : models.length === 0 ? (
+            <div className="text-sm text-muted-foreground">暂无模型返回</div>
+          ) : (
+            <div className="space-y-2 max-h-80 overflow-auto">
+              {models.map((m) => (
+                <div
+                  key={m}
+                  className="rounded border border-border/60 bg-muted/40 px-3 py-2 text-sm font-mono break-all"
+                >
+                  {m}
+                </div>
+              ))}
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
 
       {/* Delete Confirmation Dialog */}
       <Dialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>

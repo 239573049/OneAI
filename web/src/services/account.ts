@@ -46,6 +46,13 @@ export const accountService = {
   refreshAntigravityQuotaStatus(accountId: number): Promise<AccountQuotaStatus> {
     return post<AccountQuotaStatus>(`/accounts/${accountId}/refresh-antigravity-quota`, {})
   },
+
+  /**
+   * 获取 Gemini Antigravity 可用模型列表
+   */
+  getAntigravityModels(accountId: number): Promise<string[]> {
+    return get<string[]>(`/accounts/${accountId}/antigravity-models`)
+  },
 }
 
 /**

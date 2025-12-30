@@ -35,6 +35,7 @@ import type { AIAccountDto, AccountQuotaStatus } from '@/types/account'
 import Logs from './Logs'
 import AccountManagementView from './accounts/page'
 import HomeView from './home/page'
+import ModelMappingPage from './model-mapping/page'
 
 const features = [
   { icon: Lock, text: '完整的认证系统', description: '安全的令牌管理' },
@@ -56,6 +57,7 @@ export default function Home() {
     const path = location.pathname
     if (path.includes('/accounts')) return 'account'
     if (path.includes('/logs')) return 'logs'
+    if (path.includes('/model-mapping')) return 'model-mapping'
     if (path.includes('/settings')) return 'settings'
     return 'home'
   }
@@ -67,6 +69,8 @@ export default function Home() {
         return <AccountManagementView />
       case 'logs':
         return <Logs />
+      case 'model-mapping':
+        return <ModelMappingPage />
       case 'settings':
         return <SettingsViewComponent />
       default:

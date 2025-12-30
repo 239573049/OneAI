@@ -54,4 +54,9 @@ public static class SettingsKeys
     /// 系统设置 - 服务名称
     /// </summary>
     public const string System_ServiceName = "system_service_name";
+
+    /// <summary>
+    /// 模型映射规则（JSON）
+    /// </summary>
+    public const string Model_Mapping_Rules = "model_mapping_rules";
 }

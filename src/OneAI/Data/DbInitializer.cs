@@ -17,6 +17,22 @@ public static class DbInitializer
         // 检查是否已有设置
         if (await dbContext.SystemSettings.AnyAsync())
         {
+            var hasMapping = await dbContext.SystemSettings
+                .AsNoTracking()
+                .AnyAsync(s => s.Key == SettingsKeys.Model_Mapping_Rules);
+            if (!hasMapping)
+            {
+                dbContext.SystemSettings.Add(new SystemSettings
+                {
+                    Key = SettingsKeys.Model_Mapping_Rules,
+                    Value = "{\"anthropic\":[],\"openai_chat\":[]}",
+                    Description = "模型映射规则（JSON），用于 Anthropic 与 OpenAI Chat 的模型别名映射",
+                    DataType = "json",
+                    IsEditable = true,
+                    CreatedAt = DateTime.UtcNow
+                });
+                await dbContext.SaveChangesAsync();
+            }
             return; // 已初始化，跳过
         }
 
@@ -116,6 +132,15 @@ public static class DbInitializer
                 Value = "OneAI",
                 Description = "服务名称",
                 DataType = "string",
+                IsEditable = true,
+                CreatedAt = DateTime.UtcNow
+            },
+            new SystemSettings
+            {
+                Key = SettingsKeys.Model_Mapping_Rules,
+                Value = "{\"anthropic\":[],\"openai_chat\":[]}",
+                Description = "模型映射规则（JSON），用于 Anthropic 与 OpenAI Chat 的模型别名映射",
+                DataType = "json",
                 IsEditable = true,
                 CreatedAt = DateTime.UtcNow
             }

@@ -74,6 +74,16 @@ public static class AIAccountEndpoints
             .Produces<ApiResponse>(401)
             .Produces<ApiResponse>(404)
             .Produces<ApiResponse>(500);
+
+        // 获取 Gemini Antigravity 可用模型列表
+        group.MapGet("/{id}/antigravity-models", GetAntigravityModels)
+            .WithName("GetAntigravityModels")
+            .WithSummary("获取Gemini Antigravity可用模型列表")
+            .WithDescription("获取指定Gemini Antigravity账户的可用模型列表")
+            .Produces<ApiResponse<List<string>>>(200)
+            .Produces<ApiResponse>(401)
+            .Produces<ApiResponse>(404)
+            .Produces<ApiResponse>(500);
     }
 
     /// <summary>
@@ -195,6 +205,29 @@ public static class AIAccountEndpoints
         catch (Exception ex)
         {
             return ApiResponse<AccountQuotaStatusDto>.Fail($"刷新配额状态失败: {ex.Message}", 500);
+        }
+    }
+
+    /// <summary>
+    /// 获取 Gemini Antigravity 可用模型列表
+    /// </summary>
+    private static async Task<ApiResponse<List<string>>> GetAntigravityModels(
+        int id,
+        AIAccountService accountService)
+    {
+        try
+        {
+            var models = await accountService.GetAntigravityAvailableModelsAsync(id);
+            if (models == null)
+            {
+                return ApiResponse<List<string>>.Fail("账户不存在或获取模型失败", 404);
+            }
+
+            return ApiResponse<List<string>>.Success(models, "获取模型列表成功");
+        }
+        catch (Exception ex)
+        {
+            return ApiResponse<List<string>>.Fail($"获取模型列表失败: {ex.Message}", 500);
         }
     }
 }

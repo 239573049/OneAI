@@ -685,26 +685,35 @@ public class AIAccountService
             double remainingFraction = 0;
             string? resetTimeRaw = null;
 
-            // 第一遍：查找 gemini 开头的模型
-            foreach (var modelProperty in modelsElement.EnumerateObject())
+            // 第一遍：优先查找 gemini / claude 开头的模型
+            var preferredPrefixes = new[] { "gemini", "claude" };
+            foreach (var prefix in preferredPrefixes)
             {
-                if (modelProperty.Name.ToLower().StartsWith("gemini") &&
-                    modelProperty.Value.TryGetProperty("quotaInfo", out var quotaInfo))
+                foreach (var modelProperty in modelsElement.EnumerateObject())
                 {
-                    selectedModel = modelProperty.Name;
-                    if (quotaInfo.TryGetProperty("remainingFraction", out var remaining))
+                    if (modelProperty.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+                        modelProperty.Value.TryGetProperty("quotaInfo", out var quotaInfo))
                     {
-                        remainingFraction = remaining.GetDouble();
+                        selectedModel = modelProperty.Name;
+                        if (quotaInfo.TryGetProperty("remainingFraction", out var remaining))
+                        {
+                            remainingFraction = remaining.GetDouble();
+                        }
+                        if (quotaInfo.TryGetProperty("resetTime", out var resetTime))
+                        {
+                            resetTimeRaw = resetTime.GetString();
+                        }
+                        break;
                     }
-                    if (quotaInfo.TryGetProperty("resetTime", out var resetTime))
-                    {
-                        resetTimeRaw = resetTime.GetString();
-                    }
+                }
+
+                if (selectedModel != null)
+                {
                     break;
                 }
             }
 
-            // 第二遍：如果没找到 gemini 模型，使用第一个有 quotaInfo 的模型
+            // 第二遍：如果没找到 gemini/claude 模型，使用第一个有 quotaInfo 的模型
             if (selectedModel == null)
             {
                 foreach (var modelProperty in modelsElement.EnumerateObject())
@@ -795,6 +804,101 @@ public class AIAccountService
         catch (Exception ex)
         {
             _logger.LogError(ex, "刷新账户 {AccountId} 的 Antigravity 配额状态失败", id);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 获取 Gemini Antigravity 可用模型列表
+    /// </summary>
+    /// <param name="id">账户 ID</param>
+    /// <returns>模型名称列表，失败返回 null</returns>
+    public async Task<List<string>?> GetAntigravityAvailableModelsAsync(int id)
+    {
+        var account = await _appDbContext.AIAccounts.FindAsync(id);
+        if (account == null)
+        {
+            _logger.LogWarning("尝试获取不存在账户 {AccountId} 的 Antigravity 模型列表", id);
+            return null;
+        }
+
+        if (account.Provider != AIProviders.GeminiAntigravity)
+        {
+            _logger.LogWarning("账户 {AccountId} 不是 Gemini Antigravity 账户，无法获取模型列表", id);
+            return null;
+        }
+
+        var geminiOauth = account.GetGeminiOauth();
+        if (geminiOauth == null)
+        {
+            _logger.LogWarning("账户 {AccountId} 没有 Gemini OAuth 凭证", id);
+            return null;
+        }
+
+        var accessToken = geminiOauth.Token;
+        if (string.IsNullOrEmpty(accessToken))
+        {
+            _logger.LogWarning("账户 {AccountId} 的 Access Token 为空", id);
+            return null;
+        }
+
+        var apiUrl = $"{Services.GeminiOAuth.GeminiAntigravityOAuthConfig.AntigravityApiUrl}/v1internal:fetchAvailableModels";
+
+        try
+        {
+            using var httpClient = new HttpClient();
+            httpClient.DefaultRequestHeaders.Clear();
+            httpClient.DefaultRequestHeaders.Add("User-Agent", Services.GeminiOAuth.GeminiAntigravityOAuthConfig.UserAgent);
+            httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {accessToken}");
+            httpClient.Timeout = TimeSpan.FromSeconds(30);
+
+            using var requestContent = new StringContent("{}", System.Text.Encoding.UTF8, "application/json");
+            var response = await httpClient.PostAsync(apiUrl, requestContent);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorBody = await response.Content.ReadAsStringAsync();
+                _logger.LogError("Antigravity API 返回错误 {StatusCode}: {Error}",
+                    (int)response.StatusCode, errorBody);
+                return null;
+            }
+
+            var responseBody = await response.Content.ReadAsStringAsync();
+            using var jsonDoc = System.Text.Json.JsonDocument.Parse(responseBody);
+            var root = jsonDoc.RootElement;
+
+            if (!root.TryGetProperty("models", out var modelsElement) || modelsElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+            {
+                _logger.LogWarning("Antigravity API 响应中没有 models 字段");
+                return new List<string>();
+            }
+
+            var models = new List<string>();
+            foreach (var modelProperty in modelsElement.EnumerateObject())
+            {
+                models.Add(modelProperty.Name);
+            }
+
+            return models;
+        }
+        catch (System.Net.Http.HttpRequestException ex)
+        {
+            _logger.LogError(ex, "调用 Antigravity API 获取模型列表时发生 HTTP 错误，账户 {AccountId}", id);
+            return null;
+        }
+        catch (System.Threading.Tasks.TaskCanceledException ex)
+        {
+            _logger.LogError(ex, "调用 Antigravity API 获取模型列表超时或被取消，账户 {AccountId}", id);
+            return null;
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            _logger.LogError(ex, "解析 Antigravity API 响应失败，账户 {AccountId}", id);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "获取 Antigravity 模型列表时发生未知错误，账户 {AccountId}", id);
             return null;
         }
     }
