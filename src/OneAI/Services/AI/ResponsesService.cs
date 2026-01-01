@@ -57,6 +57,7 @@ public class ResponsesService
             sessionStickinessUsed: false);
 
         bool sessionStickinessUsed = false;
+        var expiredRateLimitAccountIds = new HashSet<int>();
 
         try
         {
@@ -139,6 +140,11 @@ public class ResponsesService
                         noAccountMessage,
                         StatusCodes.Status503ServiceUnavailable);
                     return;
+                }
+
+                if (account.IsRateLimitExpired())
+                {
+                    expiredRateLimitAccountIds.Add(account.Id);
                 }
 
                 AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
@@ -770,6 +776,21 @@ public class ResponsesService
         }
         finally
         {
+            try
+            {
+                if (expiredRateLimitAccountIds.Count > 0)
+                {
+                    foreach (var accountId in expiredRateLimitAccountIds)
+                    {
+                        await aiAccountService.ClearExpiredRateLimit(accountId);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "清理过期限流状态时发生异常");
+            }
+
             // 确保每次请求结束后清理 AsyncLocal，避免污染后续异步链路
             AIProviderAsyncLocal.AIProviderIds.Clear();
         }

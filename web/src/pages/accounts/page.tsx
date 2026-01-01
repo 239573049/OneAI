@@ -247,9 +247,21 @@ export default function AccountManagementView() {
     return 'bg-green-500'
   }
 
+  const formatTokens = (tokens: number): string => {
+    if (tokens >= 1_000_000) {
+      return `${(tokens / 1_000_000).toFixed(1)}M`
+    }
+    if (tokens >= 1_000) {
+      return `${(tokens / 1_000).toFixed(1)}K`
+    }
+    return tokens.toString()
+  }
+
   const enabledCount = accounts.filter(account => account.isEnabled).length
   const rateLimitedCount = accounts.filter(account => account.isRateLimited).length
-  const openaiCount = accounts.filter(account => account.provider.toLowerCase() === 'openai').length
+  const openaiCount = accounts.filter(account => normalizeProviderKey(account.provider) === 'openai').length
+  const claudeCount = accounts.filter(account => normalizeProviderKey(account.provider) === 'claude').length
+  const factoryCount = accounts.filter(account => normalizeProviderKey(account.provider) === 'factory').length
 
   const providerKeyToLabel = new Map<string, string>()
   for (const account of accounts) {
@@ -262,8 +274,9 @@ export default function AccountManagementView() {
   const providerOrder: Record<string, number> = {
     openai: 0,
     claude: 1,
-    gemini: 2,
-    'gemini-antigravity': 3,
+    factory: 2,
+    gemini: 3,
+    'gemini-antigravity': 4,
   }
 
   const providerOptions = Array.from(providerKeyToLabel.entries())
@@ -327,6 +340,12 @@ export default function AccountManagementView() {
           </span>
           <span className="inline-flex items-center rounded-full bg-muted px-3 py-1 text-xs text-muted-foreground">
             OpenAI {openaiCount}
+          </span>
+          <span className="inline-flex items-center rounded-full bg-muted px-3 py-1 text-xs text-muted-foreground">
+            Claude {claudeCount}
+          </span>
+          <span className="inline-flex items-center rounded-full bg-muted px-3 py-1 text-xs text-muted-foreground">
+            Factory {factoryCount}
           </span>
         </div>
 
@@ -629,39 +648,72 @@ export default function AccountManagementView() {
                               </div>
                             )}
 
-                            <div className="grid grid-cols-2 gap-3">
-                              <div className="space-y-1">
-                                <div className="flex items-center justify-between text-xs">
-                                  <span className="text-muted-foreground">5小时</span>
-                                  <span className="font-medium">{quota.primaryUsedPercent ?? 0}%</span>
+                            {/* Anthropic 风格限流信息（Factory） */}
+                            {quota.tokensLimit && quota.tokensLimit > 0 ? (
+                              <div className="space-y-2">
+                                <div className="space-y-1">
+                                  <div className="flex items-center justify-between text-xs">
+                                    <span className="text-muted-foreground">总 Tokens</span>
+                                    <span className="font-medium">{quota.tokensUsedPercent ?? 0}%</span>
+                                  </div>
+                                  <div className="h-2 w-full bg-muted rounded-full overflow-hidden">
+                                    <div
+                                      className={`h-full transition-all ${getUsageColor(quota.tokensUsedPercent)}`}
+                                      style={{ width: `${Math.min(quota.tokensUsedPercent ?? 0, 100)}%` }}
+                                    />
+                                  </div>
+                                  <div className="text-[11px] text-muted-foreground">
+                                    {formatTokens(quota.tokensRemaining ?? 0)} / {formatTokens(quota.tokensLimit)}
+                                  </div>
                                 </div>
-                                <div className="h-2 w-full bg-muted rounded-full overflow-hidden">
-                                  <div
-                                    className={`h-full transition-all ${getUsageColor(quota.primaryUsedPercent)}`}
-                                    style={{ width: `${primaryPercent}%` }}
-                                  />
-                                </div>
-                                <div className="text-[11px] text-muted-foreground">
-                                  {formatTimeRemaining(quota.primaryResetAfterSeconds)}后重置
-                                </div>
+                                {quota.inputTokensLimit && quota.inputTokensLimit > 0 && (
+                                  <div className="grid grid-cols-2 gap-2 text-[11px]">
+                                    <div className="space-y-0.5">
+                                      <div className="text-muted-foreground">Input</div>
+                                      <div className="font-medium">{formatTokens(quota.inputTokensRemaining ?? 0)} / {formatTokens(quota.inputTokensLimit)}</div>
+                                    </div>
+                                    <div className="space-y-0.5">
+                                      <div className="text-muted-foreground">Output</div>
+                                      <div className="font-medium">{formatTokens(quota.outputTokensRemaining ?? 0)} / {formatTokens(quota.outputTokensLimit ?? 0)}</div>
+                                    </div>
+                                  </div>
+                                )}
                               </div>
+                            ) : (
+                              <div className="grid grid-cols-2 gap-3">
+                                <div className="space-y-1">
+                                  <div className="flex items-center justify-between text-xs">
+                                    <span className="text-muted-foreground">5小时</span>
+                                    <span className="font-medium">{quota.primaryUsedPercent ?? 0}%</span>
+                                  </div>
+                                  <div className="h-2 w-full bg-muted rounded-full overflow-hidden">
+                                    <div
+                                      className={`h-full transition-all ${getUsageColor(quota.primaryUsedPercent)}`}
+                                      style={{ width: `${primaryPercent}%` }}
+                                    />
+                                  </div>
+                                  <div className="text-[11px] text-muted-foreground">
+                                    {formatTimeRemaining(quota.primaryResetAfterSeconds)}后重置
+                                  </div>
+                                </div>
 
-                              <div className="space-y-1">
-                                <div className="flex items-center justify-between text-xs">
-                                  <span className="text-muted-foreground">7天</span>
-                                  <span className="font-medium">{quota.secondaryUsedPercent ?? 0}%</span>
-                                </div>
-                                <div className="h-2 w-full bg-muted rounded-full overflow-hidden">
-                                  <div
-                                    className={`h-full transition-all ${getUsageColor(quota.secondaryUsedPercent)}`}
-                                    style={{ width: `${secondaryPercent}%` }}
-                                  />
-                                </div>
-                                <div className="text-[11px] text-muted-foreground">
-                                  {formatTimeRemaining(quota.secondaryResetAfterSeconds)}后重置
+                                <div className="space-y-1">
+                                  <div className="flex items-center justify-between text-xs">
+                                    <span className="text-muted-foreground">7天</span>
+                                    <span className="font-medium">{quota.secondaryUsedPercent ?? 0}%</span>
+                                  </div>
+                                  <div className="h-2 w-full bg-muted rounded-full overflow-hidden">
+                                    <div
+                                      className={`h-full transition-all ${getUsageColor(quota.secondaryUsedPercent)}`}
+                                      style={{ width: `${secondaryPercent}%` }}
+                                    />
+                                  </div>
+                                  <div className="text-[11px] text-muted-foreground">
+                                    {formatTimeRemaining(quota.secondaryResetAfterSeconds)}后重置
+                                  </div>
                                 </div>
                               </div>
-                            </div>
+                            )}
                           </>
                         ) : (
                           <div className="rounded-md border border-dashed p-3 text-xs text-muted-foreground">

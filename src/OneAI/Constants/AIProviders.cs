@@ -16,6 +16,11 @@ public static class AIProviders
     public const string Claude = "Claude";
 
     /// <summary>
+    /// Factory（WorkOS OAuth）
+    /// </summary>
+    public const string Factory = "Factory";
+
+    /// <summary>
     /// Google Gemini (Gemini Pro, Ultra 等)
     /// </summary>
     public const string Gemini = "Gemini";
@@ -32,6 +37,7 @@ public static class AIProviders
     [
         OpenAI,
         Claude,
+        Factory,
         Gemini,
         GeminiAntigravity
     ];
@@ -53,6 +59,7 @@ public static class AIProviders
         {
             OpenAI => "OpenAI (ChatGPT)",
             Claude => "Anthropic Claude",
+            Factory => "Factory",
             Gemini => "Google Gemini",
             GeminiAntigravity => "Google Gemini (Antigravity)",
             _ => provider

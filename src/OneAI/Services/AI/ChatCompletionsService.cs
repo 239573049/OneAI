@@ -4,8 +4,10 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using OneAI.Constants;
+using OneAI.Core;
 using OneAI.Entities;
 using OneAI.Services;
 using OneAI.Services.AI.Models.Dtos;
@@ -38,8 +40,15 @@ public sealed class ChatCompletionsService(
         "\"INVALID_ARGUMENT\""
     ];
 
+    private static readonly string[] OpenAiClientErrorKeywords =
+    [
+        "invalid_request_error",
+        "missing_required_parameter"
+    ];
+
     private const string FakeStreamingPrefix = "假流式/";
     private const string AntiTruncationPrefix = "流式抗截断/";
+    private const string DefaultFactoryChatCompletionsUrl = "https://app.factory.ai/api/llm/o/v1/chat/completions";
 
     private static readonly JsonArray DefaultSafetySettings =
     [
@@ -80,6 +89,12 @@ public sealed class ChatCompletionsService(
         var geminiModel = mapping?.TargetModel ?? baseModelForMapping;
         var preferredProvider = mapping?.TargetProvider;
 
+        // Factory 使用 OpenAI 官方协议，避免触发 Gemini 专用的“假流式”逻辑
+        if (string.Equals(preferredProvider, AIProviders.Factory, StringComparison.Ordinal))
+        {
+            useFakeStreaming = false;
+        }
+
         var (geminiRequestData, toolNameMapper) = BuildGeminiRequestData(request, modelWithoutPrefix);
         var geminiPayload = new JsonObject
         {
@@ -103,6 +118,8 @@ public sealed class ChatCompletionsService(
                 await ExecuteFakeStreaming(
                     context,
                     geminiPayload,
+                    request,
+                    geminiModel,
                     conversationId,
                     aiAccountService,
                     preferredProvider,
@@ -116,6 +133,8 @@ public sealed class ChatCompletionsService(
                 await ExecuteStream(
                     context,
                     geminiPayload,
+                    request,
+                    geminiModel,
                     originalModel,
                     toolNameMapper,
                     conversationId,
@@ -130,6 +149,8 @@ public sealed class ChatCompletionsService(
             await ExecuteNonStreaming(
                 context,
                 geminiPayload,
+                request,
+                geminiModel,
                 originalModel,
                 toolNameMapper,
                 conversationId,
@@ -162,6 +183,11 @@ public sealed class ChatCompletionsService(
                     $"服务器内部错误: {ex.Message}");
                 await WriteOpenAIErrorResponse(context, $"服务器内部错误: {ex.Message}", 500);
             }
+        }
+        finally
+        {
+            // 确保每次请求结束后清理 AsyncLocal，避免污染后续异步链路
+            AIProviderAsyncLocal.AIProviderIds.Clear();
         }
     }
 
@@ -527,6 +553,63 @@ public sealed class ChatCompletionsService(
             : $"{codeAssistEndpoint}/v1internal:generateContent";
     }
 
+    private static string BuildFactoryChatCompletionsUrl(string? baseUrl)
+    {
+        if (string.IsNullOrWhiteSpace(baseUrl))
+        {
+            return DefaultFactoryChatCompletionsUrl;
+        }
+
+        var trimmed = baseUrl.Trim();
+
+        if (trimmed.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase))
+        {
+            return trimmed;
+        }
+
+        if (trimmed.EndsWith("/responses", StringComparison.OrdinalIgnoreCase))
+        {
+            trimmed = trimmed[..^"/responses".Length].TrimEnd('/');
+        }
+
+        trimmed = trimmed.TrimEnd('/');
+
+        if (trimmed.EndsWith("/v1", StringComparison.OrdinalIgnoreCase))
+        {
+            return trimmed + "/chat/completions";
+        }
+
+        return trimmed + "/v1/chat/completions";
+    }
+
+    private static JsonObject BuildOpenAiChatCompletionsPayload(
+        ThorChatCompletionsRequest request,
+        string model,
+        bool isStreaming)
+    {
+        var node = JsonSerializer.SerializeToNode(request, new JsonSerializerOptions
+        {
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        });
+
+        var obj = node as JsonObject ?? new JsonObject();
+
+        obj["model"] = model;
+        obj["stream"] = isStreaming;
+
+        // 本地会话粘性字段，不应透传到上游（官方格式不包含）
+        obj.Remove("prompt_cache_key");
+
+        // 仅 stream=true 时才允许 stream_options
+        if (!isStreaming)
+        {
+            obj.Remove("stream_options");
+        }
+
+        return obj;
+    }
+
     private async Task<HttpResponseMessage> SendGeminiRequest(
         string url,
         JsonObject payload,
@@ -623,10 +706,10 @@ public sealed class ChatCompletionsService(
         }
 
         return DateTime.TryParse(geminiOAuth.Expiry, out var expiryUtc)
-            && expiryUtc.ToUniversalTime() <= DateTime.UtcNow;
+               && expiryUtc.ToUniversalTime() <= DateTime.UtcNow;
     }
 
-    private async Task<AIAccount?> GetGeminiAccount(
+    private async Task<AIAccount?> GetChatCompletionsAccount(
         string? conversationId,
         string? preferredProvider,
         AIAccountService aiAccountService)
@@ -639,8 +722,7 @@ public sealed class ChatCompletionsService(
             if (lastAccountId.HasValue)
             {
                 account = await aiAccountService.TryGetAccountById(lastAccountId.Value);
-                if (account != null
-                    && (account.Provider == AIProviders.Gemini || account.Provider == AIProviders.GeminiAntigravity))
+                if (account is { Provider: AIProviders.Gemini or AIProviders.GeminiAntigravity })
                 {
                     if (!string.IsNullOrWhiteSpace(preferredProvider)
                         && !string.Equals(account.Provider, preferredProvider, StringComparison.Ordinal))
@@ -648,46 +730,70 @@ public sealed class ChatCompletionsService(
                         account = null;
                     }
                 }
-
-                if (account != null)
+                else if (account is { Provider: AIProviders.Factory })
                 {
-                    logger.LogInformation(
-                        "会话粘性成功：会话 {ConversationId} 复用 Gemini 账户 {AccountId}",
-                        conversationId,
-                        lastAccountId.Value);
+                    // Factory 仅在显式指定 provider 时复用，避免跨协议会话串号
+                    if (!string.Equals(preferredProvider, AIProviders.Factory, StringComparison.Ordinal))
+                    {
+                        account = null;
+                    }
                 }
                 else
                 {
                     account = null;
                 }
+
+                if (account != null)
+                {
+                    logger.LogInformation(
+                        "会话粘性成功：会话 {ConversationId} 复用 {Provider} 账户 {AccountId}",
+                        conversationId,
+                        account.Provider,
+                        lastAccountId.Value);
+                }
             }
         }
 
-        if (account == null)
+        if (account != null)
         {
-            if (string.Equals(preferredProvider, AIProviders.Gemini, StringComparison.Ordinal))
-            {
-                return await aiAccountService.GetAIAccountByProvider(AIProviders.Gemini);
-            }
-
-            if (string.Equals(preferredProvider, AIProviders.GeminiAntigravity, StringComparison.Ordinal))
-            {
-                return await aiAccountService.GetAIAccountByProvider(AIProviders.GeminiAntigravity);
-            }
-
-            account = await aiAccountService.GetAIAccountByProvider(AIProviders.Gemini);
-            if (account == null)
-            {
-                account = await aiAccountService.GetAIAccountByProvider(AIProviders.GeminiAntigravity);
-            }
+            return account;
         }
 
-        return account;
+        if (string.Equals(preferredProvider, AIProviders.Factory, StringComparison.Ordinal))
+        {
+            return await aiAccountService.GetAIAccountByProvider(AIProviders.Factory);
+        }
+
+        if (string.Equals(preferredProvider, AIProviders.Gemini, StringComparison.Ordinal))
+        {
+            account = await aiAccountService.GetAIAccountByProvider(AIProviders.Gemini);
+            if (account != null)
+            {
+                return account;
+            }
+
+            return await aiAccountService.GetAIAccountByProvider(AIProviders.GeminiAntigravity);
+        }
+
+        if (string.Equals(preferredProvider, AIProviders.GeminiAntigravity, StringComparison.Ordinal))
+        {
+            account = await aiAccountService.GetAIAccountByProvider(AIProviders.GeminiAntigravity);
+            if (account != null)
+            {
+                return account;
+            }
+
+            return await aiAccountService.GetAIAccountByProvider(AIProviders.Gemini);
+        }
+
+        return await aiAccountService.GetAIAccountByProvider(AIProviders.Gemini,AIProviders.Factory, AIProviders.GeminiAntigravity);
     }
 
-    private async Task<HttpResponseMessage> SendGeminiWithRetries(
+    private async Task<(AIAccount Account, HttpResponseMessage Response)> SendUpstreamWithRetries(
         HttpContext context,
-        JsonObject payload,
+        JsonObject geminiPayload,
+        ThorChatCompletionsRequest openAiRequest,
+        string upstreamModel,
         bool isStreaming,
         bool allowResponseStarted,
         string? conversationId,
@@ -709,7 +815,7 @@ public sealed class ChatCompletionsService(
                 break;
             }
 
-            var account = await GetGeminiAccount(conversationId, preferredProvider, aiAccountService);
+            var account = await GetChatCompletionsAccount(conversationId, preferredProvider, aiAccountService);
             if (account == null)
             {
                 lastErrorMessage = "账户池都无可用";
@@ -718,117 +824,261 @@ public sealed class ChatCompletionsService(
             }
 
             AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
-
-            var geminiOAuth = account.GetGeminiOauth();
-            if (geminiOAuth == null)
-            {
-                lastErrorMessage = $"账户 {account.Id} 没有有效的 Gemini OAuth 凭证";
-                lastStatusCode = HttpStatusCode.Unauthorized;
-
-                if (attempt < maxRetries)
-                {
-                    continue;
-                }
-
-                break;
-            }
-
-            geminiOAuth = await GetValidGeminiOAuthAsync(account, aiAccountService);
-            if (geminiOAuth == null)
-            {
-                lastErrorMessage = $"账户 {account.Id} Gemini Token 无效或已过期且刷新失败";
-                lastStatusCode = HttpStatusCode.Unauthorized;
-
-                if (attempt < maxRetries)
-                {
-                    continue;
-                }
-
-                break;
-            }
+            await requestLogService.UpdateRetry(logId, attempt, account.Id);
 
             try
             {
-                var url = BuildGeminiInternalUrl(isStreaming);
-                var userAgent = account.Provider == AIProviders.GeminiAntigravity
-                    ? GeminiAntigravityOAuthConfig.UserAgent
-                    : GetUserAgent();
-
-                var response = await SendGeminiRequest(
-                    url,
-                    payload,
-                    geminiOAuth.Token,
-                    geminiOAuth.ProjectId,
-                    isStreaming,
-                    userAgent,
-                    context.RequestAborted);
-
-                await requestLogService.UpdateRetry(logId, attempt, account.Id);
-
-                if (response.StatusCode >= HttpStatusCode.BadRequest)
+                if (account.Provider is AIProviders.Gemini or AIProviders.GeminiAntigravity)
                 {
-                    var error = await response.Content.ReadAsStringAsync(context.RequestAborted);
-
-                    lastErrorMessage = error;
-                    lastStatusCode = response.StatusCode;
-
-                    logger.LogError(
-                        "Gemini 请求失败 (账户: {AccountId}, 状态码: {StatusCode}, 尝试: {Attempt}/{MaxRetries}): {Error}",
-                        account.Id,
-                        response.StatusCode,
-                        attempt,
-                        maxRetries,
-                        error);
-
-                    var shouldDisableAccount =
-                        response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden;
-
-                    var isClientError =
-                        shouldDisableAccount
-                        || ClientErrorKeywords.Any(keyword =>
-                            error.Contains(keyword, StringComparison.OrdinalIgnoreCase));
-
-                    if (shouldDisableAccount)
+                    var geminiOAuth = account.GetGeminiOauth();
+                    if (geminiOAuth == null)
                     {
+                        lastErrorMessage = $"账户 {account.Id} 没有有效的 Gemini OAuth 凭证";
+                        lastStatusCode = HttpStatusCode.Unauthorized;
                         await aiAccountService.DisableAccount(account.Id);
+
+                        if (attempt < maxRetries)
+                        {
+                            continue;
+                        }
+
+                        break;
                     }
 
-                    if (isClientError)
+                    geminiOAuth = await GetValidGeminiOAuthAsync(account, aiAccountService);
+                    if (geminiOAuth == null)
                     {
-                        await requestLogService.RecordFailure(
-                            logId,
-                            stopwatch,
-                            (int)response.StatusCode,
+                        lastErrorMessage = $"账户 {account.Id} Gemini Token 无效或已过期且刷新失败";
+                        lastStatusCode = HttpStatusCode.Unauthorized;
+
+                        if (attempt < maxRetries)
+                        {
+                            continue;
+                        }
+
+                        break;
+                    }
+
+                    var url = BuildGeminiInternalUrl(isStreaming);
+                    var userAgent = account.Provider switch
+                    {
+                        AIProviders.Gemini => GetUserAgent(),
+                        AIProviders.GeminiAntigravity => GeminiAntigravityOAuthConfig.UserAgent,
+                        _ => throw new InvalidOperationException($"Unsupported provider: {account.Provider}")
+                    };
+
+                    var response = await SendGeminiRequest(
+                        url,
+                        geminiPayload,
+                        geminiOAuth.Token,
+                        geminiOAuth.ProjectId,
+                        isStreaming,
+                        userAgent,
+                        context.RequestAborted);
+
+                    if (response.StatusCode >= HttpStatusCode.BadRequest)
+                    {
+                        var error = await response.Content.ReadAsStringAsync(context.RequestAborted);
+
+                        lastErrorMessage = error;
+                        lastStatusCode = response.StatusCode;
+
+                        logger.LogError(
+                            "Gemini 请求失败 (账户: {AccountId}, 状态码: {StatusCode}, 尝试: {Attempt}/{MaxRetries}): {Error}",
+                            account.Id,
+                            response.StatusCode,
+                            attempt,
+                            maxRetries,
                             error);
 
+                        var shouldDisableAccount =
+                            response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden;
+
+                        if (shouldDisableAccount)
+                        {
+                            await aiAccountService.DisableAccount(account.Id);
+                            response.Dispose();
+
+                            if (attempt < maxRetries)
+                            {
+                                continue;
+                            }
+
+                            break;
+                        }
+
+                        var isClientError =
+                            response.StatusCode == HttpStatusCode.BadRequest
+                            || ClientErrorKeywords.Any(keyword =>
+                                error.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+
+                        if (isClientError)
+                        {
+                            await requestLogService.RecordFailure(
+                                logId,
+                                stopwatch,
+                                (int)response.StatusCode,
+                                error);
+
+                            response.Dispose();
+                            throw new UpstreamRequestException(response.StatusCode, error);
+                        }
+
                         response.Dispose();
-                        throw new UpstreamRequestException(response.StatusCode, error);
+
+                        if (attempt < maxRetries)
+                        {
+                            continue;
+                        }
+
+                        break;
                     }
 
-                    response.Dispose();
-
-                    if (attempt < maxRetries)
+                    if (!string.IsNullOrEmpty(conversationId))
                     {
-                        continue;
+                        quotaCache.SetConversationAccount(conversationId, account.Id);
                     }
 
-                    break;
+                    await requestLogService.RecordSuccess(
+                        logId,
+                        stopwatch,
+                        (int)response.StatusCode,
+                        timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
+
+                    return (account, response);
                 }
 
-                if (!string.IsNullOrEmpty(conversationId))
+                if (account.Provider == AIProviders.Factory)
                 {
-                    quotaCache.SetConversationAccount(conversationId, account.Id);
+                    var factoryOauth = account.GetFactoryOauth();
+
+                    if (factoryOauth == null || string.IsNullOrWhiteSpace(factoryOauth.AccessToken))
+                    {
+                        lastErrorMessage = $"账户 {account.Id} 没有有效的 Factory Oauth 凭证";
+                        lastStatusCode = HttpStatusCode.Unauthorized;
+                        await aiAccountService.DisableAccount(account.Id);
+
+                        if (attempt < maxRetries)
+                        {
+                            continue;
+                        }
+
+                        break;
+                    }
+
+                    var url = BuildFactoryChatCompletionsUrl(account.BaseUrl);
+                    var payload = BuildOpenAiChatCompletionsPayload(openAiRequest, upstreamModel, isStreaming);
+
+                    var json = payload.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
+                    using var requestMessage = new HttpRequestMessage(HttpMethod.Post, url)
+                    {
+                        Content = new StringContent(json, Encoding.UTF8, "application/json")
+                    };
+
+                    requestMessage.Headers.TryAddWithoutValidation("Authorization", "Bearer " + factoryOauth.AccessToken);
+                    requestMessage.Headers.TryAddWithoutValidation(
+                        "Accept",
+                        isStreaming ? "text/event-stream" : "application/json");
+                    requestMessage.Headers.TryAddWithoutValidation("User-Agent", "oneai");
+
+                    // Factory 上游需要的最小识别头（参考 Factory CLI）
+                    requestMessage.Headers.TryAddWithoutValidation("x-factory-client", "cli");
+                    requestMessage.Headers.TryAddWithoutValidation("x-session-id", Guid.NewGuid().ToString());
+                    requestMessage.Headers.TryAddWithoutValidation("x-assistant-message-id", Guid.NewGuid().ToString());
+
+                    var httpClient = HttpClientFactory.GetHttpClient(url, proxyConfig: null);
+                    var response = await httpClient.SendAsync(
+                        requestMessage,
+                        HttpCompletionOption.ResponseHeadersRead,
+                        context.RequestAborted);
+
+                    if (response.StatusCode >= HttpStatusCode.BadRequest)
+                    {
+                        var error = await response.Content.ReadAsStringAsync(context.RequestAborted);
+
+                        lastErrorMessage = error;
+                        lastStatusCode = response.StatusCode;
+
+                        logger.LogError(
+                            "Factory ChatCompletions 请求失败 (账户: {AccountId}, 状态码: {StatusCode}, 尝试: {Attempt}/{MaxRetries}): {Error}",
+                            account.Id,
+                            response.StatusCode,
+                            attempt,
+                            maxRetries,
+                            error);
+
+                        var shouldDisableAccount =
+                            response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden;
+
+                        if (shouldDisableAccount)
+                        {
+                            await aiAccountService.DisableAccount(account.Id);
+                            response.Dispose();
+
+                            if (attempt < maxRetries)
+                            {
+                                continue;
+                            }
+
+                            break;
+                        }
+
+                        var isClientError =
+                            response.StatusCode == HttpStatusCode.BadRequest
+                            || OpenAiClientErrorKeywords.Any(keyword =>
+                                error.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+
+                        if (isClientError)
+                        {
+                            await requestLogService.RecordFailure(
+                                logId,
+                                stopwatch,
+                                (int)response.StatusCode,
+                                error);
+
+                            response.Dispose();
+                            throw new UpstreamRequestException(response.StatusCode, error);
+                        }
+
+                        response.Dispose();
+
+                        if (attempt < maxRetries)
+                        {
+                            continue;
+                        }
+
+                        break;
+                    }
+
+                    if (!string.IsNullOrEmpty(conversationId))
+                    {
+                        quotaCache.SetConversationAccount(conversationId, account.Id);
+                    }
+
+                    await requestLogService.RecordSuccess(
+                        logId,
+                        stopwatch,
+                        (int)response.StatusCode,
+                        timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
+
+                    return (account, response);
                 }
 
-                await requestLogService.RecordSuccess(
-                    logId,
-                    stopwatch,
-                    (int)response.StatusCode,
-                    timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
+                lastErrorMessage = $"Unsupported provider: {account.Provider}";
+                lastStatusCode = HttpStatusCode.BadRequest;
 
-                return response;
+                if (attempt < maxRetries)
+                {
+                    continue;
+                }
+
+                break;
             }
             catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (UpstreamRequestException)
             {
                 throw;
             }
@@ -837,7 +1087,7 @@ public sealed class ChatCompletionsService(
                 lastErrorMessage = $"请求异常 (账户: {account.Id}): {ex.Message}";
                 lastStatusCode = HttpStatusCode.InternalServerError;
 
-                logger.LogError(ex, "Gemini 请求异常（尝试 {Attempt}/{MaxRetries}）", attempt, maxRetries);
+                logger.LogError(ex, "ChatCompletions 上游请求异常（尝试 {Attempt}/{MaxRetries}）", attempt, maxRetries);
 
                 if (attempt < maxRetries)
                 {
@@ -858,6 +1108,8 @@ public sealed class ChatCompletionsService(
     private async Task ExecuteNonStreaming(
         HttpContext context,
         JsonObject geminiPayload,
+        ThorChatCompletionsRequest openAiRequest,
+        string upstreamModel,
         string responseModel,
         ToolNameMapper toolNameMapper,
         string? conversationId,
@@ -866,9 +1118,11 @@ public sealed class ChatCompletionsService(
         long logId,
         Stopwatch stopwatch)
     {
-        using var response = await SendGeminiWithRetries(
+        var (account, upstreamResponse) = await SendUpstreamWithRetries(
             context,
             geminiPayload,
+            openAiRequest,
+            upstreamModel,
             isStreaming: false,
             allowResponseStarted: false,
             conversationId,
@@ -876,6 +1130,20 @@ public sealed class ChatCompletionsService(
             preferredProvider,
             logId,
             stopwatch);
+
+        using var response = upstreamResponse;
+
+        if (account.Provider == AIProviders.Factory)
+        {
+            context.Response.StatusCode = (int)response.StatusCode;
+            context.Response.ContentType =
+                response.Content.Headers.ContentType?.ToString() ?? "application/json; charset=utf-8";
+
+            await using var stream = await response.Content.ReadAsStreamAsync(context.RequestAborted);
+            await stream.CopyToAsync(context.Response.Body, context.RequestAborted);
+            await context.Response.Body.FlushAsync(context.RequestAborted);
+            return;
+        }
 
         var responseText = await response.Content.ReadAsStringAsync(context.RequestAborted);
         if (!TryParseJson(responseText, out var doc))
@@ -899,6 +1167,8 @@ public sealed class ChatCompletionsService(
     private async Task ExecuteStream(
         HttpContext context,
         JsonObject geminiPayload,
+        ThorChatCompletionsRequest openAiRequest,
+        string upstreamModel,
         string responseModel,
         ToolNameMapper toolNameMapper,
         string? conversationId,
@@ -908,9 +1178,11 @@ public sealed class ChatCompletionsService(
         long logId,
         Stopwatch stopwatch)
     {
-        using var response = await SendGeminiWithRetries(
+        var (account, upstreamResponse) = await SendUpstreamWithRetries(
             context,
             geminiPayload,
+            openAiRequest,
+            upstreamModel,
             isStreaming: true,
             allowResponseStarted: false,
             conversationId,
@@ -918,6 +1190,24 @@ public sealed class ChatCompletionsService(
             preferredProvider,
             logId,
             stopwatch);
+
+        using var response = upstreamResponse;
+
+        if (account.Provider == AIProviders.Factory)
+        {
+            context.Response.ContentType =
+                response.Content.Headers.ContentType?.ToString() ?? "text/event-stream;charset=utf-8";
+            context.Response.Headers.TryAdd("Cache-Control", "no-cache");
+            context.Response.Headers.TryAdd("Connection", "keep-alive");
+            context.Response.Headers.TryAdd("X-Accel-Buffering", "no");
+            context.Response.StatusCode = (int)response.StatusCode;
+
+            await context.Response.Body.FlushAsync(context.RequestAborted);
+
+            await using var factoryStream = await response.Content.ReadAsStreamAsync(context.RequestAborted);
+            await PipeUpstreamStreamAsync(context, factoryStream, context.RequestAborted);
+            return;
+        }
 
         context.Response.ContentType = "text/event-stream;charset=utf-8";
         context.Response.Headers.TryAdd("Cache-Control", "no-cache");
@@ -974,6 +1264,8 @@ public sealed class ChatCompletionsService(
     private async Task ExecuteFakeStreaming(
         HttpContext context,
         JsonObject geminiPayload,
+        ThorChatCompletionsRequest openAiRequest,
+        string upstreamModel,
         string? conversationId,
         AIAccountService aiAccountService,
         string? preferredProvider,
@@ -1014,6 +1306,8 @@ public sealed class ChatCompletionsService(
             var fetchTask = FetchFakeStreamResult(
                 context,
                 geminiPayload,
+                openAiRequest,
+                upstreamModel,
                 conversationId,
                 aiAccountService,
                 preferredProvider,
@@ -1115,15 +1409,19 @@ public sealed class ChatCompletionsService(
     private async Task<(string Content, string ReasoningContent, JsonObject? Usage)> FetchFakeStreamResult(
         HttpContext context,
         JsonObject geminiPayload,
+        ThorChatCompletionsRequest openAiRequest,
+        string upstreamModel,
         string? conversationId,
         AIAccountService aiAccountService,
         string? preferredProvider,
         long logId,
         Stopwatch stopwatch)
     {
-        using var response = await SendGeminiWithRetries(
+        var (account, upstreamResponse) = await SendUpstreamWithRetries(
             context,
             geminiPayload,
+            openAiRequest,
+            upstreamModel,
             isStreaming: false,
             allowResponseStarted: true,
             conversationId,
@@ -1131,6 +1429,13 @@ public sealed class ChatCompletionsService(
             preferredProvider,
             logId,
             stopwatch);
+
+        using var response = upstreamResponse;
+
+        if (account.Provider is not (AIProviders.Gemini or AIProviders.GeminiAntigravity))
+        {
+            throw new InvalidOperationException("假流式仅支持 Gemini 渠道");
+        }
 
         var responseText = await response.Content.ReadAsStringAsync(context.RequestAborted);
         if (!TryParseJson(responseText, out var doc))
@@ -1645,6 +1950,25 @@ public sealed class ChatCompletionsService(
         await context.Response.Body.FlushAsync(ct);
     }
 
+    private static async Task PipeUpstreamStreamAsync(HttpContext context, Stream upstream, CancellationToken ct)
+    {
+        const int bufferSize = 8192;
+        var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(bufferSize);
+        try
+        {
+            int bytesRead;
+            while ((bytesRead = await upstream.ReadAsync(buffer.AsMemory(0, bufferSize), ct)) > 0)
+            {
+                await context.Response.Body.WriteAsync(buffer.AsMemory(0, bytesRead), ct);
+                await context.Response.Body.FlushAsync(ct);
+            }
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
     private static async Task WriteOpenAIErrorResponse(HttpContext context, string message, int statusCode)
     {
         context.Response.ContentType = "application/json; charset=utf-8";
@@ -1670,10 +1994,12 @@ public sealed class ChatCompletionsService(
 
         return new JsonObject
         {
-            ["prompt_tokens"] = usage.TryGetProperty("promptTokenCount", out var p) && p.ValueKind == JsonValueKind.Number
+            ["prompt_tokens"] = usage.TryGetProperty("promptTokenCount", out var p) &&
+                                p.ValueKind == JsonValueKind.Number
                 ? p.GetInt32()
                 : 0,
-            ["completion_tokens"] = usage.TryGetProperty("candidatesTokenCount", out var c) && c.ValueKind == JsonValueKind.Number
+            ["completion_tokens"] = usage.TryGetProperty("candidatesTokenCount", out var c) &&
+                                    c.ValueKind == JsonValueKind.Number
                 ? c.GetInt32()
                 : 0,
             ["total_tokens"] = usage.TryGetProperty("totalTokenCount", out var t) && t.ValueKind == JsonValueKind.Number
@@ -1723,7 +2049,7 @@ public sealed class ChatCompletionsService(
                     }
 
                     var isThought = part.TryGetProperty("thought", out var thoughtObj)
-                                   && thoughtObj.ValueKind == JsonValueKind.True;
+                                    && thoughtObj.ValueKind == JsonValueKind.True;
                     if (isThought)
                     {
                         reasoningContent += textObj.GetString();
@@ -1797,7 +2123,7 @@ public sealed class ChatCompletionsService(
             if (part.TryGetProperty("text", out var textObj) && textObj.ValueKind == JsonValueKind.String)
             {
                 var isThought = part.TryGetProperty("thought", out var thoughtObj)
-                               && thoughtObj.ValueKind == JsonValueKind.True;
+                                && thoughtObj.ValueKind == JsonValueKind.True;
                 if (isThought)
                 {
                     reasoning.Append(textObj.GetString());
@@ -1821,13 +2147,14 @@ public sealed class ChatCompletionsService(
     {
         var choices = new JsonArray();
 
-        if (geminiResponse.TryGetProperty("candidates", out var candidates) && candidates.ValueKind == JsonValueKind.Array)
+        if (geminiResponse.TryGetProperty("candidates", out var candidates) &&
+            candidates.ValueKind == JsonValueKind.Array)
         {
             foreach (var candidate in candidates.EnumerateArray())
             {
                 var parts = candidate.TryGetProperty("content", out var contentObj)
-                    && contentObj.ValueKind == JsonValueKind.Object
-                    && contentObj.TryGetProperty("parts", out var partsObj)
+                            && contentObj.ValueKind == JsonValueKind.Object
+                            && contentObj.TryGetProperty("parts", out var partsObj)
                     ? partsObj
                     : default;
 
@@ -1863,7 +2190,9 @@ public sealed class ChatCompletionsService(
 
                 choices.Add(new JsonObject
                 {
-                    ["index"] = candidate.TryGetProperty("index", out var idx) && idx.ValueKind == JsonValueKind.Number ? idx.GetInt32() : 0,
+                    ["index"] = candidate.TryGetProperty("index", out var idx) && idx.ValueKind == JsonValueKind.Number
+                        ? idx.GetInt32()
+                        : 0,
                     ["message"] = message,
                     ["finish_reason"] = finishReason
                 });
@@ -1902,8 +2231,8 @@ public sealed class ChatCompletionsService(
             foreach (var candidate in candidates.EnumerateArray())
             {
                 var parts = candidate.TryGetProperty("content", out var contentObj)
-                    && contentObj.ValueKind == JsonValueKind.Object
-                    && contentObj.TryGetProperty("parts", out var partsObj)
+                            && contentObj.ValueKind == JsonValueKind.Object
+                            && contentObj.TryGetProperty("parts", out var partsObj)
                     ? partsObj
                     : default;
 
@@ -1942,7 +2271,9 @@ public sealed class ChatCompletionsService(
 
                 choices.Add(new JsonObject
                 {
-                    ["index"] = candidate.TryGetProperty("index", out var idx) && idx.ValueKind == JsonValueKind.Number ? idx.GetInt32() : 0,
+                    ["index"] = candidate.TryGetProperty("index", out var idx) && idx.ValueKind == JsonValueKind.Number
+                        ? idx.GetInt32()
+                        : 0,
                     ["delta"] = delta,
                     ["finish_reason"] = finishReason
                 });

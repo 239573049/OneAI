@@ -120,6 +120,8 @@ public sealed class ModelMappingService(ISettingsService settingsService, ILogge
             "gemini-antigravity" => AIProviders.GeminiAntigravity,
             "geminiantigravity" => AIProviders.GeminiAntigravity,
             "antigravity" => AIProviders.GeminiAntigravity,
+            "factory" => AIProviders.Factory,
+            "factor" => AIProviders.Factory,
             _ => null
         };
     }

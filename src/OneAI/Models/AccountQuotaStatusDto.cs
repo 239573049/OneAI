@@ -49,4 +49,39 @@ public class AccountQuotaStatusDto
     /// 缓存数据最后更新时间
     /// </summary>
     public DateTime? LastUpdatedAt { get; set; }
+
+    /// <summary>
+    /// Token 限制（Anthropic 风格）
+    /// </summary>
+    public long? TokensLimit { get; set; }
+
+    /// <summary>
+    /// Token 剩余量（Anthropic 风格）
+    /// </summary>
+    public long? TokensRemaining { get; set; }
+
+    /// <summary>
+    /// Token 使用百分比（Anthropic 风格）
+    /// </summary>
+    public int? TokensUsedPercent { get; set; }
+
+    /// <summary>
+    /// Input Token 限制
+    /// </summary>
+    public long? InputTokensLimit { get; set; }
+
+    /// <summary>
+    /// Input Token 剩余量
+    /// </summary>
+    public long? InputTokensRemaining { get; set; }
+
+    /// <summary>
+    /// Output Token 限制
+    /// </summary>
+    public long? OutputTokensLimit { get; set; }
+
+    /// <summary>
+    /// Output Token 剩余量
+    /// </summary>
+    public long? OutputTokensRemaining { get; set; }
 }

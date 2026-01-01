@@ -9,6 +9,8 @@ using OneAI.Data;
 using OneAI.Endpoints;
 using OneAI.Services;
 using OneAI.Services.AI;
+using OneAI.Services.ClaudeCodeOAuth;
+using OneAI.Services.FactoryOAuth;
 using OneAI.Services.Logging;
 using OneAI.Services.OpenAIOAuth;
 using OneAI.Services.GeminiOAuth;
@@ -24,8 +26,8 @@ builder.Host.UseSerilog((context, loggerConfiguration) =>
 {
     loggerConfiguration
         .MinimumLevel.Information()
-        .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
-        .MinimumLevel.Override("Microsoft.AspNetCore", LogEventLevel.Warning)
+        .MinimumLevel.Override("Microsoft", LogEventLevel.Information)
+        .MinimumLevel.Override("Microsoft.AspNetCore", LogEventLevel.Information)
         .Enrich.FromLogContext()
         .Enrich.WithProperty("Application", "OneAI")
         .ReadFrom.Configuration(context.Configuration)
@@ -144,6 +146,11 @@ builder.Services.AddScoped<GeminiOAuthService>();
 builder.Services.AddScoped<GeminiOAuthHelper>();
 builder.Services.AddScoped<ChatCompletionsService>();
 builder.Services.AddScoped<AnthropicService>();
+
+builder.Services.AddScoped<ClaudeCodeOAuthHelper>();
+builder.Services.AddScoped<ClaudeCodeOAuthService>();
+builder.Services.AddScoped<FactoryOAuthService>();
+
 // 配置 CORS
 builder.Services.AddCors(options =>
 {
@@ -258,6 +265,12 @@ app.MapAIAccountEndpoints();
 
 // 映射 OpenAI OAuth 端点
 app.MapOpenAIOAuthEndpoints();
+
+// 映射 Claude OAuth 端点
+app.MapClaudeCodeOAuthEndpoints();
+
+// 映射 Factory OAuth 端点
+app.MapFactoryOAuthEndpoints();
 
 // 映射 Gemini OAuth 端点
 app.MapGeminiOAuthEndpoints();

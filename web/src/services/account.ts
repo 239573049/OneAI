@@ -1,5 +1,12 @@
 import { get, del, post, patch } from './api'
-import type { AIAccountDto, GenerateOAuthUrlResponse, ExchangeOAuthCodeRequest, AccountQuotaStatus } from '@/types/account'
+import type {
+  AIAccountDto,
+  GenerateOAuthUrlResponse,
+  ExchangeOAuthCodeRequest,
+  AccountQuotaStatus,
+  GenerateFactoryDeviceCodeResponse,
+  ExchangeFactoryDeviceCodeRequest,
+} from '@/types/account'
 
 /**
  * AI 账户服务
@@ -73,6 +80,48 @@ export const openaiOAuthService = {
    */
   exchangeOAuthCode(request: ExchangeOAuthCodeRequest): Promise<AIAccountDto> {
     return post<AIAccountDto>('/openai/oauth/callback', request)
+  },
+}
+
+/**
+ * Claude OAuth 服务
+ */
+export const claudeOAuthService = {
+  /**
+   * 生成 Claude OAuth 授权链接
+   */
+  generateOAuthUrl(proxy?: any): Promise<GenerateOAuthUrlResponse> {
+    return post<GenerateOAuthUrlResponse>('/claude/oauth/authorize', {
+      proxy: proxy || null
+    })
+  },
+
+  /**
+   * 交换授权码获取 Token 并创建账户
+   */
+  exchangeOAuthCode(request: ExchangeOAuthCodeRequest): Promise<AIAccountDto> {
+    return post<AIAccountDto>('/claude/oauth/callback', request)
+  },
+}
+
+/**
+ * Factory OAuth（WorkOS 设备码）服务
+ */
+export const factoryOAuthService = {
+  /**
+   * 生成 Factory OAuth Device Code
+   */
+  generateDeviceCode(proxy?: any): Promise<GenerateFactoryDeviceCodeResponse> {
+    return post<GenerateFactoryDeviceCodeResponse>('/factory/oauth/authorize', {
+      proxy: proxy || null,
+    })
+  },
+
+  /**
+   * 完成设备码授权并创建账户（服务端会轮询授权结果）
+   */
+  exchangeDeviceCode(request: ExchangeFactoryDeviceCodeRequest): Promise<AIAccountDto> {
+    return post<AIAccountDto>('/factory/oauth/callback', request, { timeout: 360000 })
   },
 }
 

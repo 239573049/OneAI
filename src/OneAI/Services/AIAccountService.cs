@@ -1,4 +1,5 @@
-﻿using System.Text.Json;
+﻿using System.Net;
+using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using OneAI.Constants;
 using OneAI.Data;
@@ -127,7 +128,7 @@ public class AIAccountService
     /// </summary>
     /// <param name="provider">AI 提供商（如 AIProviders.Gemini）</param>
     /// <returns>最优账户，如果没有可用账户则返回null</returns>
-    public async Task<AIAccount?> GetAIAccountByProvider(string provider)
+    public async Task<AIAccount?> GetAIAccountByProvider(params string[] provider)
     {
         // 1. 尝试从缓存获取账户列表，如果缓存不存在则从数据库查询
         var allAccounts = _quotaCache.GetAccountsCache();
@@ -145,7 +146,7 @@ public class AIAccountService
         // 2. 筛选指定提供商的可用账户（已启用 + 提供商匹配 + 不在使用中 + 未限流或限流已过期）
         var availableAccounts = allAccounts
             .Where(x => x.IsEnabled &&
-                        x.Provider == provider &&
+                        provider.Contains(x.Provider) &&
                         !AIProviderAsyncLocal.AIProviderIds.Contains(x.Id) &&
                         x.IsAvailable())
             .ToList();
@@ -360,6 +361,35 @@ public class AIAccountService
     }
 
     /// <summary>
+    /// 清理已过期的限流状态（使用原子更新）
+    /// </summary>
+    /// <param name="accountId">账户ID</param>
+    public async Task ClearExpiredRateLimit(int accountId)
+    {
+        var now = DateTime.UtcNow;
+
+        var affectedRows = await _appDbContext.AIAccounts
+            .Where(x => x.Id == accountId
+                        && x.IsRateLimited
+                        && x.RateLimitResetTime.HasValue
+                        && x.RateLimitResetTime.Value <= now)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(a => a.IsRateLimited, false)
+                .SetProperty(a => a.RateLimitResetTime, (DateTime?)null)
+                .SetProperty(a => a.UpdatedAt, now));
+
+        if (affectedRows == 0)
+        {
+            return;
+        }
+
+        // 清除账户列表缓存（因为限流状态发生了变化）
+        _quotaCache.ClearAccountsCache();
+
+        _logger.LogInformation("账户 {AccountId} 限流已过期，已自动清除限流状态", accountId);
+    }
+
+    /// <summary>
     /// 禁用账户（用于401等认证失败的情况，使用原子更新）
     /// </summary>
     /// <param name="accountId">账户ID</param>
@@ -429,7 +459,7 @@ public class AIAccountService
             };
         }
 
-        return new AccountQuotaStatusDto
+        var dto = new AccountQuotaStatusDto
         {
             AccountId = accountId,
             HasCacheData = true,
@@ -439,8 +469,23 @@ public class AIAccountService
             PrimaryResetAfterSeconds = quotaInfo.PrimaryResetAfterSeconds,
             SecondaryResetAfterSeconds = quotaInfo.SecondaryResetAfterSeconds,
             StatusDescription = quotaInfo.GetStatusDescription(),
-            LastUpdatedAt = quotaInfo.LastUpdatedAt
+            LastUpdatedAt = quotaInfo.LastUpdatedAt,
+            // Anthropic 风格的限流信息
+            TokensLimit = quotaInfo.TokensLimit,
+            TokensRemaining = quotaInfo.TokensRemaining,
+            InputTokensLimit = quotaInfo.InputTokensLimit,
+            InputTokensRemaining = quotaInfo.InputTokensRemaining,
+            OutputTokensLimit = quotaInfo.OutputTokensLimit,
+            OutputTokensRemaining = quotaInfo.OutputTokensRemaining
         };
+
+        // 计算 token 使用百分比
+        if (quotaInfo.TokensLimit.HasValue && quotaInfo.TokensLimit.Value > 0)
+        {
+            dto.TokensUsedPercent = 100 - (int)((quotaInfo.TokensRemaining ?? 0) * 100.0 / quotaInfo.TokensLimit.Value);
+        }
+
+        return dto;
     }
 
     /// <summary>
@@ -623,7 +668,7 @@ public class AIAccountService
                 }
             }, headers);
 
-            if (!response.IsSuccessStatusCode)
+            if (!response.IsSuccessStatusCode && response.StatusCode != HttpStatusCode.TooManyRequests)
             {
                 throw new Exception(await response.Content.ReadAsStringAsync());
             }

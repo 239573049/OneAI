@@ -38,24 +38,28 @@ npm run preview  # Preview production build
 
 **Minimal APIs Pattern**: Endpoints are organized as extension methods in `Endpoints/` directory. Each endpoint file exports a `Map*Endpoints(IEndpointRouteBuilder)` method that groups related routes.
 
-**Service Registration**: All services registered in `Program.cs` lines 127-146. Use scoped services for per-request state, singletons for shared caches.
+**Service Registration**: All services registered in `Program.cs` lines 128-153. Use scoped services for per-request state, singletons for shared caches (`AccountQuotaCacheService`, `IOAuthSessionService`).
 
 **Database Strategy**:
 - Two separate SQLite databases: `AppDbContext` (main data) and `LogDbContext` (request logs)
 - Migrations in `AppMigrations/` and `LogMigrations/`
 - Database initialization happens in `Program.cs` lines 233-247
 
-**Background Services**: Three hosted services run continuously:
+**Background Services**: Two hosted services run continuously:
 - `AIRequestLogWriterService`: Consumes log queue and writes to database
 - `AIRequestAggregationBackgroundService`: Aggregates hourly statistics
-- `OAuthTokenRefreshBackgroundService`: Refreshes OAuth tokens before expiry
 
 **Logging Architecture**: Uses Channel-based queue (line 45-49) for async log writing. Producers push to channel via `AIRequestLogService`, consumer (`AIRequestLogWriterService`) writes batches to database.
 
 **OAuth Flow**:
-- Session-based OAuth state stored in `InMemoryOAuthSessionService`
-- Separate helpers for OpenAI (`OpenAiOAuthHelper`) and Gemini (`GeminiAntigravityOAuthHelper`, `GeminiOAuthHelper`)
+- Session-based OAuth state stored in `InMemoryOAuthSessionService` (singleton)
+- OAuth helpers per provider:
+  - OpenAI: `OpenAiOAuthHelper` (Authorization Code + PKCE)
+  - Claude: `ClaudeCodeOAuthHelper` (Authorization Code + PKCE)
+  - Gemini: `GeminiAntigravityOAuthHelper`, `GeminiOAuthHelper` (Authorization Code + PKCE)
+  - Factory: `FactoryOAuthService` (Device Authorization Flow via WorkOS)
 - OAuth tokens stored in `AIAccount.OAuthToken` as JSON
+- Factory uses WorkOS Device Authorization Flow (RFC 8628) - user authorizes via device code, polls token endpoint
 
 **Quota Tracking**: `AccountQuotaCacheService` (singleton) maintains in-memory cache of account quotas with rate limiting logic.
 
@@ -99,7 +103,7 @@ npm run preview  # Preview production build
 - `VITE_API_BASE_URL`: Backend API URL (default: http://localhost:5000/api)
 
 ### CORS Origins
-Configured in `src/OneAI/Program.cs` lines 148-157. Currently allows:
+Configured in `src/OneAI/Program.cs` lines 154-163. Currently allows:
 - `http://localhost:5173` (Vite)
 - `http://localhost:3000` (alternative)
 
@@ -109,7 +113,8 @@ Configured in `src/OneAI/Program.cs` lines 148-157. Currently allows:
 - Supports both API key (`ApiKey`) and OAuth (`OAuthToken` JSON field)
 - `IsEnabled`: Soft disable flag
 - `IsRateLimited`: Quota exceeded flag
-- `Provider`: Service name (OpenAI, Claude, Gemini, etc.)
+- `Provider`: Service name (OpenAI, Claude, Factory, Gemini, Gemini-Antigravity)
+- Extension methods for OAuth serialization: `GetClaudeOauth()`, `SetClaudeOAuth()`, `GetFactoryOAuth()`, `SetFactoryOAuth()`, etc.
 
 **AIRequestLog**: Request logging for analytics
 - Linked to `AIAccount` via `AccountId`
@@ -123,7 +128,7 @@ Configured in `src/OneAI/Program.cs` lines 148-157. Currently allows:
 
 ## Important Implementation Details
 
-**JWT Authentication**: Custom event handlers in `Program.cs` lines 70-118 handle malformed tokens gracefully. Unauthorized endpoints don't fail on invalid tokens; only protected endpoints return 401.
+**JWT Authentication**: Custom event handlers in `Program.cs` lines 70-122 handle malformed tokens gracefully. Unauthorized endpoints don't fail on invalid tokens; only protected endpoints return 401.
 
 **Static File Serving**: Backend serves frontend SPA from `wwwroot/`. Fallback route (lines 280-298) returns `index.html` for non-API routes to support client-side routing.
 

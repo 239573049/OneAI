@@ -128,6 +128,91 @@ public class AccountQuotaCacheService(
     }
 
     /// <summary>
+    /// 从 Anthropic 风格的 HTTP 响应头提取限流信息
+    /// </summary>
+    /// <param name="accountId">账户ID</param>
+    /// <param name="headers">HTTP响应头</param>
+    /// <returns>提取的配额信息，如果提取失败则返回null</returns>
+    public static AccountQuotaInfo? ExtractFromAnthropicHeaders(int accountId, HttpResponseHeaders headers)
+    {
+        try
+        {
+            var info = new AccountQuotaInfo
+            {
+                AccountId = accountId,
+                LastUpdatedAt = DateTime.UtcNow
+            };
+
+            bool hasAnyData = false;
+
+            // 提取 Input tokens 限流信息
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-input-tokens-limit", out var inputLimit))
+            {
+                info.InputTokensLimit = long.Parse(inputLimit);
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-input-tokens-remaining", out var inputRemaining))
+            {
+                info.InputTokensRemaining = long.Parse(inputRemaining);
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-input-tokens-reset", out var inputReset))
+            {
+                info.InputTokensResetAt = DateTime.Parse(inputReset).ToUniversalTime();
+                hasAnyData = true;
+            }
+
+            // 提取 Output tokens 限流信息
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-output-tokens-limit", out var outputLimit))
+            {
+                info.OutputTokensLimit = long.Parse(outputLimit);
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-output-tokens-remaining", out var outputRemaining))
+            {
+                info.OutputTokensRemaining = long.Parse(outputRemaining);
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-output-tokens-reset", out var outputReset))
+            {
+                info.OutputTokensResetAt = DateTime.Parse(outputReset).ToUniversalTime();
+                hasAnyData = true;
+            }
+
+            // 提取 Total tokens 限流信息
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-tokens-limit", out var tokensLimit))
+            {
+                info.TokensLimit = long.Parse(tokensLimit);
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-tokens-remaining", out var tokensRemaining))
+            {
+                info.TokensRemaining = long.Parse(tokensRemaining);
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-tokens-reset", out var tokensReset))
+            {
+                info.TokensResetAt = DateTime.Parse(tokensReset).ToUniversalTime();
+                hasAnyData = true;
+            }
+
+            // 如果没有提取到任何数据，返回null
+            return hasAnyData ? info : null;
+        }
+        catch (Exception ex)
+        {
+            // 提取失败时返回null，调用方应处理这种情况
+            return null;
+        }
+    }
+
+    /// <summary>
     /// 更新账户配额缓存
     /// </summary>
     /// <param name="quotaInfo">配额信息</param>
