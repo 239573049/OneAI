@@ -137,6 +137,30 @@ public class AccountQuotaInfo
 
     #endregion
 
+    #region Anthropic Unified 限流信息（基于窗口/利用率）
+
+    public string? AnthropicUnifiedStatus { get; set; }
+
+    public string? AnthropicUnifiedFiveHourStatus { get; set; }
+
+    public double? AnthropicUnifiedFiveHourUtilization { get; set; }
+
+    public string? AnthropicUnifiedSevenDayStatus { get; set; }
+
+    public double? AnthropicUnifiedSevenDayUtilization { get; set; }
+
+    public string? AnthropicUnifiedRepresentativeClaim { get; set; }
+
+    public double? AnthropicUnifiedFallbackPercentage { get; set; }
+
+    public long? AnthropicUnifiedResetAt { get; set; }
+
+    public string? AnthropicUnifiedOverageDisabledReason { get; set; }
+
+    public string? AnthropicUnifiedOverageStatus { get; set; }
+
+    #endregion
+
     /// <summary>
     /// 最后更新时间
     /// </summary>

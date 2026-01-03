@@ -99,7 +99,7 @@ public class ResponsesService
 
                         account = await aiAccountService.TryGetAccountById(lastAccountId.Value);
 
-                        if (account != null && account.Provider == AIProviders.OpenAI)
+                        if (account is { Provider: AIProviders.OpenAI })
                         {
                             sessionStickinessUsed = true;
                             _logger.LogInformation(

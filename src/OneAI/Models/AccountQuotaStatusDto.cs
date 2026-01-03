@@ -84,4 +84,49 @@ public class AccountQuotaStatusDto
     /// Output Token 剩余量
     /// </summary>
     public long? OutputTokensRemaining { get; set; }
+
+    /// <summary>
+    /// Anthropic Unified 总状态（allowed / rejected 等）
+    /// </summary>
+    public string? AnthropicUnifiedStatus { get; set; }
+
+    public string? AnthropicUnifiedFiveHourStatus { get; set; }
+
+    public double? AnthropicUnifiedFiveHourUtilization { get; set; }
+
+    public string? AnthropicUnifiedSevenDayStatus { get; set; }
+
+    public double? AnthropicUnifiedSevenDayUtilization { get; set; }
+
+    public string? AnthropicUnifiedRepresentativeClaim { get; set; }
+
+    public double? AnthropicUnifiedFallbackPercentage { get; set; }
+
+    public long? AnthropicUnifiedResetAt { get; set; }
+
+    public string? AnthropicUnifiedOverageDisabledReason { get; set; }
+
+    public string? AnthropicUnifiedOverageStatus { get; set; }
+
+    /// <summary>
+    /// Gemini Antigravity 各模型配额信息（所有模型）
+    /// </summary>
+    public List<AntigravityModelQuotaDto>? AntigravityModelQuotas { get; set; }
+}
+
+public sealed class AntigravityModelQuotaDto
+{
+    public string Model { get; set; } = string.Empty;
+
+    public bool HasQuotaInfo { get; set; }
+
+    public double? RemainingFraction { get; set; }
+
+    public int? RemainingPercent { get; set; }
+
+    public int? UsedPercent { get; set; }
+
+    public string? ResetTime { get; set; }
+
+    public int? ResetAfterSeconds { get; set; }
 }

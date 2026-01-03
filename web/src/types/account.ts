@@ -21,6 +21,16 @@ export interface AIAccountDto {
  */
 export type AccountType = 'openai' | 'claude' | 'gemini' | 'gemini-antigravity' | 'factory'
 
+export interface AntigravityModelQuota {
+  model: string
+  hasQuotaInfo: boolean
+  remainingFraction?: number
+  remainingPercent?: number
+  usedPercent?: number
+  resetTime?: string
+  resetAfterSeconds?: number
+}
+
 /**
  * 生成OAuth URL响应
  */
@@ -97,4 +107,16 @@ export interface AccountQuotaStatus {
   inputTokensRemaining?: number
   outputTokensLimit?: number
   outputTokensRemaining?: number
+  // Anthropic Unified 限流信息（Claude 官方 API / Claude Code）
+  anthropicUnifiedStatus?: string
+  anthropicUnifiedFiveHourStatus?: string
+  anthropicUnifiedFiveHourUtilization?: number
+  anthropicUnifiedSevenDayStatus?: string
+  anthropicUnifiedSevenDayUtilization?: number
+  anthropicUnifiedRepresentativeClaim?: string
+  anthropicUnifiedFallbackPercentage?: number
+  anthropicUnifiedResetAt?: number
+  anthropicUnifiedOverageDisabledReason?: string
+  anthropicUnifiedOverageStatus?: string
+  antigravityModelQuotas?: AntigravityModelQuota[]
 }

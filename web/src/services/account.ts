@@ -55,6 +55,20 @@ export const accountService = {
   },
 
   /**
+   * 刷新 Claude 账户配额状态
+   */
+  refreshClaudeQuotaStatus(accountId: number): Promise<AccountQuotaStatus> {
+    return post<AccountQuotaStatus>(`/accounts/${accountId}/refresh-claude-quota`, {})
+  },
+
+  /**
+   * 刷新 Factory 账户配额状态
+   */
+  refreshFactoryQuotaStatus(accountId: number): Promise<AccountQuotaStatus> {
+    return post<AccountQuotaStatus>(`/accounts/${accountId}/refresh-factory-quota`, {})
+  },
+
+  /**
    * 获取 Gemini Antigravity 可用模型列表
    */
   getAntigravityModels(accountId: number): Promise<string[]> {

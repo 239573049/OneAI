@@ -186,6 +186,42 @@ export default function AccountManagementView() {
     }
   }
 
+  const handleRefreshClaudeQuota = async (accountId: number) => {
+    try {
+      setRefreshingQuotaId(accountId)
+      const status = await accountService.refreshClaudeQuotaStatus(accountId)
+      setQuotaStatuses(prev => ({ ...prev, [accountId]: status }))
+
+      // 同步刷新账户状态（可能会被标记限流/禁用）
+      const updatedAccounts = await accountService.getAccounts()
+      setAccounts(updatedAccounts)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '获取用量失败'
+      setError(message)
+      console.error('Failed to refresh Claude quota:', err)
+    } finally {
+      setRefreshingQuotaId(null)
+    }
+  }
+
+  const handleRefreshFactoryQuota = async (accountId: number) => {
+    try {
+      setRefreshingQuotaId(accountId)
+      const status = await accountService.refreshFactoryQuotaStatus(accountId)
+      setQuotaStatuses(prev => ({ ...prev, [accountId]: status }))
+
+      // 同步刷新账户状态（可能会被标记限流/禁用）
+      const updatedAccounts = await accountService.getAccounts()
+      setAccounts(updatedAccounts)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '获取用量失败'
+      setError(message)
+      console.error('Failed to refresh Factory quota:', err)
+    } finally {
+      setRefreshingQuotaId(null)
+    }
+  }
+
   const handleViewModels = async (account: AIAccountDto) => {
     setModelsDialogOpen(true)
     setModels([])
@@ -539,6 +575,44 @@ export default function AccountManagementView() {
                                 )}
                               </DropdownMenuItem>
                             )}
+                            {providerKey === 'claude' && (
+                              <DropdownMenuItem
+                                onClick={() => handleRefreshClaudeQuota(account.id)}
+                                disabled={refreshingQuotaId === account.id}
+                                className="cursor-pointer gap-2 flex"
+                              >
+                                {refreshingQuotaId === account.id ? (
+                                  <>
+                                    <Loader className="h-4 w-4 animate-spin" />
+                                    <span>获取用量中</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <RefreshCw className="h-4 w-4" />
+                                    <span>获取用量</span>
+                                  </>
+                                )}
+                              </DropdownMenuItem>
+                            )}
+                            {providerKey === 'factory' && (
+                              <DropdownMenuItem
+                                onClick={() => handleRefreshFactoryQuota(account.id)}
+                                disabled={refreshingQuotaId === account.id}
+                                className="cursor-pointer gap-2 flex"
+                              >
+                                {refreshingQuotaId === account.id ? (
+                                  <>
+                                    <Loader className="h-4 w-4 animate-spin" />
+                                    <span>获取用量中</span>
+                                  </>
+                                ) : (
+                                  <>
+                                    <RefreshCw className="h-4 w-4" />
+                                    <span>获取用量</span>
+                                  </>
+                                )}
+                              </DropdownMenuItem>
+                            )}
                             {providerKey === 'gemini-antigravity' && (
                               <>
                                 <DropdownMenuItem
@@ -648,6 +722,37 @@ export default function AccountManagementView() {
                               </div>
                             )}
 
+                            {(quota.anthropicUnifiedStatus ||
+                              quota.anthropicUnifiedOverageStatus ||
+                              quota.anthropicUnifiedOverageDisabledReason) && (
+                              <div
+                                className="text-[11px] text-muted-foreground truncate"
+                                title={[
+                                  quota.anthropicUnifiedStatus && `Unified: ${quota.anthropicUnifiedStatus}`,
+                                  quota.anthropicUnifiedRepresentativeClaim &&
+                                    `Claim: ${quota.anthropicUnifiedRepresentativeClaim}`,
+                                  quota.anthropicUnifiedFallbackPercentage != null &&
+                                    `Fallback: ${quota.anthropicUnifiedFallbackPercentage}`,
+                                  quota.anthropicUnifiedOverageStatus &&
+                                    `Overage: ${quota.anthropicUnifiedOverageStatus}`,
+                                  quota.anthropicUnifiedOverageDisabledReason &&
+                                    `Reason: ${quota.anthropicUnifiedOverageDisabledReason}`,
+                                ]
+                                  .filter(Boolean)
+                                  .join(' | ')}
+                              >
+                                {[
+                                  quota.anthropicUnifiedStatus &&
+                                    `Unified ${quota.anthropicUnifiedStatus}`,
+                                  quota.anthropicUnifiedOverageStatus &&
+                                    `Overage ${quota.anthropicUnifiedOverageStatus}`,
+                                  quota.anthropicUnifiedOverageDisabledReason,
+                                ]
+                                  .filter(Boolean)
+                                  .join(' · ')}
+                              </div>
+                            )}
+
                             {/* Anthropic 风格限流信息（Factory） */}
                             {quota.tokensLimit && quota.tokensLimit > 0 ? (
                               <div className="space-y-2">
@@ -678,6 +783,59 @@ export default function AccountManagementView() {
                                     </div>
                                   </div>
                                 )}
+                              </div>
+                            ) : providerKey === 'gemini-antigravity' &&
+                              quota.antigravityModelQuotas &&
+                              quota.antigravityModelQuotas.length > 0 ? (
+                              <div className="space-y-2">
+                                <div className="flex items-center justify-between text-xs">
+                                  <span className="text-muted-foreground">模型用量</span>
+                                  <span className="text-muted-foreground">
+                                    {quota.antigravityModelQuotas.filter(item => item.hasQuotaInfo).length}/{quota.antigravityModelQuotas.length}
+                                  </span>
+                                </div>
+                                <div className="max-h-44 space-y-2 overflow-auto pr-1">
+                                  {quota.antigravityModelQuotas.map(item => {
+                                    const used = item.usedPercent
+                                    const remaining = item.remainingPercent
+                                    const resetAfterSeconds = item.resetAfterSeconds
+
+                                    return (
+                                      <div key={item.model} className="space-y-1">
+                                        <div className="flex items-center justify-between gap-2 text-[11px]">
+                                          <span className="truncate" title={item.model}>
+                                            {item.model}
+                                          </span>
+                                          <span className="font-medium shrink-0">
+                                            {used == null ? '-' : `${used}%`}
+                                          </span>
+                                        </div>
+                                        {used != null ? (
+                                          <div className="h-2 w-full bg-muted rounded-full overflow-hidden">
+                                            <div
+                                              className={`h-full transition-all ${getUsageColor(used)}`}
+                                              style={{ width: `${Math.min(used, 100)}%` }}
+                                            />
+                                          </div>
+                                        ) : (
+                                          <div className="h-2 w-full bg-muted rounded-full overflow-hidden" />
+                                        )}
+                                        <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                                          <span>
+                                            {item.hasQuotaInfo && remaining != null
+                                              ? `剩余 ${remaining}%`
+                                              : '暂无配额信息'}
+                                          </span>
+                                          {resetAfterSeconds != null && resetAfterSeconds > 0 && (
+                                            <span className="shrink-0">
+                                              {formatTimeRemaining(resetAfterSeconds)}后重置
+                                            </span>
+                                          )}
+                                        </div>
+                                      </div>
+                                    )
+                                  })}
+                                </div>
                               </div>
                             ) : (
                               <div className="grid grid-cols-2 gap-3">
@@ -895,9 +1053,47 @@ export default function AccountManagementView() {
                               </AnimateUIButton>
                             </DropdownMenuTrigger>
                             <DropdownMenuContent align="end" className="w-48">
-                              {account.provider.toLowerCase() === 'openai' && (
+                              {normalizeProviderKey(account.provider) === 'openai' && (
                                 <DropdownMenuItem
                                   onClick={() => handleRefreshOpenAIQuota(account.id)}
+                                  disabled={refreshingQuotaId === account.id}
+                                  className="cursor-pointer gap-2 flex"
+                                >
+                                  {refreshingQuotaId === account.id ? (
+                                    <>
+                                      <Loader className="h-4 w-4 animate-spin" />
+                                      <span>获取用量中</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <RefreshCw className="h-4 w-4" />
+                                      <span>获取用量</span>
+                                    </>
+                                  )}
+                                </DropdownMenuItem>
+                              )}
+                              {normalizeProviderKey(account.provider) === 'claude' && (
+                                <DropdownMenuItem
+                                  onClick={() => handleRefreshClaudeQuota(account.id)}
+                                  disabled={refreshingQuotaId === account.id}
+                                  className="cursor-pointer gap-2 flex"
+                                >
+                                  {refreshingQuotaId === account.id ? (
+                                    <>
+                                      <Loader className="h-4 w-4 animate-spin" />
+                                      <span>获取用量中</span>
+                                    </>
+                                  ) : (
+                                    <>
+                                      <RefreshCw className="h-4 w-4" />
+                                      <span>获取用量</span>
+                                    </>
+                                  )}
+                                </DropdownMenuItem>
+                              )}
+                              {normalizeProviderKey(account.provider) === 'factory' && (
+                                <DropdownMenuItem
+                                  onClick={() => handleRefreshFactoryQuota(account.id)}
                                   disabled={refreshingQuotaId === account.id}
                                   className="cursor-pointer gap-2 flex"
                                 >

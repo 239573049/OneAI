@@ -9,10 +9,13 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Linq;
+using System.Text.Json.Nodes;
+using ClaudeCodeProxy.Abstraction;
 using OneAI.Constants;
 using OneAI.Entities;
 using OneAI.Services.AI.Anthropic;
 using OneAI.Services.ClaudeCodeOAuth;
+using OneAI.Services.FactoryOAuth;
 using OneAI.Services.GeminiOAuth;
 using OneAI.Services.Logging;
 using Thor.Abstractions.Anthropic;
@@ -26,7 +29,8 @@ public class AnthropicService(
     IConfiguration configuration,
     IModelMappingService modelMappingService,
     ClaudeCodeOAuthService claudeCodeOAuthService,
-    GeminiAntigravityOAuthService geminiAntigravityOAuthService)
+    GeminiAntigravityOAuthService geminiAntigravityOAuthService,
+    FactoryOAuthService factoryOAuthService)
 {
     private static readonly HttpClient HttpClient = CreateHttpClient();
 
@@ -61,7 +65,7 @@ public class AnthropicService(
         var client = new HttpClient(handler)
         {
             Timeout = TimeSpan.FromMinutes(30),
-            DefaultRequestVersion = HttpVersion.Version11,
+            DefaultRequestVersion = HttpVersion.Version20,
             DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower
         };
 
@@ -83,7 +87,7 @@ public class AnthropicService(
             return;
         }
 
-        AIProviderAsyncLocal.AIProviderIds = new List<int>();
+        AIProviderAsyncLocal.AIProviderIds = [];
         var (logId, stopwatch) = await requestLogService.CreateRequestLog(
             context,
             input.Model,
@@ -213,131 +217,226 @@ public class AnthropicService(
                         }
                     }
 
-                    // 准备请求头和代理配置
-                    var headers = new Dictionary<string, string>
-                    {
-                        { "Authorization", "Bearer " + claudeOauth.AccessToken },
-                        { "anthropic-version", "2023-06-01" }
-                    };
-
-                    if (isClaudeCodeRequest)
-                    {
-                        // 复制context的请求头
-                        foreach (var header in context.Request.Headers)
-                        {
-                            // 不要覆盖已有的Authorization和Content-Type头
-                            if (header.Key.Equals("Authorization", StringComparison.OrdinalIgnoreCase) ||
-                                header.Key.Equals("Content-Type", StringComparison.OrdinalIgnoreCase) ||
-                                header.Key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase) ||
-                                header.Key.Equals("Connection", StringComparison.OrdinalIgnoreCase) ||
-                                header.Key.Equals("Host", StringComparison.OrdinalIgnoreCase) ||
-                                header.Key.Equals("x-api-key", StringComparison.OrdinalIgnoreCase))
-                                continue;
-
-                            headers[header.Key] = header.Value.ToString();
-                        }
-
-                        headers["Host"] = "api.anthropic.com";
-                    }
-                    else
-                    {
-                        headers["User-Agent"] = "claude-cli/2.0.5 (external, cli)";
-                        headers["Accept-Encoding"] = "gzip, deflate, br";
-                        headers["Accept-Language"] = "*";
-                        headers["X-Stainless-Retry-Count"] = "0";
-                        headers["x-Stainless-Timeout"] = "60";
-                        headers["X-Stainless-Lang"] = "js";
-                        headers["X-Stainless-Package-Version"] = "0.55.1";
-                        headers["X-Stainless-OS"] = "Windows";
-                        headers["X-Stainless-Arch"] = "x64";
-                        headers["X-Stainless-Runtime"] = "node";
-                        headers["X-Stainless-Runtime-Version"] = "v22.15.0";
-                        headers["anthropic-dangerous-direct-browser-access"] = "true";
-                        headers["x-app"] = "cli";
-                        headers["sec-fetch-mode"] = "cors";
-                        headers["sec-fetch-site"] = "cross-site";
-                        headers["sec-fetch-dest"] = "empty";
-                        headers["anthropic-beta"] =
-                            "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14";
-                    }
-
-                    using var request =
-                        new HttpRequestMessage(HttpMethod.Post, BuildClaudeMessagesUrl(account.BaseUrl));
-                    foreach (var header in headers)
-                    {
-                        request.Headers.Add(header.Key, header.Value);
-                    }
+                    var upstreamUrl = BuildClaudeMessagesUrl(account.BaseUrl);
+                    var upstreamUri = new Uri(upstreamUrl);
+                    var isAnthropicBase =
+                        string.Equals(upstreamUri.Scheme, "https", StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(upstreamUri.Host, "api.anthropic.com", StringComparison.OrdinalIgnoreCase);
+                    var hasExplicitApiKey = !string.IsNullOrWhiteSpace(account.ApiKey);
+                    var defaultUseApiKeyHeader = isAnthropicBase && hasExplicitApiKey;
 
                     var json = JsonSerializer.Serialize(input, new JsonSerializerOptions
                     {
                         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
                     });
 
-                    request.Content = new StringContent(json, Encoding.UTF8, "application/json");
-
-                    using var response = await HttpClient.SendAsync(
-                        request,
-                        input.Stream
-                            ? HttpCompletionOption.ResponseHeadersRead
-                            : HttpCompletionOption.ResponseContentRead,
-                        context.RequestAborted);
-
-                    if (response.StatusCode >= HttpStatusCode.BadRequest)
+                    Dictionary<string, string> BuildClaudeHeaders(bool preferApiKeyHeader)
                     {
-                        var error = await response.Content.ReadAsStringAsync(context.RequestAborted);
-                        lastErrorMessage = error;
-                        lastStatusCode = response.StatusCode;
-
-                        logger.LogError(
-                            "Claude 请求失败 (账户: {AccountId}, 状态码: {StatusCode}, 尝试: {Attempt}/{MaxRetries}): {Error}",
-                            account.Id,
-                            response.StatusCode,
-                            attempt,
-                            MaxRetries,
-                            error);
-
-                        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
                         {
-                            await aiAccountService.DisableAccount(account.Id);
+                            ["User-Agent"] = "claude-cli/2.0.76 (external, cli)",
+                            ["Connection"] = "keep-alive",
+                            ["Accept"] = input.Stream ? "text/event-stream" : "application/json",
+                            ["Accept-Encoding"] = "gzip, deflate, br, zstd",
+                            ["Accept-Language"] = "*",
+                            ["X-Stainless-Helper-Method"] = "stream",
+                            ["X-Stainless-Retry-Count"] = "0",
+                            ["x-Stainless-Timeout"] = "60",
+                            ["X-Stainless-Lang"] = "js",
+                            ["X-Stainless-Package-Version"] = "0.55.1",
+                            ["X-Stainless-OS"] = "Windows",
+                            ["X-Stainless-Arch"] = "x64",
+                            ["X-Stainless-Runtime"] = "node",
+                            ["X-Stainless-Runtime-Version"] = "v22.15.0",
+                            ["anthropic-dangerous-direct-browser-access"] = "true",
+                            ["x-app"] = "cli",
+                            ["sec-fetch-mode"] = "cors",
+                            ["sec-fetch-site"] = "cross-site",
+                            ["sec-fetch-dest"] = "empty",
+                            ["baggage"] =
+                                "sentry-environment=external,sentry-release=2.0.76,sentry-public_key=e531a1d9ec1de9064fae9d4affb0b0f4,sentry-trace_id=6c8c7aab3b7f42a880b5bb940626b121",
+                            ["anthropic-beta"] = preferApiKeyHeader
+                                ? "claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+                                : "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+                        };
+
+                        result.TryAdd("anthropic-version", "2023-06-01");
+
+                        var authToken = hasExplicitApiKey
+                            ? account.ApiKey!.Trim()
+                            : claudeOauth.AccessToken;
+
+                        // Follow upstream conventions:
+                        // - Official Anthropic API uses x-api-key
+                        // - Reverse/proxy channels typically accept Authorization: Bearer
+                        var useApiKeyHeader = preferApiKeyHeader && isAnthropicBase;
+                        if (useApiKeyHeader)
+                        {
+                            result.Remove("Authorization");
+                            result["x-api-key"] = authToken;
+                        }
+                        else
+                        {
+                            result.Remove("x-api-key");
+                            result["Authorization"] = "Bearer " + authToken;
                         }
 
-                        var isClientError =
-                            response.StatusCode == HttpStatusCode.BadRequest
-                            || ClientErrorKeywords.Any(keyword =>
-                                error.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+                        result["host"] = "api.anthropic.com";
+                        return result;
+                    }
 
-                        if (isClientError)
+                    async Task<HttpResponseMessage> SendClaudeAsync(Dictionary<string, string> headersToSend)
+                    {
+                        using var request = new HttpRequestMessage(HttpMethod.Post, upstreamUrl);
+                        foreach (var header in headersToSend)
                         {
-                            await requestLogService.RecordFailure(
+                            request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                        }
+
+                        request.Content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                        return await HttpClient.SendAsync(
+                            request,
+                            input.Stream
+                                ? HttpCompletionOption.ResponseHeadersRead
+                                : HttpCompletionOption.ResponseContentRead,
+                            context.RequestAborted);
+                    }
+
+                    var useApiKeyHeader = defaultUseApiKeyHeader;
+
+                    HttpResponseMessage? response = null;
+                    string? error = null;
+
+                    try
+                    {
+                        response = await SendClaudeAsync(BuildClaudeHeaders(useApiKeyHeader));
+
+                        // Claude Code (OAuth token) calls may fail if upstream disables OAuth auth.
+                        // Retry once using x-api-key to maximize compatibility with upstream behavior changes.
+                        if (!hasExplicitApiKey && isAnthropicBase && response.StatusCode >= HttpStatusCode.BadRequest)
+                        {
+                            error = await response.Content.ReadAsStringAsync(context.RequestAborted);
+
+                            var oauthNotSupported =
+                                response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
+                                && error.Contains(
+                                    "OAuth authentication is currently not supported",
+                                    StringComparison.OrdinalIgnoreCase);
+
+                            if (oauthNotSupported)
+                            {
+                                logger.LogWarning(
+                                    "Claude OAuth 鉴权被上游拒绝，尝试改用 x-api-key 方式重试 (账户: {AccountId})",
+                                    account.Id);
+
+                                response.Dispose();
+                                response = await SendClaudeAsync(BuildClaudeHeaders(true));
+                                error = null;
+                            }
+                        }
+
+                        if (response.StatusCode >= HttpStatusCode.BadRequest)
+                        {
+                            error ??= await response.Content.ReadAsStringAsync(context.RequestAborted);
+                            lastErrorMessage = error;
+                            lastStatusCode = response.StatusCode;
+
+                            logger.LogError(
+                                "Claude 请求失败 (账户: {AccountId}, 状态码: {StatusCode}, 尝试: {Attempt}/{MaxRetries}): {Error}",
+                                account.Id,
+                                response.StatusCode,
+                                attempt,
+                                MaxRetries,
+                                error);
+
+                            if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                            {
+                                await aiAccountService.DisableAccount(account.Id);
+                            }
+
+                            var isClientError =
+                                response.StatusCode == HttpStatusCode.BadRequest
+                                || ClientErrorKeywords.Any(keyword =>
+                                    error.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+
+                            if (isClientError)
+                            {
+                                await requestLogService.RecordFailure(
+                                    logId,
+                                    stopwatch,
+                                    (int)response.StatusCode,
+                                    error);
+
+                                await WriteAnthropicError(
+                                    context,
+                                    (int)response.StatusCode,
+                                    error,
+                                    "invalid_request_error");
+
+                                return;
+                            }
+
+                            if (attempt < MaxRetries)
+                            {
+                                continue;
+                            }
+
+                            break;
+                        }
+
+                        if (!string.IsNullOrEmpty(conversationId))
+                        {
+                            quotaCache.SetConversationAccount(conversationId, account.Id);
+                        }
+
+                        // 提取 Claude (Anthropic) 限流信息（包含 Unified 5h/7d）
+                        var quotaInfo =
+                            AccountQuotaCacheService.ExtractFromAnthropicHeaders(account.Id, response.Headers);
+                        if (quotaInfo != null)
+                        {
+                            quotaCache.UpdateQuota(quotaInfo);
+                        }
+
+                        if (input.Stream)
+                        {
+                            await requestLogService.RecordSuccess(
                                 logId,
                                 stopwatch,
                                 (int)response.StatusCode,
-                                error);
+                                timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
 
-                            await WriteAnthropicError(
-                                context,
-                                (int)response.StatusCode,
-                                error,
-                                "invalid_request_error");
+                            context.Response.StatusCode = (int)response.StatusCode;
+                            context.Response.ContentType = "text/event-stream;charset=utf-8";
+                            context.Response.Headers.TryAdd("Cache-Control", "no-cache");
+                            context.Response.Headers.TryAdd("Connection", "keep-alive");
+                            context.Response.Headers.TryAdd("X-Accel-Buffering", "no");
+
+                            await context.Response.Body.FlushAsync(context.RequestAborted);
+
+                            await using var stream = await response.Content.ReadAsStreamAsync(context.RequestAborted);
+                            using var reader = new StreamReader(stream, Encoding.UTF8);
+
+                            while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
+                            {
+                                await context.Response.WriteAsync(line.TrimEnd()).ConfigureAwait(false);
+                                if (line.StartsWith("data:"))
+                                {
+                                    await context.Response.Body.WriteAsync(OpenAIConstant.NewLine);
+                                }
+                                else
+                                {
+                                    await context.Response.Body.WriteAsync(OpenAIConstant.NewLine);
+                                }
+
+                                await context.Response.Body.FlushAsync(context.RequestAborted);
+                            }
 
                             return;
                         }
 
-                        if (attempt < MaxRetries)
-                        {
-                            continue;
-                        }
+                        var body = await response.Content.ReadAsStringAsync(context.RequestAborted);
 
-                        break;
-                    }
-
-                    if (!string.IsNullOrEmpty(conversationId))
-                    {
-                        quotaCache.SetConversationAccount(conversationId, account.Id);
-                    }
-
-                    if (input.Stream)
-                    {
                         await requestLogService.RecordSuccess(
                             logId,
                             stopwatch,
@@ -345,47 +444,15 @@ public class AnthropicService(
                             timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
 
                         context.Response.StatusCode = (int)response.StatusCode;
-                        context.Response.ContentType = "text/event-stream;charset=utf-8";
-                        context.Response.Headers.TryAdd("Cache-Control", "no-cache");
-                        context.Response.Headers.TryAdd("Connection", "keep-alive");
-                        context.Response.Headers.TryAdd("X-Accel-Buffering", "no");
-
-                        await context.Response.Body.FlushAsync(context.RequestAborted);
-
-                        await using var stream = await response.Content.ReadAsStreamAsync(context.RequestAborted);
-                        using var reader = new StreamReader(stream, Encoding.UTF8);
-
-                        while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
-                        {
-                            await context.Response.WriteAsync(line).ConfigureAwait(false);
-                            if (line.StartsWith("data:"))
-                            {
-                                await context.Response.Body.WriteAsync(OpenAIConstant.DoubleNewLine);
-                            }
-                            else
-                            {
-                                await context.Response.Body.WriteAsync(OpenAIConstant.NewLine);
-                            }
-
-                            await context.Response.Body.FlushAsync(context.RequestAborted);
-                        }
-
+                        context.Response.ContentType =
+                            response.Content.Headers.ContentType?.ToString() ?? "application/json";
+                        await context.Response.WriteAsync(body, Encoding.UTF8);
                         return;
                     }
-
-                    var body = await response.Content.ReadAsStringAsync(context.RequestAborted);
-
-                    await requestLogService.RecordSuccess(
-                        logId,
-                        stopwatch,
-                        (int)response.StatusCode,
-                        timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
-
-                    context.Response.StatusCode = (int)response.StatusCode;
-                    context.Response.ContentType =
-                        response.Content.Headers.ContentType?.ToString() ?? "application/json";
-                    await context.Response.WriteAsync(body, Encoding.UTF8);
-                    return;
+                    finally
+                    {
+                        response?.Dispose();
+                    }
                 }
                 else if (account.Provider == AIProviders.Factory)
                 {
@@ -407,90 +474,52 @@ public class AnthropicService(
                         break;
                     }
 
-                    if (input.Systems != null)
-                    {
-                        // Factory AI 特殊处理
-                        foreach (var system in input.Systems)
-                        {
-                            if (system.Text?.Equals("You are Claude Code, Anthropic's official CLI for Claude.",
-                                    StringComparison.OrdinalIgnoreCase) == true || system.Text?.Equals(
-                                    "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
-                                    StringComparison.OrdinalIgnoreCase) == true)
-                            {
-                                system.Text = "You are Droid, an AI software engineering agent built by Factory.";
+                    // Factory 会做 system prompt 校验：必须使用固定的 Droid system。
+                    // 为避免 403，这里不透传外部传入的 system，统一注入 Factory 需要的 system。
 
-                                // 在"You are Droid, an AI software engineering agent built by Factory."后面添加一句claude cli提示，注意
-                                var claudeCliPrompt = new AnthropicMessageContent
-                                {
-                                    Type = "text",
-                                    Text =
-                                        "You work within an interactive cli tool and you are focused on helping users with any software engineering tasks.\nGuidelines:\n- Use tools when necessary.\n- Don't stop until all user tasks are completed.\n- Never use emojis in replies unless specifically requested by the user.\n- Only add absolutely necessary comments to the code you generate.\n- Your replies should be concise and you should preserve users tokens.\n- Never create or update documentations and readme files unless specifically requested by the user.\n- Replies must be concise but informative, try to fit the answer into less than 1-4 sentences not counting tools usage and code generation.\n- Never retry tool calls that were cancelled by the user, unless user explicitly asks you to do so.\n- Use FetchUrl to fetch Factory docs (https://docs.factory.ai/factory-docs-map.md) when:\n  - Asks questions in the second person (eg. \"are you able...\", \"can you do...\")\n  - User asks about Droid capabilities or features\n  - User needs help with Droid commands, configuration, or settings\n  - User asks about skills, MCP, hooks, custom droids, BYOK, or other Factory specific features\nFocus on the task at hand, don't try to jump to related but not requested tasks.\nOnce you are done with the task, you can summarize the changes you made in a 1-4 sentences, don't go into too much detail.\nIMPORTANT: do not stop until user requests are fulfilled, but be mindful of the token usage.\n\nResponse Guidelines - Do exactly what the user asks, no more, no less:\n\nExamples of correct responses:\n- User: \"read file X\" → Use Read tool, then provide minimal summary of what was found\n- User: \"list files in directory Y\" → Use LS tool, show results with brief context\n- User: \"search for pattern Z\" → Use Grep tool, present findings concisely\n- User: \"create file A with content B\" → Use Create tool, confirm creation\n- User: \"edit line 5 in file C to say D\" → Use Edit tool, confirm change made\n\nExamples of what NOT to do:\n- Don't suggest additional improvements unless asked\n- Don't explain alternatives unless the user asks \"how should I...\"\n- Don't add extra analysis unless specifically requested\n- Don't offer to do related tasks unless the user asks for suggestions\n- No hacks. No unreasonable shortcuts.\n- Do not give up if you encounter unexpected problems. Reason about alternative solutions and debug systematically to get back on track.\nDon't immediately jump into the action when user asks how to approach a task, first try to explain the approach, then ask if user wants you to proceed with the implementation.\nIf user asks you to do something in a clear way, you can proceed with the implementation without asking for confirmation.\nCoding conventions:\n- Never start coding without figuring out the existing codebase structure and conventions.\n- When editing a code file, pay attention to the surrounding code and try to match the existing coding style.\n- Follow approaches and use already used libraries and patterns. Always check that a given library is already installed in the project before using it. Even most popular libraries can be missing in the project.\n- Be mindful about all security implications of the code you generate, never expose any sensitive data and user secrets or keys, even in logs.\n- Before ANY git commit or push operation:\n    - Run 'git diff --cached' to review ALL changes being committed\n    - Run 'git status' to confirm all files being included\n    - Examine the diff for secrets, credentials, API keys, or sensitive data (especially in config files, logs, environment files, and build outputs) \n    - if detected, STOP and warn the user\nTesting and verification:\nBefore completing the task, always verify that the code you generated works as expected. Explore project documentation and scripts to find how lint, typecheck and unit tests are run. Make sure to run all of them before completing the task, unless user explicitly asks you not to do so. Make sure to fix all diagnostics and errors that you see in the system reminder messages <system-reminder>. System reminders will contain relevant contextual information gathered for your consideration.",
-                                };
-                                input.Systems.Insert(1, claudeCliPrompt);
-                                break;
+                    if (IsFactoryTokenExpired(factory))
+                    {
+                        try
+                        {
+                            await factoryOAuthService.RefreshFactoryOAuthTokenAsync(account);
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogWarning(
+                                ex,
+                                "Factory 账户 {AccountId} Token 已过期且刷新失败，已禁用账户",
+                                account.Id);
+
+                            lastErrorMessage = $"账户 {account.Id} Token 刷新失败: {ex.Message}";
+                            lastStatusCode = HttpStatusCode.Unauthorized;
+
+                            await aiAccountService.DisableAccount(account.Id);
+
+                            if (attempt < MaxRetries)
+                            {
+                                continue;
                             }
+
+                            break;
+                        }
+
+                        factory = account.GetFactoryOauth();
+                        if (factory == null || string.IsNullOrWhiteSpace(factory.AccessToken))
+                        {
+                            lastErrorMessage = $"账户 {account.Id} Factory Token 刷新后仍无效";
+                            lastStatusCode = HttpStatusCode.Unauthorized;
+                            logger.LogWarning(lastErrorMessage);
+
+                            await aiAccountService.DisableAccount(account.Id);
+
+                            if (attempt < MaxRetries)
+                            {
+                                continue;
+                            }
+
+                            break;
                         }
                     }
-                    else
-                    {
-                        input.Systems = new List<AnthropicMessageContent>
-                        {
-                            new AnthropicMessageContent
-                            {
-                                Type = "text",
-                                Text = "You are Droid, an AI software engineering agent built by Factory."
-                            },
-                            new AnthropicMessageContent
-                            {
-                                Type = "text",
-                                Text =
-                                    "You work within an interactive cli tool and you are focused on helping users with any software engineering tasks.\nGuidelines:\n- Use tools when necessary.\n- Don't stop until all user tasks are completed.\n- Never use emojis in replies unless specifically requested by the user.\n- Only add absolutely necessary comments to the code you generate.\n- Your replies should be concise and you should preserve users tokens.\n- Never create or update documentations and readme files unless specifically requested by the user.\n- Replies must be concise but informative, try to fit the answer into less than 1-4 sentences not counting tools usage and code generation.\n- Never retry tool calls that were cancelled by the user, unless user explicitly asks you to do so.\n- Use FetchUrl to fetch Factory docs (https://docs.factory.ai/factory-docs-map.md) when:\n  - Asks questions in the second person (eg. \"are you able...\", \"can you do...\")\n  - User asks about Droid capabilities or features\n  - User needs help with Droid commands, configuration, or settings\n  - User asks about skills, MCP, hooks, custom droids, BYOK, or other Factory specific features\nFocus on the task at hand, don't try to jump to related but not requested tasks.\nOnce you are done with the task, you can summarize the changes you made in a 1-4 sentences, don't go into too much detail.\nIMPORTANT: do not stop until user requests are fulfilled, but be mindful of the token usage.\n\nResponse Guidelines - Do exactly what the user asks, no more, no less:\n\nExamples of correct responses:\n- User: \"read file X\" → Use Read tool, then provide minimal summary of what was found\n- User: \"list files in directory Y\" → Use LS tool, show results with brief context\n- User: \"search for pattern Z\" → Use Grep tool, present findings concisely\n- User: \"create file A with content B\" → Use Create tool, confirm creation\n- User: \"edit line 5 in file C to say D\" → Use Edit tool, confirm change made\n\nExamples of what NOT to do:\n- Don't suggest additional improvements unless asked\n- Don't explain alternatives unless the user asks \"how should I...\"\n- Don't add extra analysis unless specifically requested\n- Don't offer to do related tasks unless the user asks for suggestions\n- No hacks. No unreasonable shortcuts.\n- Do not give up if you encounter unexpected problems. Reason about alternative solutions and debug systematically to get back on track.\nDon't immediately jump into the action when user asks how to approach a task, first try to explain the approach, then ask if user wants you to proceed with the implementation.\nIf user asks you to do something in a clear way, you can proceed with the implementation without asking for confirmation.\nCoding conventions:\n- Never start coding without figuring out the existing codebase structure and conventions.\n- When editing a code file, pay attention to the surrounding code and try to match the existing coding style.\n- Follow approaches and use already used libraries and patterns. Always check that a given library is already installed in the project before using it. Even most popular libraries can be missing in the project.\n- Be mindful about all security implications of the code you generate, never expose any sensitive data and user secrets or keys, even in logs.\n- Before ANY git commit or push operation:\n    - Run 'git diff --cached' to review ALL changes being committed\n    - Run 'git status' to confirm all files being included\n    - Examine the diff for secrets, credentials, API keys, or sensitive data (especially in config files, logs, environment files, and build outputs) \n    - if detected, STOP and warn the user\nTesting and verification:\nBefore completing the task, always verify that the code you generated works as expected. Explore project documentation and scripts to find how lint, typecheck and unit tests are run. Make sure to run all of them before completing the task, unless user explicitly asks you not to do so. Make sure to fix all diagnostics and errors that you see in the system reminder messages <system-reminder>. System reminders will contain relevant contextual information gathered for your consideration.",
-                            }
-                        };
-                    }
-                    // if (IsClaudeTokenExpired(claudeOauth))
-                    // {
-                    //     try
-                    //     {
-                    //         await claudeCodeOAuthService.RefreshClaudeOAuthTokenAsync(account);
-                    //     }
-                    //     catch (Exception ex)
-                    //     {
-                    //         logger.LogWarning(
-                    //             ex,
-                    //             "Claude 账户 {AccountId} Token 已过期且刷新失败，已禁用账户",
-                    //             account.Id);
-                    //
-                    //         lastErrorMessage = $"账户 {account.Id} Token 刷新失败: {ex.Message}";
-                    //         lastStatusCode = HttpStatusCode.Unauthorized;
-                    //
-                    //         await aiAccountService.DisableAccount(account.Id);
-                    //
-                    //         if (attempt < MaxRetries)
-                    //         {
-                    //             continue;
-                    //         }
-                    //
-                    //         break;
-                    //     }
-                    //
-                    //     claudeOauth = account.GetClaudeOauth();
-                    //     if (claudeOauth == null || string.IsNullOrWhiteSpace(claudeOauth.AccessToken))
-                    //     {
-                    //         lastErrorMessage = $"账户 {account.Id} Claude Token 刷新后仍无效";
-                    //         lastStatusCode = HttpStatusCode.Unauthorized;
-                    //         logger.LogWarning(lastErrorMessage);
-                    //
-                    //         await aiAccountService.DisableAccount(account.Id);
-                    //
-                    //         if (attempt < MaxRetries)
-                    //         {
-                    //             continue;
-                    //         }
-                    //
-                    //         break;
-                    //     }
-                    // }
 
                     // 准备请求头和代理配置
                     var headers = new Dictionary<string, string>
@@ -501,11 +530,10 @@ public class AnthropicService(
                     headers["User-Agent"] = "factory-cli/0.41.0";
                     headers["Accept-Encoding"] = "gzip, deflate, br";
                     headers["Accept-Language"] = "*";
-                    headers["accept"] = "text/event-stream";
+                    headers["Accept"] = input.Stream ? "text/event-stream" : "application/json";
                     headers["x-factory-client"] = "cli";
                     headers["x-session-id"] = Guid.NewGuid().ToString();
                     headers["x-assistant-message-id"] = Guid.NewGuid().ToString();
-                    headers["x-factory-client"] = "cli";
                     headers["x-stainless-arch"] = "x64";
                     headers["x-stainless-helper-method"] = "stream";
                     headers["x-stainless-lang"] = "js";
@@ -525,50 +553,95 @@ public class AnthropicService(
                         request.Headers.Add(header.Key, header.Value);
                     }
 
-                    foreach (var message in input.Messages)
+                    var systems = new List<AnthropicMessageContent>
                     {
-                        if (message.Contents?.Count > 0)
+                        new()
                         {
-                            foreach (var messageContent in message.Contents.Where(x =>
-                                         x.Type == "text"))
+                            Type = "text",
+                            Text = AIPrompt.FactoryCLI
+                        },
+                        new()
+                        {
+                            Type = "text",
+                            Text =
+                                "You work within an interactive cli tool and you are focused on helping users with any software engineering tasks.\nGuidelines:\n- Use tools when necessary.\n- Don't stop until all user tasks are completed.\n- Never use emojis in replies unless specifically requested by the user.\n- Only add absolutely necessary comments to the code you generate.\n- Your replies should be concise and you should preserve users tokens.\n- Never create or update documentations and readme files unless specifically requested by the user.\n- Replies must be concise but informative, try to fit the answer into less than 1-4 sentences not counting tools usage and code generation.\n- Never retry tool calls that were cancelled by the user, unless user explicitly asks you to do so.\n- Use FetchUrl to fetch Factory docs (https://docs.factory.ai/factory-docs-map.md) when:\n  - Asks questions in the second person (eg. \"are you able...\", \"can you do...\")\n  - User asks about Droid capabilities or features\n  - User needs help with Droid commands, configuration, or settings\n  - User asks about skills, MCP, hooks, custom droids, BYOK, or other Factory specific features\nFocus on the task at hand, don't try to jump to related but not requested tasks.\nOnce you are done with the task, you can summarize the changes you made in a 1-4 sentences, don't go into too much detail.\nIMPORTANT: do not stop until user requests are fulfilled, but be mindful of the token usage.\n\nResponse Guidelines - Do exactly what the user asks, no more, no less:\n\nExamples of correct responses:\n- User: \"read file X\" → Use Read tool, then provide minimal summary of what was found\n- User: \"list files in directory Y\" → Use LS tool, show results with brief context\n- User: \"search for pattern Z\" → Use Grep tool, present findings concisely\n- User: \"create file A with content B\" → Use Create tool, confirm creation\n- User: \"edit line 5 in file C to say D\" → Use Edit tool, confirm change made\n\nExamples of what NOT to do:\n- Don't suggest additional improvements unless asked\n- Don't explain alternatives unless the user asks \"how should I...\"\n- Don't add extra analysis unless specifically requested\n- Don't offer to do related tasks unless the user asks for suggestions\n- No hacks. No unreasonable shortcuts.\n- Do not give up if you encounter unexpected problems. Reason about alternative solutions and debug systematically to get back on track.\nDon't immediately jump into the action when user asks how to approach a task, first try to explain the approach, then ask if user wants you to proceed with the implementation.\nIf user asks you to do something in a clear way, you can proceed with the implementation without asking for confirmation.\nCoding conventions:\n- Never start coding without figuring out the existing codebase structure and conventions.\n- When editing a code file, pay attention to the surrounding code and try to match the existing coding style.\n- Follow approaches and use already used libraries and patterns. Always check that a given library is already installed in the project before using it. Even most popular libraries can be missing in the project.\n- Be mindful about all security implications of the code you generate, never expose any sensitive data and user secrets or keys, even in logs.\n- Before ANY git commit or push operation:\n    - Run 'git diff --cached' to review ALL changes being committed\n    - Run 'git status' to confirm all files being included\n    - Examine the diff for secrets, credentials, API keys, or sensitive data (especially in config files, logs, environment files, and build outputs) \n    - if detected, STOP and warn the user\nTesting and verification:\nBefore completing the task, always verify that the code you generated works as expected. Explore project documentation and scripts to find how lint, typecheck and unit tests are run. Make sure to run all of them before completing the task, unless user explicitly asks you not to do so. Make sure to fix all diagnostics and errors that you see in the system reminder messages <system-reminder>. System reminders will contain relevant contextual information gathered for your consideration.",
+                        }
+                    };
+
+                    var v = JsonSerializer.Serialize(input);
+                    var obj = JsonSerializer.Deserialize<AnthropicInput>(v);
+
+                    if (input.Systems?.Any(x => x.Text != AIPrompt.FactoryCLI) == true && input.Systems?.Count == 2 &&
+                        input.Systems?.Any(x => x.Text == AIPrompt.AnthropicCLI) == true)
+                    {
+                        systems.AddRange(input.Systems.Where(x => x.Text != AIPrompt.AnthropicCLI));
+
+                        obj.Systems = new List<AnthropicMessageContent>(systems);
+                    }
+                    else if (input.Systems?.Any(x => x.Text != AIPrompt.FactoryCLI) == true)
+                    {
+                        if (!string.IsNullOrEmpty(input.System))
+                        {
+                            input.Systems = new List<AnthropicMessageContent>(systems)
                             {
-                                if (messageContent.Text?.StartsWith("<system-reminder>\nThis is a reminder") == true)
+                                new()
                                 {
-                                    messageContent.Text = messageContent.Text.Replace(
-                                        "<system-reminder>\nThis is a reminder that your todo list is currently empty. DO NOT mention this to the user explicitly because they are already aware. If you are working on tasks that would benefit from a todo list please use the TodoWrite tool to create one. If not, please feel free to ignore. Again do not mention this message to the user.\n</system-reminder>",
-                                        "<system-reminder>\n这是一个提醒，您的待办事项列表目前为空。不要明确告诉用户这一点，因为他们已经知道。如果您正在处理的任务需要待办事项列表，请使用 TodoWrite 工具创建一个。如果不需要，请随意忽略。再次提醒，不要向用户提及此消息。\n</system-reminder>");
+                                    Type = "text",
+                                    Text = input.System
                                 }
-                                else if (messageContent.Text?.StartsWith(
-                                             "<system-reminder>\nCalled the Read tool with the following input:") ==
-                                         true)
-                                {
-                                    messageContent.Text = messageContent.Text.Replace(
-                                        "<system-reminder>\nCalled the Read tool with the following input:",
-                                        "<system-reminder>\n使用以下输入调用了读取工具：");
-                                }
-                                else if (messageContent.Text?.StartsWith(
-                                             "<system-reminder>\nResult of calling the Read tool:") ==
-                                         true)
-                                {
-                                    messageContent.Text = messageContent.Text.Replace(
-                                        "<system-reminder>\nResult of calling the Read tool:",
-                                        "<system-reminder>\n调用读取工具的结果：");
-                                }
-                                else if (messageContent.Text?.StartsWith(
-                                             "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# claudeMd\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\nContents of ") ==
-                                         true)
-                                {
-                                    messageContent.Text = messageContent.Text.Replace(
-                                        "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# claudeMd\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\nContents of ",
-                                        "<system-reminder>\n在回答用户问题时，您可以使用以下上下文：\n# claudeMd\n代码库和用户说明如下。务必遵守这些说明。重要提示：这些说明优先于任何默认行为，您必须严格按照说明执行。\n\n内容如下");
-                                }
+                            };
+                        }
+                        else if (input.Systems?.Count > 0)
+                        {
+                            systems.AddRange(input.Systems);
+
+                            obj.Systems = new List<AnthropicMessageContent>(systems);
+                        }
+                    }
+
+
+                    foreach (var message in obj.Messages)
+                    {
+                        if (!(message.Contents?.Count > 0)) continue;
+                        foreach (var messageContent in message.Contents.Where(x =>
+                                     x.Type == "text"))
+                        {
+                            if (messageContent.Text?.StartsWith("<system-reminder>\nThis is a reminder") == true)
+                            {
+                                messageContent.Text = messageContent.Text.Replace(
+                                    "<system-reminder>\nThis is a reminder that your todo list is currently empty. DO NOT mention this to the user explicitly because they are already aware. If you are working on tasks that would benefit from a todo list please use the TodoWrite tool to create one. If not, please feel free to ignore. Again do not mention this message to the user.\n</system-reminder>",
+                                    "<system-reminder>\n这是一个提醒，您的待办事项列表目前为空。不要明确告诉用户这一点，因为他们已经知道。如果您正在处理的任务需要待办事项列表，请使用 TodoWrite 工具创建一个。如果不需要，请随意忽略。再次提醒，不要向用户提及此消息。\n</system-reminder>");
+                            }
+                            else if (messageContent.Text?.StartsWith(
+                                         "<system-reminder>\nCalled the Read tool with the following input:") ==
+                                     true)
+                            {
+                                messageContent.Text = messageContent.Text.Replace(
+                                    "<system-reminder>\nCalled the Read tool with the following input:",
+                                    "<system-reminder>\n使用以下输入调用了读取工具：");
+                            }
+                            else if (messageContent.Text?.StartsWith(
+                                         "<system-reminder>\nResult of calling the Read tool:") ==
+                                     true)
+                            {
+                                messageContent.Text = messageContent.Text.Replace(
+                                    "<system-reminder>\nResult of calling the Read tool:",
+                                    "<system-reminder>\n调用读取工具的结果：");
+                            }
+                            else if (messageContent.Text?.StartsWith(
+                                         "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# claudeMd\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\nContents of ") ==
+                                     true)
+                            {
+                                messageContent.Text = messageContent.Text.Replace(
+                                    "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# claudeMd\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\nContents of ",
+                                    "<system-reminder>\n在回答用户问题时，您可以使用以下上下文：\n# claudeMd\n代码库和用户说明如下。务必遵守这些说明。重要提示：这些说明优先于任何默认行为，您必须严格按照说明执行。\n\n内容如下");
                             }
                         }
                     }
 
                     request.Headers.Referrer = new Uri("https://app.factory.ai/");
 
-                    var json = JsonSerializer.Serialize(input, new JsonSerializerOptions
+                    var json = JsonSerializer.Serialize(obj, new JsonSerializerOptions
                     {
                         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
                     });
@@ -589,14 +662,14 @@ public class AnthropicService(
                         lastStatusCode = response.StatusCode;
 
                         logger.LogError(
-                            "Claude 请求失败 (账户: {AccountId}, 状态码: {StatusCode}, 尝试: {Attempt}/{MaxRetries}): {Error}",
+                            "Factory 请求失败 (账户: {AccountId}, 状态码: {StatusCode}, 尝试: {Attempt}/{MaxRetries}): {Error}",
                             account.Id,
                             response.StatusCode,
                             attempt,
                             MaxRetries,
                             error);
 
-                        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.PaymentRequired)
                         {
                             await aiAccountService.DisableAccount(account.Id);
                         }
@@ -1037,7 +1110,7 @@ public class AnthropicService(
         var trimmed = baseUrl.Trim();
         if (trimmed.EndsWith("/v1/messages", StringComparison.OrdinalIgnoreCase))
         {
-            return trimmed+"?beta=true";
+            return trimmed + "?beta=true";
         }
 
         trimmed = trimmed.TrimEnd('/');
@@ -2626,6 +2699,19 @@ public class AnthropicService(
         const int expirySkewSeconds = 60;
         var nowUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         return claudeOauth.ExpiresAt <= nowUnixSeconds + expirySkewSeconds;
+    }
+
+    private static bool IsFactoryTokenExpired(FactoryOauth factoryOauth)
+    {
+        if (factoryOauth.ExpiresAt <= 0)
+        {
+            return false;
+        }
+
+        // 提前一点刷新，避免临界点卡住（尤其是流式请求）
+        const int expirySkewSeconds = 60;
+        var nowUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        return factoryOauth.ExpiresAt <= nowUnixSeconds + expirySkewSeconds;
     }
 
 

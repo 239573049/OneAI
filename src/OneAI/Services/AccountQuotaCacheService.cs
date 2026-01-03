@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Net.Http.Headers;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Caching.Memory;
@@ -144,6 +145,113 @@ public class AccountQuotaCacheService(
             };
 
             bool hasAnyData = false;
+
+            int CalculateResetAfterSeconds(long resetAtUnixSeconds)
+            {
+                var nowUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                var remaining = resetAtUnixSeconds - nowUnixSeconds;
+                if (remaining <= 0)
+                {
+                    return 0;
+                }
+
+                return remaining > int.MaxValue ? int.MaxValue : (int)remaining;
+            }
+
+            static int ClampPercent(double value)
+            {
+                var rounded = (int)Math.Round(value, MidpointRounding.AwayFromZero);
+                return Math.Clamp(rounded, 0, 100);
+            }
+
+            // Anthropic Unified (5h / 7d) 限流信息
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-unified-status", out var unifiedStatus))
+            {
+                info.AnthropicUnifiedStatus = unifiedStatus;
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-unified-5h-status", out var fiveHourStatus))
+            {
+                info.AnthropicUnifiedFiveHourStatus = fiveHourStatus;
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-unified-5h-reset", out var fiveHourResetRaw)
+                && long.TryParse(fiveHourResetRaw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var fiveHourResetAt))
+            {
+                info.PrimaryResetAt = fiveHourResetAt;
+                info.PrimaryResetAfterSeconds = CalculateResetAfterSeconds(fiveHourResetAt);
+                info.PrimaryWindowMinutes = 5 * 60;
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-unified-5h-utilization", out var fiveHourUtilizationRaw)
+                && double.TryParse(fiveHourUtilizationRaw, NumberStyles.Float, CultureInfo.InvariantCulture, out var fiveHourUtilization))
+            {
+                info.AnthropicUnifiedFiveHourUtilization = fiveHourUtilization;
+                var percent = fiveHourUtilization <= 1 ? fiveHourUtilization * 100 : fiveHourUtilization;
+                info.PrimaryUsedPercent = ClampPercent(percent);
+                info.PrimaryWindowMinutes = 5 * 60;
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-unified-7d-status", out var sevenDayStatus))
+            {
+                info.AnthropicUnifiedSevenDayStatus = sevenDayStatus;
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-unified-7d-reset", out var sevenDayResetRaw)
+                && long.TryParse(sevenDayResetRaw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var sevenDayResetAt))
+            {
+                info.SecondaryResetAt = sevenDayResetAt;
+                info.SecondaryResetAfterSeconds = CalculateResetAfterSeconds(sevenDayResetAt);
+                info.SecondaryWindowMinutes = 7 * 24 * 60;
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-unified-7d-utilization", out var sevenDayUtilizationRaw)
+                && double.TryParse(sevenDayUtilizationRaw, NumberStyles.Float, CultureInfo.InvariantCulture, out var sevenDayUtilization))
+            {
+                info.AnthropicUnifiedSevenDayUtilization = sevenDayUtilization;
+                var percent = sevenDayUtilization <= 1 ? sevenDayUtilization * 100 : sevenDayUtilization;
+                info.SecondaryUsedPercent = ClampPercent(percent);
+                info.SecondaryWindowMinutes = 7 * 24 * 60;
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-unified-representative-claim", out var representativeClaim))
+            {
+                info.AnthropicUnifiedRepresentativeClaim = representativeClaim;
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-unified-fallback-percentage", out var fallbackPercentageRaw)
+                && double.TryParse(fallbackPercentageRaw, NumberStyles.Float, CultureInfo.InvariantCulture, out var fallbackPercentage))
+            {
+                info.AnthropicUnifiedFallbackPercentage = fallbackPercentage;
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-unified-reset", out var unifiedResetRaw)
+                && long.TryParse(unifiedResetRaw, NumberStyles.Integer, CultureInfo.InvariantCulture, out var unifiedResetAt))
+            {
+                info.AnthropicUnifiedResetAt = unifiedResetAt;
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-unified-overage-disabled-reason", out var overageDisabledReason))
+            {
+                info.AnthropicUnifiedOverageDisabledReason = overageDisabledReason;
+                hasAnyData = true;
+            }
+
+            if (TryGetHeaderValue(headers, "anthropic-ratelimit-unified-overage-status", out var overageStatus))
+            {
+                info.AnthropicUnifiedOverageStatus = overageStatus;
+                hasAnyData = true;
+            }
 
             // 提取 Input tokens 限流信息
             if (TryGetHeaderValue(headers, "anthropic-ratelimit-input-tokens-limit", out var inputLimit))

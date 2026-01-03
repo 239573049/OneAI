@@ -75,6 +75,26 @@ public static class AIAccountEndpoints
             .Produces<ApiResponse>(404)
             .Produces<ApiResponse>(500);
 
+        // 刷新 Claude 账户配额状态
+        group.MapPost("/{id}/refresh-claude-quota", RefreshClaudeQuotaStatus)
+            .WithName("RefreshClaudeQuotaStatus")
+            .WithSummary("刷新Claude账户配额状态")
+            .WithDescription("手动刷新指定Claude账户的配额/限流信息（通过请求上游并解析响应头）")
+            .Produces<ApiResponse<AccountQuotaStatusDto>>(200)
+            .Produces<ApiResponse>(401)
+            .Produces<ApiResponse>(404)
+            .Produces<ApiResponse>(500);
+
+        // 刷新 Factory 账户配额状态
+        group.MapPost("/{id}/refresh-factory-quota", RefreshFactoryQuotaStatus)
+            .WithName("RefreshFactoryQuotaStatus")
+            .WithSummary("刷新Factory账户配额状态")
+            .WithDescription("手动刷新指定Factory账户的配额/限流信息（通过请求上游并解析响应头）")
+            .Produces<ApiResponse<AccountQuotaStatusDto>>(200)
+            .Produces<ApiResponse>(401)
+            .Produces<ApiResponse>(404)
+            .Produces<ApiResponse>(500);
+
         // 获取 Gemini Antigravity 可用模型列表
         group.MapGet("/{id}/antigravity-models", GetAntigravityModels)
             .WithName("GetAntigravityModels")
@@ -195,6 +215,52 @@ public static class AIAccountEndpoints
         try
         {
             var status = await accountService.RefreshAntigravityQuotaStatusAsync(id);
+            if (status == null)
+            {
+                return ApiResponse<AccountQuotaStatusDto>.Fail("账户不存在或刷新失败", 404);
+            }
+
+            return ApiResponse<AccountQuotaStatusDto>.Success(status, "刷新配额状态成功");
+        }
+        catch (Exception ex)
+        {
+            return ApiResponse<AccountQuotaStatusDto>.Fail($"刷新配额状态失败: {ex.Message}", 500);
+        }
+    }
+
+    /// <summary>
+    /// 刷新 Claude 账户配额状态
+    /// </summary>
+    private static async Task<ApiResponse<AccountQuotaStatusDto>> RefreshClaudeQuotaStatus(
+        int id,
+        AIAccountService accountService)
+    {
+        try
+        {
+            var status = await accountService.RefreshClaudeQuotaStatusAsync(id);
+            if (status == null)
+            {
+                return ApiResponse<AccountQuotaStatusDto>.Fail("账户不存在或刷新失败", 404);
+            }
+
+            return ApiResponse<AccountQuotaStatusDto>.Success(status, "刷新配额状态成功");
+        }
+        catch (Exception ex)
+        {
+            return ApiResponse<AccountQuotaStatusDto>.Fail($"刷新配额状态失败: {ex.Message}", 500);
+        }
+    }
+
+    /// <summary>
+    /// 刷新 Factory 账户配额状态
+    /// </summary>
+    private static async Task<ApiResponse<AccountQuotaStatusDto>> RefreshFactoryQuotaStatus(
+        int id,
+        AIAccountService accountService)
+    {
+        try
+        {
+            var status = await accountService.RefreshFactoryQuotaStatusAsync(id);
             if (status == null)
             {
                 return ApiResponse<AccountQuotaStatusDto>.Fail("账户不存在或刷新失败", 404);

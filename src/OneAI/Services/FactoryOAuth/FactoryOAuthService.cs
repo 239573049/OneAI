@@ -11,7 +11,9 @@ namespace OneAI.Services.FactoryOAuth;
 /// <summary>
 /// Factory OAuth (WorkOS Device Authorization Flow) 服务
 /// </summary>
-public class FactoryOAuthService(ILogger<FactoryOAuthService> logger)
+public class FactoryOAuthService(
+    ILogger<FactoryOAuthService> logger,
+    AppDbContext appDbContext)
 {
     /// <summary>
     /// 生成 Factory OAuth Device Code 授权信息（并写入会话缓存）
@@ -374,6 +376,36 @@ public class FactoryOAuthService(ILogger<FactoryOAuthService> logger)
             logger.LogError(ex, "Factory token refresh response parsing failed: {Message}", ex.Message);
             throw new Exception($"Token refresh failed: Invalid response format - {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// 刷新 Factory OAuth Token 并更新账户（类似于 ClaudeCodeOAuthService）
+    /// </summary>
+    public async Task RefreshFactoryOAuthTokenAsync(AIAccount account, ProxyConfig? proxyConfig = null)
+    {
+        var currentOauth = account.GetFactoryOauth();
+        if (string.IsNullOrEmpty(currentOauth?.RefreshToken))
+        {
+            throw new InvalidOperationException("没有可用的 Factory 刷新令牌");
+        }
+
+        var updatedOauth = await RefreshTokenAsync(
+            currentOauth.RefreshToken,
+            currentOauth.OrganizationId,
+            proxyConfig);
+
+        account.SetFactoryOAuth(updatedOauth);
+
+        if (updatedOauth.UserInfo != null && !string.IsNullOrWhiteSpace(updatedOauth.UserInfo.Email))
+        {
+            account.Email = updatedOauth.UserInfo.Email;
+            account.Name ??= updatedOauth.UserInfo.Email;
+        }
+
+        appDbContext.AIAccounts.Update(account);
+        await appDbContext.SaveChangesAsync();
+
+        logger.LogInformation("Factory 账户 {AccountId} Token 刷新成功", account.Id);
     }
 
     /// <summary>

@@ -2,6 +2,8 @@
 
 public class AIPrompt
 {
+    public const string FactoryCLI = "You are Droid, an AI software engineering agent built by Factory.";
+    
     public const string AnthropicCLI = "You are Claude Code, Anthropic's official CLI for Claude.";
     
     public const string CodeXPrompt =
