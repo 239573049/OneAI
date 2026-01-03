@@ -124,7 +124,7 @@ public class GeminiAntigravityOAuthService(
 
         var account = new AIAccount
         {
-            Provider = AIProviders.GeminiAntigravity,
+            Provider = AIProviders.Gemini,
             ApiKey = string.Empty,
             BaseUrl = string.Empty,
             CreatedAt = DateTime.Now,

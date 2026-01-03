@@ -818,6 +818,15 @@ public sealed class ChatCompletionsService(
             var account = await GetChatCompletionsAccount(conversationId, preferredProvider, aiAccountService);
             if (account == null)
             {
+                if (!string.IsNullOrWhiteSpace(lastErrorMessage))
+                {
+                    logger.LogWarning(
+                        "账户池都无可用，返回上一次错误 (状态码: {StatusCode}): {ErrorMessage}",
+                        (int)(lastStatusCode ?? HttpStatusCode.ServiceUnavailable),
+                        lastErrorMessage);
+                    break;
+                }
+
                 lastErrorMessage = "账户池都无可用";
                 lastStatusCode = HttpStatusCode.ServiceUnavailable;
                 break;
@@ -970,10 +979,8 @@ public sealed class ChatCompletionsService(
                     var payload = BuildOpenAiChatCompletionsPayload(openAiRequest, upstreamModel, isStreaming);
 
                     var json = payload.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
-                    using var requestMessage = new HttpRequestMessage(HttpMethod.Post, url)
-                    {
-                        Content = new StringContent(json, Encoding.UTF8, "application/json")
-                    };
+                    using var requestMessage = new HttpRequestMessage(HttpMethod.Post, url);
+                    requestMessage.Content = new StringContent(json, Encoding.UTF8, "application/json");
 
                     requestMessage.Headers.TryAddWithoutValidation("Authorization", "Bearer " + factoryOauth.AccessToken);
                     requestMessage.Headers.TryAddWithoutValidation(
@@ -1160,7 +1167,7 @@ public sealed class ChatCompletionsService(
 
             context.Response.ContentType = "application/json; charset=utf-8";
             context.Response.StatusCode = (int)response.StatusCode;
-            await context.Response.WriteAsync(openAiResponse.ToJsonString());
+            await context.Response.WriteAsync(openAiResponse.ToJsonString(JsonOptions.DefaultOptions));
         }
     }
 
@@ -1939,7 +1946,7 @@ public sealed class ChatCompletionsService(
     private static async Task WriteSseJsonAsync(HttpContext context, JsonObject json, CancellationToken ct)
     {
         await context.Response.WriteAsync("data: ", ct);
-        await context.Response.WriteAsync(json.ToJsonString(), ct);
+        await context.Response.WriteAsync(json.ToJsonString(JsonOptions.DefaultOptions), ct);
         await context.Response.WriteAsync("\n\n", ct);
         await context.Response.Body.FlushAsync(ct);
     }
@@ -1982,7 +1989,7 @@ public sealed class ChatCompletionsService(
                 ["code"] = statusCode
             }
         };
-        await context.Response.WriteAsync(payload.ToJsonString());
+        await context.Response.WriteAsync(payload.ToJsonString(JsonOptions.DefaultOptions));
     }
 
     private static JsonObject? ConvertUsageMetadata(JsonElement gemini)

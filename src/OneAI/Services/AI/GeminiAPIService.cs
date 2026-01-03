@@ -107,23 +107,19 @@ public class GeminiAPIService(
 
                 if (account == null)
                 {
-                    if (!string.IsNullOrEmpty(lastErrorMessage))
+                    if (!string.IsNullOrWhiteSpace(lastErrorMessage))
                     {
-                        await context.Response.WriteAsJsonAsync(lastErrorMessage);
-                        return;
+                        logger.LogWarning(
+                            "无可用的 Gemini 账户，返回上一次错误 (状态码: {StatusCode}): {ErrorMessage}",
+                            (int)(lastStatusCode ?? HttpStatusCode.ServiceUnavailable),
+                            lastErrorMessage);
+                        break;
                     }
 
                     lastErrorMessage = $"无可用的 Gemini 账户（尝试 {attempt}/{maxRetries}）";
                     lastStatusCode = HttpStatusCode.ServiceUnavailable;
 
                     logger.LogWarning(lastErrorMessage);
-
-                    if (attempt < maxRetries)
-                    {
-                        await Task.Delay(1000); // 等待后重试
-                        continue;
-                    }
-
                     break;
                 }
 
@@ -134,12 +130,6 @@ public class GeminiAPIService(
                     var geminiOAuth = await GetValidGeminiOAuthAsync(account, aiAccountService);
                     if (geminiOAuth == null)
                     {
-                        if (!string.IsNullOrEmpty(lastErrorMessage))
-                        {
-                            await context.Response.WriteAsJsonAsync(lastErrorMessage);
-                            return;
-                        }
-
                         lastErrorMessage = $"账户 {account.Id} Gemini Token 无效或已过期且刷新失败";
                         lastStatusCode = HttpStatusCode.Unauthorized;
 
@@ -474,23 +464,19 @@ public class GeminiAPIService(
 
                 if (account == null)
                 {
+                    if (!string.IsNullOrWhiteSpace(lastErrorMessage))
+                    {
+                        logger.LogWarning(
+                            "无可用的 Gemini 账户，返回上一次错误 (状态码: {StatusCode}): {ErrorMessage}",
+                            (int)(lastStatusCode ?? HttpStatusCode.ServiceUnavailable),
+                            lastErrorMessage);
+                        break;
+                    }
+
                     lastErrorMessage = $"无可用的 Gemini 账户（尝试 {attempt}/{maxRetries}）";
                     lastStatusCode = HttpStatusCode.ServiceUnavailable;
 
                     logger.LogWarning(lastErrorMessage);
-
-                    if (!string.IsNullOrEmpty(lastErrorMessage))
-                    {
-                        await context.Response.WriteAsJsonAsync(lastErrorMessage);
-                        return;
-                    }
-
-                    if (attempt < maxRetries)
-                    {
-                        await Task.Delay(1000);
-                        continue;
-                    }
-
                     break;
                 }
 

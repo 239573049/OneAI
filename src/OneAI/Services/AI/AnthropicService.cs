@@ -132,6 +132,29 @@ public class AnthropicService(
 
                 if (account == null)
                 {
+                    if (!string.IsNullOrWhiteSpace(lastErrorMessage))
+                    {
+                        var statusCode = (int)(lastStatusCode ?? HttpStatusCode.ServiceUnavailable);
+                        logger.LogWarning(
+                            "账户池都无可用，返回上一次错误 (状态码: {StatusCode}): {ErrorMessage}",
+                            statusCode,
+                            lastErrorMessage);
+
+                        await requestLogService.RecordFailure(
+                            logId,
+                            stopwatch,
+                            statusCode,
+                            lastErrorMessage);
+
+                        await WriteAnthropicError(
+                            context,
+                            statusCode,
+                            lastErrorMessage,
+                            "api_error");
+
+                        return;
+                    }
+
                     const string noAccountMessage = "账户池都无可用";
                     logger.LogWarning(noAccountMessage);
 
@@ -225,10 +248,7 @@ public class AnthropicService(
                     var hasExplicitApiKey = !string.IsNullOrWhiteSpace(account.ApiKey);
                     var defaultUseApiKeyHeader = isAnthropicBase && hasExplicitApiKey;
 
-                    var json = JsonSerializer.Serialize(input, new JsonSerializerOptions
-                    {
-                        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-                    });
+                    var json = JsonSerializer.Serialize(input, JsonOptions.DefaultOptions);
 
                     Dictionary<string, string> BuildClaudeHeaders(bool preferApiKeyHeader)
                     {
@@ -311,30 +331,6 @@ public class AnthropicService(
                     try
                     {
                         response = await SendClaudeAsync(BuildClaudeHeaders(useApiKeyHeader));
-
-                        // Claude Code (OAuth token) calls may fail if upstream disables OAuth auth.
-                        // Retry once using x-api-key to maximize compatibility with upstream behavior changes.
-                        if (!hasExplicitApiKey && isAnthropicBase && response.StatusCode >= HttpStatusCode.BadRequest)
-                        {
-                            error = await response.Content.ReadAsStringAsync(context.RequestAborted);
-
-                            var oauthNotSupported =
-                                response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden
-                                && error.Contains(
-                                    "OAuth authentication is currently not supported",
-                                    StringComparison.OrdinalIgnoreCase);
-
-                            if (oauthNotSupported)
-                            {
-                                logger.LogWarning(
-                                    "Claude OAuth 鉴权被上游拒绝，尝试改用 x-api-key 方式重试 (账户: {AccountId})",
-                                    account.Id);
-
-                                response.Dispose();
-                                response = await SendClaudeAsync(BuildClaudeHeaders(true));
-                                error = null;
-                            }
-                        }
 
                         if (response.StatusCode >= HttpStatusCode.BadRequest)
                         {

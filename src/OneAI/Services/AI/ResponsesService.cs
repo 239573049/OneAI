@@ -126,20 +126,19 @@ public class ResponsesService
 
                 if (account == null)
                 {
-                    const string noAccountMessage = "账户池都无可用";
-                    _logger.LogWarning(noAccountMessage);
+                    if (!string.IsNullOrWhiteSpace(lastErrorMessage))
+                    {
+                        _logger.LogWarning(
+                            "账户池都无可用，返回上一次错误 (状态码: {StatusCode}): {ErrorMessage}",
+                            (int)(lastStatusCode ?? HttpStatusCode.ServiceUnavailable),
+                            lastErrorMessage);
+                        break;
+                    }
 
-                    await _requestLogService.RecordFailure(
-                        logId,
-                        stopwatch,
-                        StatusCodes.Status503ServiceUnavailable,
-                        noAccountMessage);
-
-                    await WriteOpenAiErrorResponse(
-                        context,
-                        noAccountMessage,
-                        StatusCodes.Status503ServiceUnavailable);
-                    return;
+                    lastErrorMessage = "账户池都无可用";
+                    lastStatusCode = HttpStatusCode.ServiceUnavailable;
+                    _logger.LogWarning(lastErrorMessage);
+                    break;
                 }
 
                 if (account.IsRateLimitExpired())
