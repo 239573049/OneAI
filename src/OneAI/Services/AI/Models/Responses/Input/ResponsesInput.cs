@@ -126,6 +126,8 @@ public class ResponsesInput : IOpenAiModels.IModel, IOpenAiModels.IUser
     
     [JsonPropertyName("conversation")]
     public object? Conversation { get; set; }
+    
+    [JsonPropertyName("text")] public object? Text { get; set; }
 }
 
 public sealed class ReasoningResponsesInput
