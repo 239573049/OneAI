@@ -7,6 +7,8 @@ import type {
   GenerateFactoryDeviceCodeResponse,
   ExchangeFactoryDeviceCodeRequest,
   ImportKiroCredentialsRequest,
+  ImportKiroBatchRequest,
+  ImportKiroBatchResult,
 } from '@/types/account'
 
 /**
@@ -198,5 +200,12 @@ export const kiroOAuthService = {
    */
   importCredentials(request: ImportKiroCredentialsRequest): Promise<AIAccountDto> {
     return post<AIAccountDto>('/kiro/oauth/import', request)
+  },
+
+  /**
+   * Batch import Kiro credentials and create accounts
+   */
+  importBatchCredentials(request: ImportKiroBatchRequest): Promise<ImportKiroBatchResult> {
+    return post<ImportKiroBatchResult>('/kiro/oauth/import/batch', request)
   },
 }

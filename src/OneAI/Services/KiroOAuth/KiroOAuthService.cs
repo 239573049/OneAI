@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 using OneAI.Constants;
 using OneAI.Data;
 using OneAI.Entities;
@@ -59,6 +60,119 @@ public class KiroOAuthService(
         quotaCacheService.ClearAccountsCache();
 
         return account;
+    }
+
+    /// <summary>
+    /// Import Kiro credentials in batch and create accounts.
+    /// </summary>
+    public async Task<ImportKiroBatchResult> ImportKiroBatchAsync(
+        AppDbContext dbContext,
+        ImportKiroBatchRequest request)
+    {
+        var result = new ImportKiroBatchResult();
+        var existingEmails = new HashSet<string>();
+
+        // 如果需要跳过已存在的账户，先获取所有已存在的Kiro账户邮箱
+        if (request.SkipExisting)
+        {
+            var existingAccounts = await dbContext.AIAccounts
+                .Where(a => a.Provider == AIProviders.Kiro && a.Email != null)
+                .Select(a => a.Email!)
+                .ToListAsync();
+
+            foreach (var email in existingAccounts)
+            {
+                existingEmails.Add(email.ToLowerInvariant());
+            }
+        }
+
+        foreach (var item in request.Accounts)
+        {
+            try
+            {
+                // 检查是否需要跳过
+                if (request.SkipExisting && !string.IsNullOrWhiteSpace(item.Email))
+                {
+                    if (existingEmails.Contains(item.Email.ToLowerInvariant()))
+                    {
+                        result.SkippedCount++;
+                        continue;
+                    }
+                }
+
+                // 验证凭证
+                if (string.IsNullOrWhiteSpace(item.AccessToken) && string.IsNullOrWhiteSpace(item.RefreshToken))
+                {
+                    throw new ArgumentException("Missing accessToken/refreshToken");
+                }
+
+                // 转换为KiroOAuthCredentialsDto
+                var credentials = new KiroOAuthCredentialsDto
+                {
+                    AccessToken = item.AccessToken,
+                    RefreshToken = item.RefreshToken,
+                    ProfileArn = item.ProfileArn,
+                    ExpiresAt = item.ExpiresAt,
+                    AuthMethod = item.AuthMethod ?? "social",
+                    Region = "us-east-1" // 默认区域
+                };
+
+                // 创建账户名称
+                var accountName = !string.IsNullOrWhiteSpace(request.AccountNamePrefix)
+                    ? $"{request.AccountNamePrefix}_{item.Email ?? item.Id ?? Guid.NewGuid().ToString()[..8]}"
+                    : item.Email ?? item.Id ?? "Kiro";
+
+                // 创建账户
+                var account = new AIAccount
+                {
+                    Provider = AIProviders.Kiro,
+                    ApiKey = string.Empty,
+                    BaseUrl = string.Empty,
+                    CreatedAt = DateTime.Now,
+                    Email = string.IsNullOrWhiteSpace(item.Email) ? null : item.Email.Trim(),
+                    Name = accountName,
+                    IsEnabled = true
+                };
+
+                account.SetKiroOAuth(credentials);
+
+                await dbContext.AIAccounts.AddAsync(account);
+                await dbContext.SaveChangesAsync();
+
+                result.SuccessCount++;
+                result.SuccessItems.Add(new ImportSuccessItem
+                {
+                    OriginalId = item.Id,
+                    AccountId = account.Id,
+                    Email = account.Email,
+                    AccountName = account.Name
+                });
+
+                // 添加到已存在集合，避免重复
+                if (!string.IsNullOrWhiteSpace(account.Email))
+                {
+                    existingEmails.Add(account.Email.ToLowerInvariant());
+                }
+            }
+            catch (Exception ex)
+            {
+                result.FailCount++;
+                result.FailItems.Add(new ImportFailItem
+                {
+                    OriginalId = item.Id,
+                    Email = item.Email,
+                    ErrorMessage = ex.Message
+                });
+            }
+        }
+
+        // 清除缓存
+        if (result.SuccessCount > 0)
+        {
+            quotaCacheService.ClearAccountsCache();
+        }
+
+        return result;
     }
 
     /// <summary>

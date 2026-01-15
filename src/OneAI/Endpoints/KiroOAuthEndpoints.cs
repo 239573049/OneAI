@@ -26,6 +26,15 @@ public static class KiroOAuthEndpoints
             .Produces<ApiResponse>(400)
             .Produces<ApiResponse>(401)
             .Produces<ApiResponse>(500);
+
+        group.MapPost("/import/batch", ImportKiroBatch)
+            .WithName("ImportKiroBatch")
+            .WithSummary("批量导入 Kiro 凭证")
+            .WithDescription("批量导入多个 Kiro 逆向凭证并创建账户")
+            .Produces<ApiResponse<ImportKiroBatchResult>>(200)
+            .Produces<ApiResponse>(400)
+            .Produces<ApiResponse>(401)
+            .Produces<ApiResponse>(500);
     }
 
     private static async Task<IResult> ImportKiroCredentials(
@@ -64,6 +73,42 @@ public static class KiroOAuthEndpoints
         {
             return Results.Json(
                 ApiResponse.Fail($"导入 Kiro 凭证失败: {ex.Message}", 500),
+                statusCode: 500
+            );
+        }
+    }
+
+    private static async Task<IResult> ImportKiroBatch(
+        ImportKiroBatchRequest request,
+        KiroOAuthService kiroOAuthService,
+        AppDbContext dbContext)
+    {
+        try
+        {
+            if (request.Accounts == null || request.Accounts.Count == 0)
+            {
+                return Results.Json(
+                    ApiResponse.Fail("批量导入列表不能为空", 400),
+                    statusCode: 400
+                );
+            }
+
+            var result = await kiroOAuthService.ImportKiroBatchAsync(dbContext, request);
+
+            return Results.Json(ApiResponse<ImportKiroBatchResult>.Success(result,
+                $"批量导入完成：成功 {result.SuccessCount} 个，失败 {result.FailCount} 个，跳过 {result.SkippedCount} 个"));
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.Json(
+                ApiResponse.Fail(ex.Message, 400),
+                statusCode: 400
+            );
+        }
+        catch (Exception ex)
+        {
+            return Results.Json(
+                ApiResponse.Fail($"批量导入 Kiro 凭证失败: {ex.Message}", 500),
                 statusCode: 500
             );
         }

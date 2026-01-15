@@ -48,10 +48,12 @@ import {
 } from '@/components/animate-ui/components/radix/toggle-group'
 import { Checkbox } from '@/components/animate-ui/components/radix/checkbox'
 import { AddAccountDialog } from '@/components/add-account-dialog'
+import { BatchImportKiroDialog } from '@/components/batch-import-kiro-dialog'
 import { accountService } from '@/services/account'
-import type { AIAccountDto, AccountQuotaStatus } from '@/types/account'
+import type { AIAccountDto, AccountQuotaStatus, ImportKiroBatchResult } from '@/types/account'
 import { cn } from '@/lib/utils'
 import { Skeleton } from '@/components/ui/skeleton'
+import { FileJson } from 'lucide-react'
 
 type ProviderFilter = 'all' | string
 type StatusFilter = 'all' | 'enabled' | 'disabled' | 'rate-limited'
@@ -119,6 +121,7 @@ export default function AccountManagementView() {
   const [providerFilter, setProviderFilter] = useState<ProviderFilter>('all')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [addDialogOpen, setAddDialogOpen] = useState(false)
+  const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
   const [deleteConfirmAccountId, setDeleteConfirmAccountId] = useState<number | null>(null)
   const [togglingId, setTogglingId] = useState<number | null>(null)
@@ -181,6 +184,13 @@ export default function AccountManagementView() {
 
   const handleAccountAdded = async () => {
     await fetchAccounts()
+  }
+
+  const handleBatchImportCompleted = async (result: ImportKiroBatchResult) => {
+    // 延迟一下让结果页面显示，然后刷新列表
+    setTimeout(async () => {
+      await fetchAccounts()
+    }, 1000)
   }
 
   const handleToggleStatus = async (id: number) => {
@@ -312,13 +322,23 @@ export default function AccountManagementView() {
             连接并监控您的多平台 AI 服务账户，实时掌握用量与状态。
           </p>
         </div>
-        <Button
-          onClick={() => setAddDialogOpen(true)}
-          className="w-full sm:w-auto shadow-lg shadow-primary/20 hover:shadow-primary/30 transition-all"
-        >
-          <Plus className="mr-2 h-4 w-4" />
-          添加新账户
-        </Button>
+        <div className="flex gap-2 w-full sm:w-auto">
+          <Button
+            onClick={() => setBatchImportDialogOpen(true)}
+            variant="outline"
+            className="gap-2"
+          >
+            <FileJson className="h-4 w-4" />
+            批量导入 Kiro
+          </Button>
+          <Button
+            onClick={() => setAddDialogOpen(true)}
+            className="shadow-lg shadow-primary/20 hover:shadow-primary/30 transition-all gap-2"
+          >
+            <Plus className="h-4 w-4" />
+            添加新账户
+          </Button>
+        </div>
       </div>
 
       {/* Summary Stats */}
@@ -457,6 +477,12 @@ export default function AccountManagementView() {
         open={addDialogOpen}
         onOpenChange={setAddDialogOpen}
         onAccountAdded={handleAccountAdded}
+      />
+
+      <BatchImportKiroDialog
+        open={batchImportDialogOpen}
+        onOpenChange={setBatchImportDialogOpen}
+        onImportCompleted={handleBatchImportCompleted}
       />
 
       <AntigravityModelsDialog

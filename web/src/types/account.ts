@@ -122,6 +122,65 @@ export interface ImportKiroCredentialsRequest {
 }
 
 /**
+ * Kiro批量导入单个账户的数据结构
+ */
+export interface KiroBatchAccountItem {
+  accessToken?: string
+  refreshToken?: string
+  profileArn?: string
+  expiresAt?: string
+  authMethod?: string
+  provider?: string
+  email?: string
+  addedAt?: string
+  id?: string
+  usageLimit?: {
+    limit: number
+    used: number
+    remaining: number
+  }
+}
+
+/**
+ * Kiro批量导入请求
+ */
+export interface ImportKiroBatchRequest {
+  accounts: KiroBatchAccountItem[]
+  skipExisting?: boolean
+  accountNamePrefix?: string
+}
+
+/**
+ * 批量导入成功项
+ */
+export interface ImportSuccessItem {
+  originalId?: string
+  accountId: number
+  email?: string
+  accountName?: string
+}
+
+/**
+ * 批量导入失败项
+ */
+export interface ImportFailItem {
+  originalId?: string
+  email?: string
+  errorMessage: string
+}
+
+/**
+ * 批量导入结果
+ */
+export interface ImportKiroBatchResult {
+  successCount: number
+  failCount: number
+  skippedCount: number
+  successItems: ImportSuccessItem[]
+  failItems: ImportFailItem[]
+}
+
+/**
  * 账户配额状态
  */
 export interface AccountQuotaStatus {
