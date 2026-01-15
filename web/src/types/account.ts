@@ -19,7 +19,7 @@ export interface AIAccountDto {
 /**
  * 账户类型
  */
-export type AccountType = 'openai' | 'claude' | 'gemini' | 'gemini-antigravity' | 'factory'
+export type AccountType = 'openai' | 'claude' | 'gemini' | 'gemini-antigravity' | 'factory' | 'kiro'
 
 export interface AntigravityModelQuota {
   model: string
@@ -84,6 +84,12 @@ export interface ExchangeFactoryDeviceCodeRequest {
     username?: string
     password?: string
   }
+}
+
+export interface ImportKiroCredentialsRequest {
+  credentials: string
+  accountName?: string
+  email?: string
 }
 
 /**

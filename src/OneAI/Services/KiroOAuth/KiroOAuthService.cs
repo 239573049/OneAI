@@ -1,0 +1,195 @@
+using System.Text;
+using System.Text.Json;
+using System.Net.Http.Json;
+using OneAI.Constants;
+using OneAI.Data;
+using OneAI.Entities;
+
+namespace OneAI.Services.KiroOAuth;
+
+/// <summary>
+/// Kiro credentials import service
+/// </summary>
+public class KiroOAuthService(
+    AppDbContext appDbContext,
+    AccountQuotaCacheService quotaCacheService)
+{
+    /// <summary>
+    /// Import Kiro credentials and create account.
+    /// </summary>
+    public async Task<AIAccount> ImportKiroCredentialsAsync(
+        AppDbContext dbContext,
+        ImportKiroCredentialsRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.Credentials))
+        {
+            throw new ArgumentException("Kiro credentials are required");
+        }
+
+        var credentials = ParseCredentials(request.Credentials);
+        if (string.IsNullOrWhiteSpace(credentials.AccessToken)
+            && string.IsNullOrWhiteSpace(credentials.RefreshToken))
+        {
+            throw new ArgumentException("Kiro credentials missing accessToken/refreshToken");
+        }
+
+        credentials.Region = string.IsNullOrWhiteSpace(credentials.Region)
+            ? "us-east-1"
+            : credentials.Region.Trim();
+
+        var account = new AIAccount
+        {
+            Provider = AIProviders.Kiro,
+            ApiKey = string.Empty,
+            BaseUrl = string.Empty,
+            CreatedAt = DateTime.Now,
+            Email = string.IsNullOrWhiteSpace(request.Email) ? null : request.Email.Trim(),
+            Name = string.IsNullOrWhiteSpace(request.AccountName)
+                ? "Kiro"
+                : request.AccountName.Trim(),
+            IsEnabled = true
+        };
+
+        account.SetKiroOAuth(credentials);
+
+        await dbContext.AIAccounts.AddAsync(account);
+        await dbContext.SaveChangesAsync();
+
+        quotaCacheService.ClearAccountsCache();
+
+        return account;
+    }
+
+    /// <summary>
+    /// Refresh Kiro access token and persist updated credentials.
+    /// </summary>
+    public async Task RefreshKiroOAuthTokenAsync(AIAccount account)
+    {
+        var current = account.GetKiroOauth();
+        if (current == null)
+        {
+            throw new InvalidOperationException("No Kiro credentials available");
+        }
+
+        if (string.IsNullOrWhiteSpace(current.RefreshToken))
+        {
+            throw new InvalidOperationException("No Kiro refresh token available");
+        }
+
+        var region = string.IsNullOrWhiteSpace(current.Region) ? "us-east-1" : current.Region.Trim();
+        var authMethod = string.IsNullOrWhiteSpace(current.AuthMethod) ? "social" : current.AuthMethod.Trim();
+
+        var refreshUrl = $"https://prod.{region}.auth.desktop.kiro.dev/refreshToken";
+        var refreshIdcUrl = $"https://oidc.{region}.amazonaws.com/token";
+
+        using var httpClient = new HttpClient { Timeout = TimeSpan.FromSeconds(30) };
+
+        object requestBody = new Dictionary<string, object?>
+        {
+            ["refreshToken"] = current.RefreshToken
+        };
+
+        if (!string.Equals(authMethod, "social", StringComparison.OrdinalIgnoreCase))
+        {
+            requestBody = new Dictionary<string, object?>
+            {
+                ["clientId"] = current.ClientId,
+                ["clientSecret"] = current.ClientSecret,
+                ["grantType"] = "refresh_token",
+                ["refreshToken"] = current.RefreshToken
+            };
+        }
+
+        var response = await httpClient.PostAsJsonAsync(
+            string.Equals(authMethod, "social", StringComparison.OrdinalIgnoreCase) ? refreshUrl : refreshIdcUrl,
+            requestBody);
+
+        if (!response.IsSuccessStatusCode)
+        {
+            var error = await response.Content.ReadAsStringAsync();
+            throw new Exception($"Kiro token refresh failed: HTTP {(int)response.StatusCode} - {error}");
+        }
+
+        var content = await response.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(content);
+        var root = doc.RootElement;
+
+        if (!root.TryGetProperty("accessToken", out var accessTokenElement))
+        {
+            throw new Exception("Kiro token refresh failed: missing accessToken");
+        }
+
+        current.AccessToken = accessTokenElement.GetString();
+        if (root.TryGetProperty("refreshToken", out var refreshTokenElement))
+        {
+            current.RefreshToken = refreshTokenElement.GetString();
+        }
+
+        if (root.TryGetProperty("profileArn", out var profileArnElement))
+        {
+            current.ProfileArn = profileArnElement.GetString();
+        }
+
+        if (root.TryGetProperty("expiresIn", out var expiresInElement)
+            && expiresInElement.ValueKind == JsonValueKind.Number)
+        {
+            var expiresInSeconds = expiresInElement.GetInt32();
+            current.ExpiresAt = DateTime.UtcNow.AddSeconds(expiresInSeconds).ToString("O");
+        }
+
+        account.SetKiroOAuth(current);
+
+        appDbContext.AIAccounts.Update(account);
+        await appDbContext.SaveChangesAsync();
+
+        quotaCacheService.ClearAccountsCache();
+    }
+
+    private static KiroOAuthCredentialsDto ParseCredentials(string raw)
+    {
+        var trimmed = raw.Trim();
+        if (TryParseCredentials(trimmed, out var parsed))
+        {
+            return parsed;
+        }
+
+        try
+        {
+            var decoded = Encoding.UTF8.GetString(Convert.FromBase64String(trimmed));
+            if (TryParseCredentials(decoded, out parsed))
+            {
+                return parsed;
+            }
+        }
+        catch
+        {
+            // ignore base64 decode errors
+        }
+
+        throw new ArgumentException("Invalid Kiro credentials format");
+    }
+
+    private static bool TryParseCredentials(string json, out KiroOAuthCredentialsDto credentials)
+    {
+        credentials = null!;
+        try
+        {
+            var parsed = JsonSerializer.Deserialize<KiroOAuthCredentialsDto>(json, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
+
+            if (parsed == null)
+            {
+                return false;
+            }
+
+            credentials = parsed;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+}

@@ -6,6 +6,7 @@ import type {
   AccountQuotaStatus,
   GenerateFactoryDeviceCodeResponse,
   ExchangeFactoryDeviceCodeRequest,
+  ImportKiroCredentialsRequest,
 } from '@/types/account'
 
 /**
@@ -178,5 +179,17 @@ export const geminiAntigravityOAuthService = {
    */
   exchangeOAuthCode(request: ExchangeOAuthCodeRequest): Promise<AIAccountDto> {
     return post<AIAccountDto>('/gemini/oauth/callback', request)
+  },
+}
+
+/**
+ * Kiro credentials import service
+ */
+export const kiroOAuthService = {
+  /**
+   * Import Kiro credentials and create account
+   */
+  importCredentials(request: ImportKiroCredentialsRequest): Promise<AIAccountDto> {
+    return post<AIAccountDto>('/kiro/oauth/import', request)
   },
 }

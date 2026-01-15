@@ -14,6 +14,7 @@ using OneAI.Services.FactoryOAuth;
 using OneAI.Services.Logging;
 using OneAI.Services.OpenAIOAuth;
 using OneAI.Services.GeminiOAuth;
+using OneAI.Services.KiroOAuth;
 using Scalar.AspNetCore;
 using Serilog;
 using Serilog.Context;
@@ -146,10 +147,12 @@ builder.Services.AddScoped<GeminiOAuthService>();
 builder.Services.AddScoped<GeminiOAuthHelper>();
 builder.Services.AddScoped<ChatCompletionsService>();
 builder.Services.AddScoped<AnthropicService>();
+builder.Services.AddScoped<KiroService>();
 
 builder.Services.AddScoped<ClaudeCodeOAuthHelper>();
 builder.Services.AddScoped<ClaudeCodeOAuthService>();
 builder.Services.AddScoped<FactoryOAuthService>();
+builder.Services.AddScoped<KiroOAuthService>();
 
 // 配置 CORS
 builder.Services.AddCors(options =>
@@ -257,6 +260,8 @@ app.MapAIEndpoints();
 
 app.MapAnthropicEndpoints();
 
+app.MapKiroEndpoints();
+
 // 映射认证端点
 app.MapAuthEndpoints();
 
@@ -274,6 +279,8 @@ app.MapFactoryOAuthEndpoints();
 
 // 映射 Gemini OAuth 端点
 app.MapGeminiOAuthEndpoints();
+
+app.MapKiroOAuthEndpoints();
 
 // 映射 Gemini API 端点
 app.MapGeminiAPIEndpoints();

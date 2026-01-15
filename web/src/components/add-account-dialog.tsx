@@ -4,7 +4,7 @@ import { AlertCircle, Loader, ExternalLink, Copy, Check } from 'lucide-react'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/animate-ui/components/radix/dialog'
 import { Button } from '@/components/animate-ui/components/buttons/button'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/animate-ui/components/card'
-import { openaiOAuthService, claudeOAuthService, factoryOAuthService, geminiOAuthService, geminiAntigravityOAuthService } from '@/services/account'
+import { openaiOAuthService, claudeOAuthService, factoryOAuthService, geminiOAuthService, geminiAntigravityOAuthService, kiroOAuthService } from '@/services/account'
 import type { AccountType, GenerateFactoryDeviceCodeResponse, GenerateOAuthUrlResponse, AIAccountDto } from '@/types/account'
 
 interface AddAccountDialogProps {
@@ -25,6 +25,9 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
   const [processingCode, setProcessingCode] = useState(false)
   const [copied, setCopied] = useState(false)
   const [copiedUserCode, setCopiedUserCode] = useState(false)
+  const [kiroCredentials, setKiroCredentials] = useState('')
+  const [kiroAccountName, setKiroAccountName] = useState('')
+  const [kiroEmail, setKiroEmail] = useState('')
   const [proxyEnabled, setProxyEnabled] = useState(false)
   const [proxyType, setProxyType] = useState<'http' | 'https' | 'socks5'>('http')
   const [proxyHost, setProxyHost] = useState('')
@@ -181,6 +184,34 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
     }
   }
 
+  const handleImportKiroCredentials = async () => {
+    if (!kiroCredentials.trim()) {
+      setError('请粘贴 Kiro 凭证内容')
+      return
+    }
+
+    try {
+      setProcessingCode(true)
+      setError(null)
+
+      const account = await kiroOAuthService.importCredentials({
+        credentials: kiroCredentials.trim(),
+        accountName: kiroAccountName.trim() || undefined,
+        email: kiroEmail.trim() || undefined,
+      })
+
+      onAccountAdded?.(account)
+      resetForm()
+      onOpenChange(false)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '导入 Kiro 凭证失败'
+      setError(message)
+      console.error('Failed to import Kiro credentials:', err)
+    } finally {
+      setProcessingCode(false)
+    }
+  }
+
   const handleCompleteFactoryDeviceCode = async () => {
     if (!sessionId) {
       setError('请先生成 Device Code')
@@ -258,6 +289,9 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
     setError(null)
     setCopied(false)
     setCopiedUserCode(false)
+    setKiroCredentials('')
+    setKiroAccountName('')
+    setKiroEmail('')
     setProxyEnabled(false)
   }
 
@@ -280,7 +314,7 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
 
         <div className="space-y-6">
           {/* Account Type Tabs */}
-          <div className="flex gap-2 border-b">
+          <div className="flex flex-wrap gap-2 border-b pb-2">
             <button
               onClick={() => {
                 setAccountType('openai')
@@ -345,6 +379,19 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
               }`}
             >
               Gemini-Antigravity
+            </button>
+            <button
+              onClick={() => {
+                setAccountType('kiro')
+                resetForm()
+              }}
+              className={`px-4 py-2 font-medium border-b-2 transition-colors ${
+                accountType === 'kiro'
+                  ? 'border-primary text-primary'
+                  : 'border-transparent text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              Kiro
             </button>
           </div>
 
@@ -1011,6 +1058,61 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
             </motion.div>
           )}
 
+          {/* Kiro Reverse Flow */}
+          {accountType === 'kiro' && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="space-y-4"
+            >
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">Kiro 逆向凭证导入</CardTitle>
+                  <CardDescription>
+                    粘贴 Kiro 凭证 JSON 或 Base64 内容，创建可用账户
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">账户名称（可选）</label>
+                      <input
+                        type="text"
+                        placeholder="例如: Kiro-主账号"
+                        value={kiroAccountName}
+                        onChange={(e) => setKiroAccountName(e.target.value)}
+                        className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">邮箱（可选）</label>
+                      <input
+                        type="email"
+                        placeholder="账号邮箱"
+                        value={kiroEmail}
+                        onChange={(e) => setKiroEmail(e.target.value)}
+                        className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                      />
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Kiro 凭证内容</label>
+                    <textarea
+                      rows={6}
+                      placeholder="粘贴 kiro-auth-token.json 的完整内容，或 Base64 编码后的文本"
+                      value={kiroCredentials}
+                      onChange={(e) => setKiroCredentials(e.target.value)}
+                      className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      支持 JSON / Base64，两种格式任选其一。
+                    </p>
+                  </div>
+                </CardContent>
+              </Card>
+            </motion.div>
+          )}
+
           {/* Action Buttons */}
           <div className="flex gap-3 justify-end">
             <Button
@@ -1020,10 +1122,22 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
             >
               取消
             </Button>
-            {(accountType === 'factory' ? !!factoryDeviceCode : !!authUrl) && (
+            {(accountType === 'factory'
+              ? !!factoryDeviceCode
+              : accountType === 'kiro'
+              ? true
+              : !!authUrl) && (
               <Button
-                onClick={accountType === 'factory' ? handleCompleteFactoryDeviceCode : handleExchangeCode}
-                disabled={accountType === 'factory' ? processingCode : (!authCode.trim() || processingCode)}
+                onClick={accountType === 'factory'
+                  ? handleCompleteFactoryDeviceCode
+                  : accountType === 'kiro'
+                  ? handleImportKiroCredentials
+                  : handleExchangeCode}
+                disabled={accountType === 'factory'
+                  ? processingCode
+                  : accountType === 'kiro'
+                  ? (!kiroCredentials.trim() || processingCode)
+                  : (!authCode.trim() || processingCode)}
                 className="gap-2"
               >
                 {processingCode ? (
@@ -1032,7 +1146,7 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
                     处理中...
                   </>
                 ) : (
-                  '完成授权'
+                  accountType === 'kiro' ? '保存凭证' : '完成授权'
                 )}
               </Button>
             )}

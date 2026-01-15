@@ -31,6 +31,11 @@ public static class AIProviders
     public const string GeminiAntigravity = "Gemini-Antigravity";
 
     /// <summary>
+    /// Kiro Reverse (Amazon CodeWhisperer via Kiro)
+    /// </summary>
+    public const string Kiro = "Kiro";
+
+    /// <summary>
     /// 获取所有支持的提供商列表
     /// </summary>
     public static readonly string[] All =
@@ -39,7 +44,8 @@ public static class AIProviders
         Claude,
         Factory,
         Gemini,
-        GeminiAntigravity
+        GeminiAntigravity,
+        Kiro
     ];
 
     /// <summary>
@@ -62,6 +68,7 @@ public static class AIProviders
             Factory => "Factory",
             Gemini => "Google Gemini",
             GeminiAntigravity => "Google Gemini (Antigravity)",
+            Kiro => "Kiro Reverse",
             _ => provider
         };
     }

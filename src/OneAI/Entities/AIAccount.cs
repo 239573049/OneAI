@@ -4,6 +4,7 @@ using OneAI.Services.ClaudeCodeOAuth;
 using OneAI.Services.FactoryOAuth;
 using OneAI.Services.OpenAIOAuth;
 using OneAI.Services.GeminiOAuth;
+using OneAI.Services.KiroOAuth;
 
 namespace OneAI.Entities;
 
@@ -142,6 +143,21 @@ public class AIAccount
         }
 
         return JsonSerializer.Deserialize<FactoryOauth>(OAuthToken, JsonSerializerOptions.Web);
+    }
+
+    public void SetKiroOAuth(KiroOAuthCredentialsDto kiroOauth)
+    {
+        OAuthToken = JsonSerializer.Serialize(kiroOauth, JsonSerializerOptions.Web);
+    }
+
+    public KiroOAuthCredentialsDto? GetKiroOauth()
+    {
+        if (string.IsNullOrEmpty(OAuthToken) || Provider != AIProviders.Kiro)
+        {
+            return null;
+        }
+
+        return JsonSerializer.Deserialize<KiroOAuthCredentialsDto>(OAuthToken, JsonSerializerOptions.Web);
     }
 
     /// <summary>

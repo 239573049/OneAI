@@ -828,7 +828,7 @@ public sealed class ChatCompletionsService(
                 }
 
                 lastErrorMessage = "账户池都无可用";
-                lastStatusCode = HttpStatusCode.ServiceUnavailable;
+                lastStatusCode = HttpStatusCode.TooManyRequests;
                 break;
             }
 
