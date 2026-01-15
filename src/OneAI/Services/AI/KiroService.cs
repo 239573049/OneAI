@@ -997,16 +997,12 @@ public sealed class KiroService(
                     ["output_tokens"] = totalOutputTokens
                 }
             },
-            ["usage"] = new JsonObject
+            ["usage"] =  new JsonObject
             {
-                ["stop_reason"] = stopReason,
-                ["usage"] = new JsonObject
-                {
-                    ["input_tokens"] = inputTokens,
-                    ["cache_creation_input_tokens"] = 0,
-                    ["cache_read_input_tokens"] = 0,
-                    ["output_tokens"] = totalOutputTokens
-                }
+                ["input_tokens"] = inputTokens,
+                ["cache_creation_input_tokens"] = 0,
+                ["cache_read_input_tokens"] = 0,
+                ["output_tokens"] = totalOutputTokens
             }
         }, context.RequestAborted);
 
