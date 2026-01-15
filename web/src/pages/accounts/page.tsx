@@ -89,6 +89,14 @@ const formatTokens = (tokens: number): string => {
   return tokens.toString()
 }
 
+const formatUsageValue = (value: number): string => {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}K`
+  if (value >= 100) return value.toFixed(0)
+  if (value >= 10) return value.toFixed(1)
+  return value.toFixed(2)
+}
+
 const getUsageColor = (percent?: number) => {
   const value = percent ?? 0
   if (value >= 90) return 'bg-destructive'
@@ -195,7 +203,7 @@ export default function AccountManagementView() {
     try {
       setRefreshingQuotaId(accountId)
       let status: AccountQuotaStatus
-      
+
       switch (providerKey) {
         case 'openai':
           status = await accountService.refreshOpenAIQuotaStatus(accountId)
@@ -208,6 +216,9 @@ export default function AccountManagementView() {
           break
         case 'gemini-antigravity':
           status = await accountService.refreshAntigravityQuotaStatus(accountId)
+          break
+        case 'kiro':
+          status = await accountService.refreshKiroQuotaStatus(accountId)
           break
         default:
           return
@@ -611,12 +622,35 @@ function AccountCard({
                       <span className={cn("text-xs font-bold", getHealthColor(healthScore))}>{healthScore}%</span>
                    </div>
 
-                   {/* Usage Bars */}
-                   {quota.tokensLimit && quota.tokensLimit > 0 ? (
+                   {/* Kiro Usage Bars */}
+                   {quota.kiroUsageBreakdownList && quota.kiroUsageBreakdownList.length > 0 ? (
                       <div className="space-y-2.5">
-                         <UsageProgress 
-                            label="总 Tokens" 
-                            percent={quota.tokensUsedPercent} 
+                         {quota.kiroUsageBreakdownList.map((item, idx) => (
+                            <UsageProgress
+                               key={idx}
+                               label={item.displayName || 'Usage'}
+                               percent={item.usedPercent}
+                               subText={`${formatUsageValue(item.remaining ?? 0)} / ${formatUsageValue(item.usageLimit)}`}
+                               resetText={formatTimeRemaining(item.resetAfterSeconds)}
+                            />
+                         ))}
+                         {/* Free Trial Info - Separate Progress Bar */}
+                         {quota.kiroFreeTrialInfo && (
+                            <div className="pt-2 mt-2 border-t border-dashed border-muted-foreground/20">
+                               <UsageProgress
+                                  label={`免费试用 (${quota.kiroFreeTrialInfo.freeTrialStatus || 'ACTIVE'})`}
+                                  percent={quota.kiroFreeTrialInfo.usedPercent}
+                                  subText={`${formatUsageValue(quota.kiroFreeTrialInfo.remaining ?? 0)} / ${formatUsageValue(quota.kiroFreeTrialInfo.usageLimit)}`}
+                                  resetText={quota.kiroFreeTrialInfo.expiryAfterSeconds ? `剩余 ${formatTimeRemaining(quota.kiroFreeTrialInfo.expiryAfterSeconds)}` : undefined}
+                               />
+                            </div>
+                         )}
+                      </div>
+                   ) : quota.tokensLimit && quota.tokensLimit > 0 ? (
+                      <div className="space-y-2.5">
+                         <UsageProgress
+                            label="总 Tokens"
+                            percent={quota.tokensUsedPercent}
                             subText={`${formatTokens(quota.tokensRemaining ?? 0)} / ${formatTokens(quota.tokensLimit)}`}
                          />
                          {quota.inputTokensLimit && (
@@ -634,14 +668,14 @@ function AccountCard({
                       </div>
                    ) : (
                       <div className="grid grid-cols-2 gap-3">
-                         <UsageProgress 
-                            label="5H 窗口" 
-                            percent={quota.primaryUsedPercent} 
+                         <UsageProgress
+                            label="5H 窗口"
+                            percent={quota.primaryUsedPercent}
                             resetText={formatTimeRemaining(quota.primaryResetAfterSeconds)}
                          />
-                         <UsageProgress 
-                            label="7D 窗口" 
-                            percent={quota.secondaryUsedPercent} 
+                         <UsageProgress
+                            label="7D 窗口"
+                            percent={quota.secondaryUsedPercent}
                             resetText={formatTimeRemaining(quota.secondaryResetAfterSeconds)}
                          />
                       </div>

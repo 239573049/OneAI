@@ -27,7 +27,8 @@
       "Bash(cmd //c \"taskkill /F /IM OneAI.exe 2>nul\")",
       "Bash(cmd //c \"taskkill /F /PID 42880\")",
       "Bash(git add:*)",
-      "Bash(docker build:*)"
+      "Bash(docker build:*)",
+      "Bash(python3:*)"
     ]
   }
 }

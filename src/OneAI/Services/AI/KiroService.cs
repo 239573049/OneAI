@@ -4,11 +4,13 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
 using OneAI.Constants;
 using OneAI.Entities;
+using OneAI.Extensions;
 using OneAI.Services;
 using OneAI.Services.AI.Anthropic;
 using OneAI.Services.AI.Models.Dtos;
@@ -18,7 +20,62 @@ using Thor.Abstractions.Chats.Dtos;
 namespace OneAI.Services.AI;
 
 /// <summary>
+/// Kiro usage limits response DTO
+/// </summary>
+public class KiroUsageLimitsResponse
+{
+    [JsonPropertyName("usageBreakdownList")]
+    public List<KiroUsageBreakdown>? UsageBreakdownList { get; set; }
+}
+
+/// <summary>
+/// Kiro usage breakdown item
+/// </summary>
+public class KiroUsageBreakdown
+{
+    [JsonPropertyName("displayName")] public string? DisplayName { get; set; }
+
+    [JsonPropertyName("displayNamePlural")]
+    public string? DisplayNamePlural { get; set; }
+
+    [JsonPropertyName("currentUsage")] public double CurrentUsage { get; set; }
+
+    [JsonPropertyName("currentUsageWithPrecision")]
+    public double CurrentUsageWithPrecision { get; set; }
+
+    [JsonPropertyName("usageLimit")] public double UsageLimit { get; set; }
+
+    [JsonPropertyName("usageLimitWithPrecision")]
+    public double UsageLimitWithPrecision { get; set; }
+
+    [JsonPropertyName("nextDateReset")] public double NextDateReset { get; set; }
+
+    [JsonPropertyName("freeTrialInfo")] public KiroFreeTrialInfo? FreeTrialInfo { get; set; }
+}
+
+/// <summary>
+/// Kiro free trial info
+/// </summary>
+public class KiroFreeTrialInfo
+{
+    [JsonPropertyName("freeTrialStatus")] public string? FreeTrialStatus { get; set; }
+
+    [JsonPropertyName("currentUsage")] public double CurrentUsage { get; set; }
+
+    [JsonPropertyName("currentUsageWithPrecision")]
+    public double CurrentUsageWithPrecision { get; set; }
+
+    [JsonPropertyName("usageLimit")] public double UsageLimit { get; set; }
+
+    [JsonPropertyName("usageLimitWithPrecision")]
+    public double UsageLimitWithPrecision { get; set; }
+
+    [JsonPropertyName("freeTrialExpiry")] public double FreeTrialExpiry { get; set; }
+}
+
+/// <summary>
 /// Kiro Reverse API service (Amazon CodeWhisperer via Kiro)
+/// 集成了类似 Claude API 的 Prompt Caching (cache_control -> cachePoint) 功能
 /// </summary>
 public sealed class KiroService(
     ILogger<KiroService> logger,
@@ -107,7 +164,8 @@ public sealed class KiroService(
                 return;
             }
 
-            var responseText = await CallKiroAsync(account, credentials, requestBody, requestModel, context.RequestAborted);
+            var responseText =
+                await CallKiroAsync(account, credentials, requestBody, requestModel, context.RequestAborted);
             var (content, toolCalls) = ParseKiroResponse(responseText);
 
             var responsePayload = BuildAnthropicResponse(content, toolCalls, input.Model, inputTokens);
@@ -190,7 +248,8 @@ public sealed class KiroService(
                 return;
             }
 
-            var responseText = await CallKiroAsync(account, credentials, requestBody, requestModel, context.RequestAborted);
+            var responseText =
+                await CallKiroAsync(account, credentials, requestBody, requestModel, context.RequestAborted);
             var (content, toolCalls) = ParseKiroResponse(responseText);
 
             var responsePayload = BuildOpenAiResponse(content, toolCalls, request.Model, inputTokens);
@@ -371,7 +430,8 @@ public sealed class KiroService(
         var totalOutputTokens = 0;
         string? lastContent = null;
 
-        await foreach (var ev in StreamKiroEvents(account, credentials, requestBody, requestUrl, context.RequestAborted))
+        await foreach (var ev in StreamKiroEvents(account, credentials, requestBody, requestUrl,
+                           context.RequestAborted))
         {
             if (ev.Type == KiroStreamEventType.Content && !string.IsNullOrEmpty(ev.Content))
             {
@@ -452,6 +512,8 @@ public sealed class KiroService(
                         ["input"] = new JsonObject()
                     }
                 }, context.RequestAborted);
+                
+                var partialJson = inputJson.ToJsonString(JsonOptions.DefaultOptions);
 
                 await WriteSseJsonAsync(context, new JsonObject
                 {
@@ -460,10 +522,11 @@ public sealed class KiroService(
                     ["delta"] = new JsonObject
                     {
                         ["type"] = "input_json_delta",
-                        ["partial_json"] = inputJson.ToJsonString(JsonOptions.DefaultOptions)
+                        ["partial_json"] = partialJson
                     }
                 }, context.RequestAborted);
 
+                totalOutputTokens += CountTokens(partialJson);
                 await WriteSseJsonAsync(context, new JsonObject
                 {
                     ["type"] = "content_block_stop",
@@ -478,14 +541,14 @@ public sealed class KiroService(
             ["type"] = "message_delta",
             ["delta"] = new JsonObject
             {
-                ["stop_reason"] = stopReason
-            },
-            ["usage"] = new JsonObject
-            {
-                ["input_tokens"] = inputTokens,
-                ["cache_creation_input_tokens"] = 0,
-                ["cache_read_input_tokens"] = 0,
-                ["output_tokens"] = totalOutputTokens
+                ["stop_reason"] = stopReason,
+                ["usage"] = new JsonObject
+                {
+                    ["input_tokens"] = inputTokens,
+                    ["cache_creation_input_tokens"] = 0,
+                    ["cache_read_input_tokens"] = 0,
+                    ["output_tokens"] = totalOutputTokens
+                }
             }
         }, context.RequestAborted);
 
@@ -544,7 +607,8 @@ public sealed class KiroService(
         var currentTool = (ToolCallAccumulator?)null;
         string? lastContent = null;
 
-        await foreach (var ev in StreamKiroEvents(account, credentials, requestBody, requestUrl, context.RequestAborted))
+        await foreach (var ev in StreamKiroEvents(account, credentials, requestBody, requestUrl,
+                           context.RequestAborted))
         {
             if (ev.Type == KiroStreamEventType.Content && !string.IsNullOrEmpty(ev.Content))
             {
@@ -662,6 +726,82 @@ public sealed class KiroService(
         await WriteSseDoneAsync(context, context.RequestAborted);
     }
 
+    public async Task<KiroUsageLimitsResponse?> GetUsageLimitsAsync(AIAccount account)
+    {
+        var credentials = account.GetKiroOauth();
+        if (credentials == null)
+        {
+            throw new InvalidOperationException("Kiro credentials not found");
+        }
+
+        if (IsExpiryDateNear(credentials))
+        {
+            await kiroOAuthService.RefreshKiroOAuthTokenAsync(account);
+            credentials = account.GetKiroOauth();
+        }
+
+        if (string.IsNullOrWhiteSpace(credentials?.AccessToken))
+        {
+            throw new InvalidOperationException("Kiro access token is required");
+        }
+
+        var region = string.IsNullOrWhiteSpace(credentials.Region) ? "us-east-1" : credentials.Region.Trim();
+        var authMethod = string.IsNullOrWhiteSpace(credentials.AuthMethod) ? "social" : credentials.AuthMethod.Trim();
+
+        var baseUrl = $"https://q.{region}.amazonaws.com/getUsageLimits";
+
+        var queryParams = new List<string>
+        {
+            "isEmailRequired=true",
+            "origin=AI_EDITOR",
+            "resourceType=AGENTIC_REQUEST"
+        };
+
+        if (string.Equals(authMethod, "social", StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(credentials.ProfileArn))
+        {
+            queryParams.Add($"profileArn={Uri.EscapeDataString(credentials.ProfileArn)}");
+        }
+
+        var requestUrl = $"{baseUrl}?{string.Join("&", queryParams)}";
+
+        using var request = new HttpRequestMessage(HttpMethod.Get, requestUrl);
+
+        request.Headers.Add("Authorization", $"Bearer {credentials.AccessToken}");
+        request.Headers.Add("User-Agent", $"OneAI/{KiroVersion}");
+        request.Headers.Add("amz-sdk-invocation-id", Guid.NewGuid().ToString());
+        request.Headers.Add("Origin", "https://app.kiro.dev");
+        request.Headers.Add("Referer", "https://app.kiro.dev/");
+
+        try
+        {
+            var response = await HttpClient.SendAsync(request);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var error = await response.Content.ReadAsStringAsync();
+                logger.LogError("Kiro usage limits request failed: {StatusCode} - {Error}",
+                    response.StatusCode, error);
+                return null;
+            }
+
+            var content = await response.Content.ReadAsStringAsync();
+            logger.LogInformation("Kiro usage limits request succeeded");
+
+            var result = JsonSerializer.Deserialize<KiroUsageLimitsResponse>(content, new JsonSerializerOptions
+            {
+                PropertyNameCaseInsensitive = true
+            });
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Error fetching Kiro usage limits");
+            return null;
+        }
+    }
+
     private async IAsyncEnumerable<KiroStreamEvent> StreamKiroEvents(
         AIAccount account,
         KiroOAuthCredentialsDto credentials,
@@ -675,10 +815,8 @@ public sealed class KiroService(
         while (true)
         {
             attempt++;
-            using var request = new HttpRequestMessage(HttpMethod.Post, requestUrl)
-            {
-                Content = new StringContent(body, Encoding.UTF8, "application/json")
-            };
+            using var request = new HttpRequestMessage(HttpMethod.Post, requestUrl);
+            request.Content = new StringContent(body, Encoding.UTF8, "application/json");
             ApplyKiroHeaders(request, credentials);
 
             HttpResponseMessage response;
@@ -752,11 +890,13 @@ public sealed class KiroService(
         var machineId = GenerateMachineId(credentials);
         var (osName, runtimeVersion) = GetSystemRuntimeInfo();
 
-        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", credentials.AccessToken ?? string.Empty);
+        request.Headers.Authorization =
+            new AuthenticationHeaderValue("Bearer", credentials.AccessToken ?? string.Empty);
         request.Headers.TryAddWithoutValidation("amz-sdk-invocation-id", Guid.NewGuid().ToString());
         request.Headers.TryAddWithoutValidation("amz-sdk-request", "attempt=1; max=1");
         request.Headers.TryAddWithoutValidation("x-amzn-kiro-agent-mode", "vibe");
-        request.Headers.TryAddWithoutValidation("x-amz-user-agent", $"aws-sdk-js/1.0.0 KiroIDE-{KiroVersion}-{machineId}");
+        request.Headers.TryAddWithoutValidation("x-amz-user-agent",
+            $"aws-sdk-js/1.0.0 KiroIDE-{KiroVersion}-{machineId}");
         request.Headers.TryAddWithoutValidation("user-agent",
             $"aws-sdk-js/1.0.0 ua/2.1 os/{osName} lang/js md/dotnet#{runtimeVersion} api/codewhispererruntime#1.0.0 m/E KiroIDE-{KiroVersion}-{machineId}");
         request.Headers.ConnectionClose = true;
@@ -797,9 +937,9 @@ public sealed class KiroService(
     private static string GenerateMachineId(KiroOAuthCredentialsDto credentials)
     {
         var uniqueKey = credentials.Uuid
-            ?? credentials.ProfileArn
-            ?? credentials.ClientId
-            ?? "KIRO_DEFAULT_MACHINE";
+                        ?? credentials.ProfileArn
+                        ?? credentials.ClientId
+                        ?? "KIRO_DEFAULT_MACHINE";
 
         using var sha = SHA256.Create();
         var hash = sha.ComputeHash(Encoding.UTF8.GetBytes(uniqueKey));
@@ -824,7 +964,7 @@ public sealed class KiroService(
         return expiry <= threshold;
     }
 
-    private static JsonObject BuildCodeWhispererRequest(
+    private JsonObject BuildCodeWhispererRequest(
         List<KiroMessage> messages,
         string model,
         JsonArray? toolsContext,
@@ -863,6 +1003,9 @@ public sealed class KiroService(
                 var merged = string.IsNullOrWhiteSpace(firstContent)
                     ? systemPrompt
                     : $"{systemPrompt}\n\n{firstContent}";
+
+                var cp = processedMessages[0].Parts.FirstOrDefault(p => p.CachePoint != null)?.CachePoint;
+
                 history.Add(new JsonObject
                 {
                     ["userInputMessage"] = BuildUserInputMessage(
@@ -871,7 +1014,8 @@ public sealed class KiroService(
                         OriginAiEditor,
                         null,
                         null,
-                        null)
+                        null,
+                        cp != null ? new JsonObject { ["type"] = cp.Type } : null)
                 });
                 startIndex = 1;
             }
@@ -895,11 +1039,13 @@ public sealed class KiroService(
             var message = processedMessages[i];
             if (message.Role == "user")
             {
+                var cp = message.Parts.FirstOrDefault(p => p.CachePoint != null)?.CachePoint;
                 var userMessage = BuildUserInputMessageFromParts(
                     message,
                     codewhispererModel,
                     includeTools: false,
-                    toolsContext: null);
+                    toolsContext: null,
+                    cachePoint: cp != null ? new JsonObject { ["type"] = cp.Type } : null);
                 history.Add(new JsonObject { ["userInputMessage"] = userMessage });
             }
             else if (message.Role == "assistant")
@@ -913,6 +1059,7 @@ public sealed class KiroService(
         var currentContent = string.Empty;
         var currentToolResults = new List<JsonObject>();
         var currentImages = new List<JsonObject>();
+        JsonObject? currentCachePoint = null;
 
         if (currentMessage.Role == "assistant")
         {
@@ -969,6 +1116,11 @@ public sealed class KiroService(
                         }
                     });
                 }
+
+                if (part.CachePoint != null)
+                {
+                    currentCachePoint = new JsonObject { ["type"] = part.CachePoint.Type };
+                }
             }
 
             if (string.IsNullOrWhiteSpace(currentContent))
@@ -983,7 +1135,8 @@ public sealed class KiroService(
             OriginAiEditor,
             currentImages.Count > 0 ? currentImages : null,
             currentToolResults.Count > 0 ? currentToolResults : null,
-            toolsContext);
+            toolsContext,
+            currentCachePoint);
 
         var request = new JsonObject
         {
@@ -1018,7 +1171,8 @@ public sealed class KiroService(
         string origin,
         List<JsonObject>? images,
         List<JsonObject>? toolResults,
-        JsonArray? tools)
+        JsonArray? tools,
+        JsonObject? cachePoint = null)
     {
         var userInputMessage = new JsonObject
         {
@@ -1027,18 +1181,23 @@ public sealed class KiroService(
             ["origin"] = origin
         };
 
-        if (images != null && images.Count > 0)
+        if (cachePoint != null)
+        {
+            userInputMessage["cachePoint"] = cachePoint;
+        }
+
+        if (images is { Count: > 0 })
         {
             userInputMessage["images"] = new JsonArray(images.ToArray());
         }
 
         var context = new JsonObject();
-        if (toolResults != null && toolResults.Count > 0)
+        if (toolResults is { Count: > 0 })
         {
             context["toolResults"] = new JsonArray(toolResults.ToArray());
         }
 
-        if (tools != null && tools.Count > 0)
+        if (tools is { Count: > 0 })
         {
             context["tools"] = tools;
         }
@@ -1055,7 +1214,8 @@ public sealed class KiroService(
         KiroMessage message,
         string modelId,
         bool includeTools,
-        JsonArray? toolsContext)
+        JsonArray? toolsContext,
+        JsonObject? cachePoint = null)
     {
         var contentBuilder = new StringBuilder();
         var toolResults = new List<JsonObject>();
@@ -1107,7 +1267,8 @@ public sealed class KiroService(
             OriginAiEditor,
             images.Count > 0 ? images : null,
             toolResults.Count > 0 ? toolResults : null,
-            includeTools ? toolsContext : null);
+            includeTools ? toolsContext : null,
+            cachePoint);
     }
 
     private static JsonObject BuildAssistantResponseMessage(KiroMessage message)
@@ -1278,6 +1439,7 @@ public sealed class KiroService(
                 {
                     builder.Append('\n');
                 }
+
                 builder.Append(item.Text);
             }
         }
@@ -1297,36 +1459,47 @@ public sealed class KiroService(
             {
                 foreach (var content in message.Contents)
                 {
+                    KiroMessagePart? part = null;
                     if (content.Type == "text")
                     {
-                        parts.Add(new KiroMessagePart("text") { Text = content.Text ?? content.Content?.ToString() });
+                        part = new KiroMessagePart("text") { Text = content.Text ?? content.Content?.ToString() };
                     }
                     else if (content.Type == "tool_use")
                     {
                         var toolId = content.Id ?? content.ToolUseId;
-                        parts.Add(new KiroMessagePart("tool_use")
+                        part = new KiroMessagePart("tool_use")
                         {
                             ToolUseId = toolId,
                             Name = content.Name,
                             Input = content.Input != null
                                 ? JsonSerializer.SerializeToNode(content.Input, JsonOptions.DefaultOptions)
                                 : new JsonObject()
-                        });
+                        };
                     }
                     else if (content.Type == "tool_result")
                     {
-                        parts.Add(new KiroMessagePart("tool_result")
+                        part = new KiroMessagePart("tool_result")
                         {
                             ToolUseId = content.ToolUseId,
                             Content = content.Content?.ToString() ?? content.Text
-                        });
+                        };
                     }
                     else if (content.Type == "image" && content.Source != null)
                     {
-                        parts.Add(new KiroMessagePart("image")
+                        part = new KiroMessagePart("image")
                         {
                             Source = new KiroImageSource(content.Source.MediaType, content.Source.Data)
-                        });
+                        };
+                    }
+
+                    if (part != null)
+                    {
+                        if (content.CacheControl != null)
+                        {
+                            part.CachePoint = new KiroCachePoint { Type = "default" };
+                        }
+
+                        parts.Add(part);
                     }
                 }
             }
@@ -1341,7 +1514,8 @@ public sealed class KiroService(
         return result;
     }
 
-    private static (string? SystemPrompt, List<KiroMessage> Messages) ConvertOpenAiMessages(IList<ThorChatMessage> messages)
+    private static (string? SystemPrompt, List<KiroMessage> Messages) ConvertOpenAiMessages(
+        IList<ThorChatMessage> messages)
     {
         var systemBuilder = new StringBuilder();
         var result = new List<KiroMessage>();
@@ -1356,8 +1530,10 @@ public sealed class KiroService(
                     {
                         systemBuilder.Append("\n\n");
                     }
+
                     systemBuilder.Append(message.Content);
                 }
+
                 continue;
             }
 
@@ -1460,12 +1636,7 @@ public sealed class KiroService(
 
     private static int CountTokens(string? text)
     {
-        if (string.IsNullOrEmpty(text))
-        {
-            return 0;
-        }
-
-        return (int)Math.Ceiling(text.Length / 4.0);
+        return text?.GetTokens() ?? 0;
     }
 
     private static (string Content, List<KiroToolCall> ToolCalls) ParseKiroResponse(string raw)
@@ -1541,6 +1712,7 @@ public sealed class KiroService(
             {
                 break;
             }
+
             callPositions.Add(pos);
             start = pos + 1;
         }
@@ -1558,6 +1730,7 @@ public sealed class KiroService(
                 {
                     continue;
                 }
+
                 bracketEnd = lastBracket;
             }
 
@@ -1664,7 +1837,6 @@ public sealed class KiroService(
     private static string RepairJson(string json)
     {
         var repaired = Regex.Replace(json, ",\\s*([}\\]])", "$1");
-        repaired = Regex.Replace(repaired, "([{,]\\s*)([a-zA-Z0-9_]+?)\\s*:", "$1\"$2\":");
         repaired = Regex.Replace(repaired, ":\\s*([a-zA-Z0-9_]+)(?=[,\\}\\]])", ":\"$1\"");
         return repaired;
     }
@@ -1728,6 +1900,7 @@ public sealed class KiroService(
                 });
                 outputTokens += CountTokens(call.Arguments);
             }
+
             stopReason = "tool_use";
         }
         else
@@ -1859,6 +2032,7 @@ public sealed class KiroService(
         var remaining = buffer;
         var searchStart = 0;
 
+        Console.WriteLine(buffer);
         while (true)
         {
             var contentStart = remaining.IndexOf("{\"content\":", searchStart, StringComparison.Ordinal);
@@ -1930,6 +2104,7 @@ public sealed class KiroService(
             if (jsonEnd < 0)
             {
                 remaining = remaining.Substring(jsonStart);
+                searchStart = 0;
                 break;
             }
 
@@ -1948,7 +2123,7 @@ public sealed class KiroService(
                     });
                 }
                 else if (root.TryGetProperty("name", out var nameElement)
-                    && root.TryGetProperty("toolUseId", out var toolUseIdElement))
+                         && root.TryGetProperty("toolUseId", out var toolUseIdElement))
                 {
                     events.Add(new KiroStreamEvent(KiroStreamEventType.ToolUse)
                     {
@@ -1956,11 +2131,12 @@ public sealed class KiroService(
                             nameElement.GetString() ?? string.Empty,
                             toolUseIdElement.GetString() ?? Guid.NewGuid().ToString("N"),
                             root.TryGetProperty("input", out var inputElement) ? inputElement.GetString() : null,
-                            root.TryGetProperty("stop", out var stopElement) && stopElement.ValueKind == JsonValueKind.True)
+                            root.TryGetProperty("stop", out var stopElement) &&
+                            stopElement.ValueKind == JsonValueKind.True)
                     });
                 }
                 else if (root.TryGetProperty("input", out var inputOnlyElement)
-                    && !root.TryGetProperty("name", out _))
+                         && !root.TryGetProperty("name", out _))
                 {
                     events.Add(new KiroStreamEvent(KiroStreamEventType.ToolUseInput)
                     {
@@ -1990,7 +2166,7 @@ public sealed class KiroService(
 
         if (searchStart > 0 && remaining.Length > 0)
         {
-            remaining = remaining.Substring(searchStart);
+            remaining = remaining[searchStart..];
         }
 
         return (events, remaining);
@@ -2054,15 +2230,26 @@ public sealed class KiroService(
         }
     }
 
-    private sealed class KiroMessagePart(string type)
+    private sealed class KiroMessagePart
     {
-        public string Type { get; } = type;
+        public KiroMessagePart()
+        {
+        }
+
+        public KiroMessagePart(string type)
+        {
+            Type = type;
+        }
+
+        public string Type { get; }
         public string? Text { get; init; }
         public string? ToolUseId { get; init; }
         public string? Name { get; init; }
         public JsonNode? Input { get; init; }
         public string? Content { get; init; }
         public KiroImageSource? Source { get; init; }
+
+        public KiroCachePoint? CachePoint { get; set; }
 
         public KiroMessagePart Clone()
         {
@@ -2073,9 +2260,15 @@ public sealed class KiroService(
                 Name = Name,
                 Input = Input,
                 Content = Content,
-                Source = Source
+                Source = Source,
+                CachePoint = CachePoint
             };
         }
+    }
+
+    private sealed class KiroCachePoint
+    {
+        public string Type { get; set; } = "default";
     }
 
     private sealed class KiroImageSource(string? mediaType, string? data)

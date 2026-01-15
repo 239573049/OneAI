@@ -21,6 +21,7 @@ public class AIAccountService
     private readonly OpenAIOAuthService _openAiOAuthService;
     private readonly ClaudeCodeOAuthService _claudeCodeOAuthService;
     private readonly FactoryOAuthService _factoryOAuthService;
+    private readonly KiroService _kiroService;
     private readonly ILogger<AIAccountService> _logger;
 
     public AIAccountService(
@@ -29,6 +30,7 @@ public class AIAccountService
         OpenAIOAuthService openAiOAuthService,
         ClaudeCodeOAuthService claudeCodeOAuthService,
         FactoryOAuthService factoryOAuthService,
+        KiroService kiroService,
         ILogger<AIAccountService> logger)
     {
         _appDbContext = appDbContext;
@@ -36,6 +38,7 @@ public class AIAccountService
         _openAiOAuthService = openAiOAuthService;
         _claudeCodeOAuthService = claudeCodeOAuthService;
         _factoryOAuthService = factoryOAuthService;
+        _kiroService = kiroService;
         _logger = logger;
     }
 
@@ -1230,7 +1233,7 @@ public class AIAccountService
                     {
                         type = "text",
                         text =
-                            "You work within an interactive cli tool and you are focused on helping users with any software engineering tasks.\nGuidelines:\n- Use tools when necessary.\n- Don't stop until all user tasks are completed.\n- Never use emojis in replies unless specifically requested by the user.\n- Only add absolutely necessary comments to the code you generate.\n- Your replies should be concise and you should preserve users tokens.\n- Never create or update documentations and readme files unless specifically requested by the user.\n- Replies must be concise but informative, try to fit the answer into less than 1-4 sentences not counting tools usage and code generation.\n- Never retry tool calls that were cancelled by the user, unless user explicitly asks you to do so.\n- Use FetchUrl to fetch Factory docs (https://docs.factory.ai/factory-docs-map.md) when:\n  - Asks questions in the second person (eg. \"are you able...\", \"can you do...\")\n  - User asks about Droid capabilities or features\n  - User needs help with Droid commands, configuration, or settings\n  - User asks about skills, MCP, hooks, custom droids, BYOK, or other Factory specific features\nFocus on the task at hand, don't try to jump to related but not requested tasks.\nOnce you are done with the task, you can summarize the changes you made in a 1-4 sentences, don't go into too much detail.\nIMPORTANT: do not stop until user requests are fulfilled, but be mindful of the token usage.\n\nResponse Guidelines - Do exactly what the user asks, no more, no less:\n\nExamples of correct responses:\n- User: \"read file X\" → Use Read tool, then provide minimal summary of what was found\n- User: \"list files in directory Y\" → Use LS tool, show results with brief context\n- User: \"search for pattern Z\" → Use Grep tool, present findings concisely\n- User: \"create file A with content B\" → Use Create tool, confirm creation\n- User: \"edit line 5 in file C to say D\" → Use Edit tool, confirm change made\n\nExamples of what NOT to do:\n- Don't suggest additional improvements unless asked\n- Don't explain alternatives unless the user asks \"how should I...\"\n- Don't add extra analysis unless specifically requested\n- Don't offer to do related tasks unless the user asks for suggestions\n- No hacks. No unreasonable shortcuts.\n- Do not give up if you encounter unexpected problems. Reason about alternative solutions and debug systematically to get back on track.\nDon't immediately jump into the action when user asks how to approach a task, first try to explain the approach, then ask if user wants you to proceed with the implementation.\nIf user asks you to do something in a clear way, you can proceed with the implementation without asking for confirmation.\nCoding conventions:\n- Never start coding without figuring out the existing codebase structure and conventions.\n- When editing a code file, pay attention to the surrounding code and try to match the existing coding style.\n- Follow approaches and use already used libraries and patterns. Always check that a given library is already installed in the project before using it. Even most popular libraries can be missing in the project.\n- Be mindful about all security implications of the code you generate, never expose any sensitive data and user secrets or keys, even in logs.\n- Before ANY git commit or push operation:\n    - Run 'git diff --cached' to review ALL changes being committed\n    - Run 'git status' to confirm all files being included\n    - Examine the diff for secrets, credentials, API keys, or sensitive data (especially in config files, logs, environment files, and build outputs) \n    - if detected, STOP and warn the user\nTesting and verification:\nBefore completing the task, always verify that the code you generated works as expected. Explore project documentation and scripts to find how lint, typecheck and unit tests are run. Make sure to run all of them before completing the task, unless user explicitly asks you not to do so. Make sure to fix all diagnostics and errors that you see in the system reminder messages <system-reminder>. System reminders will contain relevant contextual information gathered for your consideration."
+                            "You work within an interactive cli tool and you are focused on helping users with any software engineering tasks.nGuidelines:n- Use tools when necessary.n- Don't stop until all user tasks are completed.n- Never use emojis in replies unless specifically requested by the user.n- Only add absolutely necessary comments to the code you generate.n- Your replies should be concise and you should preserve users tokens.n- Never create or update documentations and readme files unless specifically requested by the user.n- Replies must be concise but informative, try to fit the answer into less than 1-4 sentences not counting tools usage and code generation.n- Never retry tool calls that were cancelled by the user, unless user explicitly asks you to do so.n- Use FetchUrl to fetch Factory docs (https://docs.factory.ai/factory-docs-map.md) when:n  - Asks questions in the second person (eg. \"are you able...\", \"can you do...\")n  - User asks about Droid capabilities or featuresn  - User needs help with Droid commands, configuration, or settingsn  - User asks about skills, MCP, hooks, custom droids, BYOK, or other Factory specific featuresnFocus on the task at hand, don't try to jump to related but not requested tasks.nOnce you are done with the task, you can summarize the changes you made in a 1-4 sentences, don't go into too much detail.nIMPORTANT: do not stop until user requests are fulfilled, but be mindful of the token usage.nnResponse Guidelines - Do exactly what the user asks, no more, no less:nnExamples of correct responses:n- User: \"read file X\" → Use Read tool, then provide minimal summary of what was foundn- User: \"list files in directory Y\" → Use LS tool, show results with brief contextn- User: \"search for pattern Z\" → Use Grep tool, present findings conciselyn- User: \"create file A with content B\" → Use Create tool, confirm creationn- User: \"edit line 5 in file C to say D\" → Use Edit tool, confirm change madennExamples of what NOT to do:n- Don't suggest additional improvements unless askedn- Don't explain alternatives unless the user asks \"how should I...\"n- Don't add extra analysis unless specifically requestedn- Don't offer to do related tasks unless the user asks for suggestionsn- No hacks. No unreasonable shortcuts.n- Do not give up if you encounter unexpected problems. Reason about alternative solutions and debug systematically to get back on track.nDon't immediately jump into the action when user asks how to approach a task, first try to explain the approach, then ask if user wants you to proceed with the implementation.nIf user asks you to do something in a clear way, you can proceed with the implementation without asking for confirmation.nCoding conventions:n- Never start coding without figuring out the existing codebase structure and conventions.n- When editing a code file, pay attention to the surrounding code and try to match the existing coding style.n- Follow approaches and use already used libraries and patterns. Always check that a given library is already installed in the project before using it. Even most popular libraries can be missing in the project.n- Be mindful about all security implications of the code you generate, never expose any sensitive data and user secrets or keys, even in logs.n- Before ANY git commit or push operation:n    - Run 'git diff --cached' to review ALL changes being committedn    - Run 'git status' to confirm all files being includedn    - Examine the diff for secrets, credentials, API keys, or sensitive data (especially in config files, logs, environment files, and build outputs) n    - if detected, STOP and warn the usernTesting and verification:nBefore completing the task, always verify that the code you generated works as expected. Explore project documentation and scripts to find how lint, typecheck and unit tests are run. Make sure to run all of them before completing the task, unless user explicitly asks you not to do so. Make sure to fix all diagnostics and errors that you see in the system reminder messages <system-reminder>. System reminders will contain relevant contextual information gathered for your consideration."
                     }
                 },
                 messages = new[]
@@ -1291,6 +1294,249 @@ public class AIAccountService
         catch (Exception ex)
         {
             _logger.LogError(ex, "刷新账户 {AccountId} 的 Factory 配额状态失败", id);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 刷新 Kiro 账户的配额状态
+    /// </summary>
+    /// <param name="id">账户 ID</param>
+    /// <returns>账户配额状态，如果账户不存在或刷新失败则返回 null</returns>
+    public async Task<AccountQuotaStatusDto?> RefreshKiroQuotaStatusAsync(int id)
+    {
+        var account = await _appDbContext.AIAccounts.FindAsync(id);
+        if (account == null)
+        {
+            _logger.LogWarning("尝试刷新不存在的账户 {AccountId} 的配额状态", id);
+            return null;
+        }
+
+        if (account.Provider != AIProviders.Kiro)
+        {
+            _logger.LogWarning("账户 {AccountId} 不是 Kiro 账户，无法刷新配额", id);
+            return null;
+        }
+
+        try
+        {
+            var usageLimits = await _kiroService.GetUsageLimitsAsync(account);
+            if (usageLimits == null || usageLimits.UsageBreakdownList == null)
+            {
+                _logger.LogWarning("无法获取账户 {AccountId} 的 Kiro 使用限制", id);
+                return new AccountQuotaStatusDto
+                {
+                    AccountId = account.Id,
+                    HasCacheData = false
+                };
+            }
+
+            // 查找 Credits 使用情况（通常用于显示配额）
+            var creditsItem = usageLimits.UsageBreakdownList
+                .FirstOrDefault(x =>
+                    string.Equals(x.DisplayName, "Credits", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(x.DisplayName, "Credit", StringComparison.OrdinalIgnoreCase));
+
+            if (creditsItem == null)
+            {
+                // 如果没有 Credits，使用第一个项目
+                creditsItem = usageLimits.UsageBreakdownList.FirstOrDefault();
+            }
+
+            if (creditsItem == null)
+            {
+                _logger.LogWarning("账户 {AccountId} 的 Kiro 使用限制为空", id);
+                return new AccountQuotaStatusDto
+                {
+                    AccountId = account.Id,
+                    HasCacheData = false
+                };
+            }
+
+            // 计算使用百分比（使用带精度的字段）
+            var usedPercent = 0;
+            var remainingPercent = 100;
+            var healthScore = 100;
+
+            // 优先使用带精度的字段，如果不可用则使用普通字段
+            var currentUsage = creditsItem.CurrentUsageWithPrecision > 0 ? creditsItem.CurrentUsageWithPrecision : creditsItem.CurrentUsage;
+            var usageLimit = creditsItem.UsageLimitWithPrecision > 0 ? creditsItem.UsageLimitWithPrecision : creditsItem.UsageLimit;
+
+            if (usageLimit > 0)
+            {
+                usedPercent = (int)Math.Round((currentUsage / usageLimit) * 100);
+                remainingPercent = 100 - usedPercent;
+                healthScore = Math.Max(0, 100 - usedPercent);
+            }
+
+            // 计算重置时间（NextDateReset 是 Unix 时间戳，单位为秒，格式为科学计数法）
+            int? resetAfterSeconds = null;
+            if (creditsItem.NextDateReset > 0)
+            {
+                try
+                {
+                    // Kiro API 返回的是秒级 Unix 时间戳（科学计数法格式，如 1.769904E9 = 1769904000）
+                    var resetTimeSeconds = (long)creditsItem.NextDateReset;
+                    var resetTime = DateTimeOffset.FromUnixTimeSeconds(resetTimeSeconds);
+                    var delta = resetTime - DateTimeOffset.UtcNow;
+                    resetAfterSeconds = Math.Max(0, (int)delta.TotalSeconds);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "解析 Kiro 重置时间失败: {ResetTime}", creditsItem.NextDateReset);
+                }
+            }
+
+            // 构建状态描述
+            var statusDescription = $"{creditsItem.DisplayName ?? "Credits"} 使用: {usedPercent}%";
+            if (resetAfterSeconds.HasValue && resetAfterSeconds > 0)
+            {
+                var hours = resetAfterSeconds.Value / 3600;
+                var minutes = (resetAfterSeconds.Value % 3600) / 60;
+                if (hours > 0)
+                {
+                    statusDescription += $" ({hours}小时{minutes}分钟后重置)";
+                }
+                else if (minutes > 0)
+                {
+                    statusDescription += $" ({minutes}分钟后重置)";
+                }
+            }
+
+            _logger.LogInformation(
+                "成功刷新账户 {AccountId} 的 Kiro 配额状态: {Status}",
+                account.Id, statusDescription);
+
+            // 构建 Kiro 使用明细列表
+            var kiroUsageBreakdownList = usageLimits.UsageBreakdownList?.Select(item =>
+            {
+                var itemUsedPercent = 0;
+                var itemRemaining = 0.0;
+                var itemRemainingPercent = 100;
+                int? itemResetAfterSeconds = null;
+
+                // 使用带精度的字段进行计算
+                var itemCurrentUsage = item.CurrentUsageWithPrecision > 0 ? item.CurrentUsageWithPrecision : item.CurrentUsage;
+                var itemUsageLimit = item.UsageLimitWithPrecision > 0 ? item.UsageLimitWithPrecision : item.UsageLimit;
+
+                if (itemUsageLimit > 0)
+                {
+                    itemUsedPercent = (int)Math.Round((itemCurrentUsage / itemUsageLimit) * 100);
+                    itemRemaining = itemUsageLimit - itemCurrentUsage;
+                    itemRemainingPercent = 100 - itemUsedPercent;
+                }
+
+                if (item.NextDateReset > 0)
+                {
+                    try
+                    {
+                        // Kiro API 返回的是秒级 Unix 时间戳（科学计数法格式）
+                        var resetTimeSeconds = (long)item.NextDateReset;
+                        var resetTime = DateTimeOffset.FromUnixTimeSeconds(resetTimeSeconds);
+                        var delta = resetTime - DateTimeOffset.UtcNow;
+                        itemResetAfterSeconds = Math.Max(0, (int)delta.TotalSeconds);
+                    }
+                    catch
+                    {
+                        // Ignore parse errors
+                    }
+                }
+
+                // 处理免费试用信息
+                KiroFreeTrialInfoDto? freeTrialInfoDto = null;
+                if (item.FreeTrialInfo != null)
+                {
+                    var ftCurrentUsage = item.FreeTrialInfo.CurrentUsageWithPrecision > 0
+                        ? item.FreeTrialInfo.CurrentUsageWithPrecision
+                        : item.FreeTrialInfo.CurrentUsage;
+                    var ftUsageLimit = item.FreeTrialInfo.UsageLimitWithPrecision > 0
+                        ? item.FreeTrialInfo.UsageLimitWithPrecision
+                        : item.FreeTrialInfo.UsageLimit;
+
+                    var ftUsedPercent = 0;
+                    var ftRemaining = 0.0;
+                    var ftRemainingPercent = 100;
+                    int? ftExpiryAfterSeconds = null;
+
+                    if (ftUsageLimit > 0)
+                    {
+                        ftUsedPercent = (int)Math.Round((ftCurrentUsage / ftUsageLimit) * 100);
+                        ftRemaining = ftUsageLimit - ftCurrentUsage;
+                        ftRemainingPercent = 100 - ftUsedPercent;
+                    }
+
+                    if (item.FreeTrialInfo.FreeTrialExpiry > 0)
+                    {
+                        try
+                        {
+                            // freeTrialExpiry 是毫秒级 Unix 时间戳
+                            var expiryTimeMs = (long)item.FreeTrialInfo.FreeTrialExpiry;
+                            var expiryTime = DateTimeOffset.FromUnixTimeMilliseconds(expiryTimeMs);
+                            var delta = expiryTime - DateTimeOffset.UtcNow;
+                            ftExpiryAfterSeconds = Math.Max(0, (int)delta.TotalSeconds);
+                        }
+                        catch
+                        {
+                            // Ignore parse errors
+                        }
+                    }
+
+                    freeTrialInfoDto = new KiroFreeTrialInfoDto
+                    {
+                        FreeTrialStatus = item.FreeTrialInfo.FreeTrialStatus,
+                        CurrentUsage = ftCurrentUsage,
+                        UsageLimit = ftUsageLimit,
+                        UsedPercent = ftUsedPercent,
+                        Remaining = ftRemaining,
+                        RemainingPercent = ftRemainingPercent,
+                        FreeTrialExpiry = (long)(item.FreeTrialInfo.FreeTrialExpiry / 1000), // Convert to seconds
+                        ExpiryAfterSeconds = ftExpiryAfterSeconds
+                    };
+                }
+
+                return new KiroUsageBreakdownDto
+                {
+                    DisplayName = item.DisplayName,
+                    CurrentUsage = itemCurrentUsage,
+                    UsageLimit = itemUsageLimit,
+                    NextDateReset = (long)item.NextDateReset,
+                    UsedPercent = itemUsedPercent,
+                    Remaining = itemRemaining,
+                    RemainingPercent = itemRemainingPercent,
+                    ResetAfterSeconds = itemResetAfterSeconds,
+                    FreeTrialInfo = freeTrialInfoDto
+                };
+            }).ToList();
+
+            // 提取第一个免费试用信息作为单独展示（如果存在）
+            KiroFreeTrialInfoDto? kiroFreeTrialInfo = null;
+            if (kiroUsageBreakdownList != null)
+            {
+                var firstWithTrial = kiroUsageBreakdownList.FirstOrDefault(item => item.FreeTrialInfo != null);
+                if (firstWithTrial?.FreeTrialInfo != null)
+                {
+                    kiroFreeTrialInfo = firstWithTrial.FreeTrialInfo;
+                }
+            }
+
+            return new AccountQuotaStatusDto
+            {
+                AccountId = account.Id,
+                HasCacheData = true,
+                HealthScore = healthScore,
+                PrimaryUsedPercent = usedPercent,
+                SecondaryUsedPercent = usedPercent,
+                PrimaryResetAfterSeconds = resetAfterSeconds ?? 0,
+                SecondaryResetAfterSeconds = resetAfterSeconds ?? 0,
+                StatusDescription = statusDescription,
+                LastUpdatedAt = DateTime.UtcNow,
+                KiroUsageBreakdownList = kiroUsageBreakdownList,
+                KiroFreeTrialInfo = kiroFreeTrialInfo
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "刷新账户 {AccountId} 的 Kiro 配额状态失败", id);
             return null;
         }
     }

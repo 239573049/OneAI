@@ -75,6 +75,13 @@ export const accountService = {
   getAntigravityModels(accountId: number): Promise<string[]> {
     return get<string[]>(`/accounts/${accountId}/antigravity-models`)
   },
+
+  /**
+   * 刷新 Kiro 账户配额状态
+   */
+  refreshKiroQuotaStatus(accountId: number): Promise<AccountQuotaStatus> {
+    return post<AccountQuotaStatus>(`/accounts/${accountId}/refresh-kiro-quota`, {})
+  },
 }
 
 /**

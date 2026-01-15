@@ -32,6 +32,35 @@ export interface AntigravityModelQuota {
 }
 
 /**
+ * Kiro 使用明细
+ */
+export interface KiroUsageBreakdown {
+  displayName?: string
+  currentUsage: number
+  usageLimit: number
+  nextDateReset: number
+  usedPercent?: number
+  remaining?: number
+  remainingPercent?: number
+  resetAfterSeconds?: number
+  freeTrialInfo?: KiroFreeTrialInfo
+}
+
+/**
+ * Kiro 免费试用信息
+ */
+export interface KiroFreeTrialInfo {
+  freeTrialStatus?: string
+  currentUsage: number
+  usageLimit: number
+  usedPercent?: number
+  remaining?: number
+  remainingPercent?: number
+  freeTrialExpiry: number
+  expiryAfterSeconds?: number
+}
+
+/**
  * 生成OAuth URL响应
  */
 export interface GenerateOAuthUrlResponse {
@@ -125,4 +154,6 @@ export interface AccountQuotaStatus {
   anthropicUnifiedOverageDisabledReason?: string
   anthropicUnifiedOverageStatus?: string
   antigravityModelQuotas?: AntigravityModelQuota[]
+  kiroUsageBreakdownList?: KiroUsageBreakdown[]
+  kiroFreeTrialInfo?: KiroFreeTrialInfo
 }
