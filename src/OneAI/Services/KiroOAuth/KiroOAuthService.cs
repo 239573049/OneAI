@@ -1,6 +1,5 @@
 using System.Text;
 using System.Text.Json;
-using System.Net.Http.Json;
 using OneAI.Constants;
 using OneAI.Data;
 using OneAI.Entities;
@@ -14,6 +13,8 @@ public class KiroOAuthService(
     AppDbContext appDbContext,
     AccountQuotaCacheService quotaCacheService)
 {
+    private const string KiroVersion = "0.7.5";
+
     /// <summary>
     /// Import Kiro credentials and create account.
     /// </summary>
@@ -100,9 +101,25 @@ public class KiroOAuthService(
             };
         }
 
-        var response = await httpClient.PostAsJsonAsync(
-            string.Equals(authMethod, "social", StringComparison.OrdinalIgnoreCase) ? refreshUrl : refreshIdcUrl,
-            requestBody);
+        var refreshEndpoint = string.Equals(authMethod, "social", StringComparison.OrdinalIgnoreCase)
+            ? refreshUrl
+            : refreshIdcUrl;
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, refreshEndpoint);
+        var payload = JsonSerializer.Serialize(requestBody);
+        request.Content = new StringContent(payload, Encoding.UTF8, "application/json");
+
+        if (!string.IsNullOrWhiteSpace(current.AccessToken))
+        {
+            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {current.AccessToken}");
+        }
+
+        request.Headers.TryAddWithoutValidation("User-Agent", $"OneAI/{KiroVersion}");
+        request.Headers.TryAddWithoutValidation("amz-sdk-invocation-id", Guid.NewGuid().ToString());
+        request.Headers.TryAddWithoutValidation("Origin", "https://app.kiro.dev");
+        request.Headers.TryAddWithoutValidation("Referer", "https://app.kiro.dev/");
+
+        var response = await httpClient.SendAsync(request);
 
         if (!response.IsSuccessStatusCode)
         {

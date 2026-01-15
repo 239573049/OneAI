@@ -1,4 +1,5 @@
 using System.Net;
+using System.Diagnostics;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
@@ -14,6 +15,7 @@ using OneAI.Extensions;
 using OneAI.Services;
 using OneAI.Services.AI.Anthropic;
 using OneAI.Services.AI.Models.Dtos;
+using OneAI.Services.Logging;
 using OneAI.Services.KiroOAuth;
 using Thor.Abstractions.Chats.Dtos;
 
@@ -79,12 +81,12 @@ public class KiroFreeTrialInfo
 /// </summary>
 public sealed class KiroService(
     ILogger<KiroService> logger,
-    KiroOAuthService kiroOAuthService)
+    KiroOAuthService kiroOAuthService,
+    AIRequestLogService requestLogService)
 {
     private static readonly HttpClient HttpClient = CreateHttpClient();
 
     private const int MaxRetries = 3;
-    private const int BaseDelayMs = 1000;
     private const string DefaultModelName = "claude-opus-4-5";
     private const string AuthMethodSocial = "social";
     private const string ChatTriggerManual = "MANUAL";
@@ -116,62 +118,264 @@ public sealed class KiroService(
         }
 
         AIProviderAsyncLocal.AIProviderIds = [];
+        var (logId, stopwatch) = await requestLogService.CreateRequestLog(
+            context,
+            input.Model,
+            input.Stream,
+            null,
+            false);
+
+        var tools = BuildToolSpecificationsFromAnthropic(input.Tools);
+        var systemPrompt = BuildAnthropicSystemPrompt(input);
+        var messages = ConvertAnthropicMessages(input);
+        var requestModel = ResolveKiroModel(input.Model);
+        var inputTokens = EstimateInputTokens(systemPrompt, messages, tools);
+        HttpStatusCode? lastStatusCode = null;
+        string? lastErrorMessage = null;
 
         try
         {
-            var account = await aiAccountService.GetAIAccountByProvider(AIProviders.Kiro);
-            if (account == null)
+            for (var attempt = 1; attempt <= MaxRetries; attempt++)
             {
-                await WriteAnthropicError(context, StatusCodes.Status503ServiceUnavailable,
-                    "Kiro 账户池暂无可用账户", "api_error");
+                var account = await aiAccountService.GetAIAccountByProvider(AIProviders.Kiro);
+                if (account == null)
+                {
+                    var statusCode = (int)(lastStatusCode ?? HttpStatusCode.ServiceUnavailable);
+                    var message = lastErrorMessage ?? "Kiro 账户池暂无可用账户";
+                    await requestLogService.RecordFailure(
+                        logId,
+                        stopwatch,
+                        statusCode,
+                        message);
+                    await WriteAnthropicError(context, statusCode, message, "api_error");
+                    return;
+                }
+
+                AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
+                await requestLogService.UpdateRetry(logId, attempt, account.Id);
+
+                var credentials = account.GetKiroOauth();
+                if (credentials == null)
+                {
+                    lastErrorMessage = $"账户 {account.Id} 缺少有效凭证";
+                    lastStatusCode = HttpStatusCode.Unauthorized;
+                    await aiAccountService.DisableAccount(account.Id);
+                    if (attempt < MaxRetries)
+                    {
+                        continue;
+                    }
+
+                    break;
+                }
+
+                if (IsExpiryDateNear(credentials))
+                {
+                    var (refreshed, refreshError) = await TryRefreshKiroTokenAsync(account, credentials);
+                    if (refreshed)
+                    {
+                        credentials = account.GetKiroOauth();
+                    }
+                    else if (!string.IsNullOrWhiteSpace(refreshError))
+                    {
+                        logger.LogWarning(
+                            "Kiro Token 预刷新失败 (账户: {AccountId}): {Error}",
+                            account.Id,
+                            refreshError);
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(credentials?.AccessToken))
+                {
+                    lastErrorMessage = $"账户 {account.Id} 缺少访问令牌";
+                    lastStatusCode = HttpStatusCode.Unauthorized;
+                    await aiAccountService.DisableAccount(account.Id);
+                    if (attempt < MaxRetries)
+                    {
+                        continue;
+                    }
+
+                    break;
+                }
+
+                var requestBody = BuildCodeWhispererRequest(messages, input.Model, tools, systemPrompt, credentials);
+                var region = BuildRegion(credentials);
+                var requestUrl = requestModel.StartsWith("amazonq", StringComparison.OrdinalIgnoreCase)
+                    ? BuildAmazonQUrl(region)
+                    : BuildBaseUrl(region);
+
+                HttpResponseMessage response;
+                try
+                {
+                    response = await SendKiroRequestAsync(
+                        credentials,
+                        requestBody,
+                        requestUrl,
+                        input.Stream,
+                        context.RequestAborted);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex,
+                        "Kiro 请求异常 (账户: {AccountId}, 尝试: {Attempt}/{MaxRetries})",
+                        account.Id,
+                        attempt,
+                        MaxRetries);
+                    lastErrorMessage = $"Kiro 请求异常: {ex.Message}";
+                    lastStatusCode = HttpStatusCode.BadGateway;
+                    if (attempt < MaxRetries)
+                    {
+                        continue;
+                    }
+
+                    break;
+                }
+
+                if (response.StatusCode == HttpStatusCode.Unauthorized)
+                {
+                    response.Dispose();
+                    var (refreshed, refreshError) = await TryRefreshKiroTokenAsync(account, credentials);
+                    if (!refreshed)
+                    {
+                        lastErrorMessage = string.IsNullOrWhiteSpace(refreshError)
+                            ? $"账户 {account.Id} Token 刷新失败"
+                            : $"账户 {account.Id} Token 刷新失败: {refreshError}";
+                        lastStatusCode = HttpStatusCode.Unauthorized;
+                        await aiAccountService.DisableAccount(account.Id);
+                        if (attempt < MaxRetries)
+                        {
+                            continue;
+                        }
+
+                        break;
+                    }
+
+                    credentials = account.GetKiroOauth();
+                    if (credentials == null || string.IsNullOrWhiteSpace(credentials.AccessToken))
+                    {
+                        lastErrorMessage = $"账户 {account.Id} Token 刷新后仍无效";
+                        lastStatusCode = HttpStatusCode.Unauthorized;
+                        await aiAccountService.DisableAccount(account.Id);
+                        if (attempt < MaxRetries)
+                        {
+                            continue;
+                        }
+
+                        break;
+                    }
+
+                    requestBody = BuildCodeWhispererRequest(messages, input.Model, tools, systemPrompt, credentials);
+                    region = BuildRegion(credentials);
+                    requestUrl = requestModel.StartsWith("amazonq", StringComparison.OrdinalIgnoreCase)
+                        ? BuildAmazonQUrl(region)
+                        : BuildBaseUrl(region);
+
+                    try
+                    {
+                        response = await SendKiroRequestAsync(
+                            credentials,
+                            requestBody,
+                            requestUrl,
+                            input.Stream,
+                            context.RequestAborted);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex,
+                            "Kiro 请求异常 (账户: {AccountId}, 尝试: {Attempt}/{MaxRetries})",
+                            account.Id,
+                            attempt,
+                            MaxRetries);
+                        lastErrorMessage = $"Kiro 请求异常: {ex.Message}";
+                        lastStatusCode = HttpStatusCode.BadGateway;
+                        if (attempt < MaxRetries)
+                        {
+                            continue;
+                        }
+
+                        break;
+                    }
+                }
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    var error = await response.Content.ReadAsStringAsync(context.RequestAborted);
+                    response.Dispose();
+
+                    lastErrorMessage = string.IsNullOrWhiteSpace(error)
+                        ? $"Kiro 请求失败 (状态码: {(int)response.StatusCode})"
+                        : error;
+                    lastStatusCode = response.StatusCode;
+
+                    if (response.StatusCode is HttpStatusCode.Unauthorized
+                        or HttpStatusCode.Forbidden
+                        or HttpStatusCode.PaymentRequired)
+                    {
+                        await aiAccountService.DisableAccount(account.Id);
+                    }
+
+                    var shouldRetry = response.StatusCode == HttpStatusCode.TooManyRequests
+                                      || response.StatusCode is HttpStatusCode.Unauthorized
+                                          or HttpStatusCode.Forbidden
+                                          or HttpStatusCode.PaymentRequired
+                                      || (int)response.StatusCode >= 500;
+
+                    if (attempt < MaxRetries && shouldRetry)
+                    {
+                        continue;
+                    }
+
+                    break;
+                }
+
+                if (input.Stream)
+                {
+                    var (streamOutputTokens, streamTimeToFirstByteMs) = await StreamAnthropicResponse(
+                        context,
+                        response,
+                        input.Model,
+                        inputTokens,
+                        stopwatch);
+                    await requestLogService.RecordSuccess(
+                        logId,
+                        stopwatch,
+                        StatusCodes.Status200OK,
+                        timeToFirstByteMs: streamTimeToFirstByteMs,
+                        promptTokens: inputTokens,
+                        completionTokens: streamOutputTokens,
+                        totalTokens: inputTokens + streamOutputTokens);
+                    return;
+                }
+
+                var responseText = await response.Content.ReadAsStringAsync(context.RequestAborted);
+                response.Dispose();
+                var (content, toolCalls) = ParseKiroResponse(responseText);
+
+                var outputTokens = toolCalls.Count > 0
+                    ? toolCalls.Sum(call => CountTokens(call.Arguments))
+                    : CountTokens(content);
+                await requestLogService.RecordSuccess(
+                    logId,
+                    stopwatch,
+                    StatusCodes.Status200OK,
+                    timeToFirstByteMs: stopwatch.ElapsedMilliseconds,
+                    promptTokens: inputTokens,
+                    completionTokens: outputTokens,
+                    totalTokens: inputTokens + outputTokens);
+
+                var responsePayload = BuildAnthropicResponse(content, toolCalls, input.Model, inputTokens);
+                context.Response.ContentType = "application/json";
+                await context.Response.WriteAsync(responsePayload.ToJsonString(JsonOptions.DefaultOptions));
                 return;
             }
 
-            AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
-
-            var credentials = account.GetKiroOauth();
-            if (credentials == null)
-            {
-                await WriteAnthropicError(context, StatusCodes.Status401Unauthorized,
-                    "Kiro 账户缺少有效凭证", "authentication_error");
-                return;
-            }
-
-            if (IsExpiryDateNear(credentials))
-            {
-                await kiroOAuthService.RefreshKiroOAuthTokenAsync(account);
-                credentials = account.GetKiroOauth();
-            }
-
-            if (string.IsNullOrWhiteSpace(credentials?.AccessToken))
-            {
-                await WriteAnthropicError(context, StatusCodes.Status401Unauthorized,
-                    "Kiro 账户缺少访问令牌", "authentication_error");
-                return;
-            }
-
-            var tools = BuildToolSpecificationsFromAnthropic(input.Tools);
-            var systemPrompt = BuildAnthropicSystemPrompt(input);
-            var messages = ConvertAnthropicMessages(input);
-
-            var requestBody = BuildCodeWhispererRequest(messages, input.Model, tools, systemPrompt, credentials);
-            var requestModel = ResolveKiroModel(input.Model);
-            var inputTokens = EstimateInputTokens(systemPrompt, messages, tools);
-
-            if (input.Stream)
-            {
-                await StreamAnthropicResponse(context, account, credentials, requestBody, requestModel, input.Model,
-                    inputTokens);
-                return;
-            }
-
-            var responseText =
-                await CallKiroAsync(account, credentials, requestBody, requestModel, context.RequestAborted);
-            var (content, toolCalls) = ParseKiroResponse(responseText);
-
-            var responsePayload = BuildAnthropicResponse(content, toolCalls, input.Model, inputTokens);
-            context.Response.ContentType = "application/json";
-            await context.Response.WriteAsync(responsePayload.ToJsonString(JsonOptions.DefaultOptions));
+            var finalStatus = (int)(lastStatusCode ?? HttpStatusCode.ServiceUnavailable);
+            var finalMessage = lastErrorMessage ?? "Kiro 账户池暂无可用账户";
+            await requestLogService.RecordFailure(
+                logId,
+                stopwatch,
+                finalStatus,
+                finalMessage);
+            await WriteAnthropicError(context, finalStatus, finalMessage, "api_error");
         }
         catch (OperationCanceledException)
         {
@@ -182,8 +386,21 @@ public sealed class KiroService(
             logger.LogError(ex, "Kiro /v1/messages 处理失败");
             if (!context.Response.HasStarted)
             {
+                await requestLogService.RecordFailure(
+                    logId,
+                    stopwatch,
+                    StatusCodes.Status500InternalServerError,
+                    $"服务器内部错误: {ex.Message}");
                 await WriteAnthropicError(context, StatusCodes.Status500InternalServerError,
                     $"服务器内部错误: {ex.Message}", "api_error");
+            }
+            else
+            {
+                await requestLogService.RecordFailure(
+                    logId,
+                    stopwatch,
+                    StatusCodes.Status500InternalServerError,
+                    $"服务器内部错误: {ex.Message}");
             }
         }
         finally
@@ -205,57 +422,261 @@ public sealed class KiroService(
 
         AIProviderAsyncLocal.AIProviderIds = [];
 
+        var (logId, stopwatch) = await requestLogService.CreateRequestLog(
+            context,
+            request.Model,
+            request.Stream == true,
+            null,
+            false);
+
+        var (systemPrompt, messages) = ConvertOpenAiMessages(request.Messages);
+        var tools = BuildToolSpecificationsFromOpenAi(request.Tools);
+        var requestModel = ResolveKiroModel(request.Model);
+        var inputTokens = EstimateInputTokens(systemPrompt, messages, tools);
+        HttpStatusCode? lastStatusCode = null;
+        string? lastErrorMessage = null;
+
         try
         {
-            var account = await aiAccountService.GetAIAccountByProvider(AIProviders.Kiro);
-            if (account == null)
+            for (var attempt = 1; attempt <= MaxRetries; attempt++)
             {
-                await WriteOpenAIErrorResponse(context, "Kiro 账户池暂无可用账户", 503);
+                var account = await aiAccountService.GetAIAccountByProvider(AIProviders.Kiro);
+                if (account == null)
+                {
+                    var statusCode = (int)(lastStatusCode ?? HttpStatusCode.ServiceUnavailable);
+                    var message = lastErrorMessage ?? "Kiro 账户池暂无可用账户";
+                    await requestLogService.RecordFailure(
+                        logId,
+                        stopwatch,
+                        statusCode,
+                        message);
+                    await WriteOpenAIErrorResponse(context, message, statusCode);
+                    return;
+                }
+
+                AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
+                await requestLogService.UpdateRetry(logId, attempt, account.Id);
+
+                var credentials = account.GetKiroOauth();
+                if (credentials == null)
+                {
+                    lastErrorMessage = $"账户 {account.Id} 缺少有效凭证";
+                    lastStatusCode = HttpStatusCode.Unauthorized;
+                    await aiAccountService.DisableAccount(account.Id);
+                    if (attempt < MaxRetries)
+                    {
+                        continue;
+                    }
+
+                    break;
+                }
+
+                if (IsExpiryDateNear(credentials))
+                {
+                    var (refreshed, refreshError) = await TryRefreshKiroTokenAsync(account, credentials);
+                    if (refreshed)
+                    {
+                        credentials = account.GetKiroOauth();
+                    }
+                    else if (!string.IsNullOrWhiteSpace(refreshError))
+                    {
+                        logger.LogWarning(
+                            "Kiro Token 预刷新失败 (账户: {AccountId}): {Error}",
+                            account.Id,
+                            refreshError);
+                    }
+                }
+
+                if (string.IsNullOrWhiteSpace(credentials?.AccessToken))
+                {
+                    lastErrorMessage = $"账户 {account.Id} 缺少访问令牌";
+                    lastStatusCode = HttpStatusCode.Unauthorized;
+                    await aiAccountService.DisableAccount(account.Id);
+                    if (attempt < MaxRetries)
+                    {
+                        continue;
+                    }
+
+                    break;
+                }
+
+                var requestBody = BuildCodeWhispererRequest(messages, request.Model, tools, systemPrompt, credentials);
+                var region = BuildRegion(credentials);
+                var requestUrl = requestModel.StartsWith("amazonq", StringComparison.OrdinalIgnoreCase)
+                    ? BuildAmazonQUrl(region)
+                    : BuildBaseUrl(region);
+
+                HttpResponseMessage response;
+                try
+                {
+                    response = await SendKiroRequestAsync(
+                        credentials,
+                        requestBody,
+                        requestUrl,
+                        request.Stream == true,
+                        context.RequestAborted);
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex,
+                        "Kiro 请求异常 (账户: {AccountId}, 尝试: {Attempt}/{MaxRetries})",
+                        account.Id,
+                        attempt,
+                        MaxRetries);
+                    lastErrorMessage = $"Kiro 请求异常: {ex.Message}";
+                    lastStatusCode = HttpStatusCode.BadGateway;
+                    if (attempt < MaxRetries)
+                    {
+                        continue;
+                    }
+
+                    break;
+                }
+
+                if (response.StatusCode == HttpStatusCode.Unauthorized)
+                {
+                    response.Dispose();
+                    var (refreshed, refreshError) = await TryRefreshKiroTokenAsync(account, credentials);
+                    if (!refreshed)
+                    {
+                        lastErrorMessage = string.IsNullOrWhiteSpace(refreshError)
+                            ? $"账户 {account.Id} Token 刷新失败"
+                            : $"账户 {account.Id} Token 刷新失败: {refreshError}";
+                        lastStatusCode = HttpStatusCode.Unauthorized;
+                        await aiAccountService.DisableAccount(account.Id);
+                        if (attempt < MaxRetries)
+                        {
+                            continue;
+                        }
+
+                        break;
+                    }
+
+                    credentials = account.GetKiroOauth();
+                    if (credentials == null || string.IsNullOrWhiteSpace(credentials.AccessToken))
+                    {
+                        lastErrorMessage = $"账户 {account.Id} Token 刷新后仍无效";
+                        lastStatusCode = HttpStatusCode.Unauthorized;
+                        await aiAccountService.DisableAccount(account.Id);
+                        if (attempt < MaxRetries)
+                        {
+                            continue;
+                        }
+
+                        break;
+                    }
+
+                    requestBody = BuildCodeWhispererRequest(messages, request.Model, tools, systemPrompt, credentials);
+                    region = BuildRegion(credentials);
+                    requestUrl = requestModel.StartsWith("amazonq", StringComparison.OrdinalIgnoreCase)
+                        ? BuildAmazonQUrl(region)
+                        : BuildBaseUrl(region);
+
+                    try
+                    {
+                        response = await SendKiroRequestAsync(
+                            credentials,
+                            requestBody,
+                            requestUrl,
+                            request.Stream == true,
+                            context.RequestAborted);
+                    }
+                    catch (Exception ex)
+                    {
+                        logger.LogError(ex,
+                            "Kiro 请求异常 (账户: {AccountId}, 尝试: {Attempt}/{MaxRetries})",
+                            account.Id,
+                            attempt,
+                            MaxRetries);
+                        lastErrorMessage = $"Kiro 请求异常: {ex.Message}";
+                        lastStatusCode = HttpStatusCode.BadGateway;
+                        if (attempt < MaxRetries)
+                        {
+                            continue;
+                        }
+
+                        break;
+                    }
+                }
+
+                if (!response.IsSuccessStatusCode)
+                {
+                    var error = await response.Content.ReadAsStringAsync(context.RequestAborted);
+                    response.Dispose();
+
+                    lastErrorMessage = string.IsNullOrWhiteSpace(error)
+                        ? $"Kiro 请求失败 (状态码: {(int)response.StatusCode})"
+                        : error;
+                    lastStatusCode = response.StatusCode;
+
+                    if (response.StatusCode is HttpStatusCode.Unauthorized
+                        or HttpStatusCode.Forbidden
+                        or HttpStatusCode.PaymentRequired)
+                    {
+                        await aiAccountService.DisableAccount(account.Id);
+                    }
+
+                    var shouldRetry = response.StatusCode == HttpStatusCode.TooManyRequests
+                                      || response.StatusCode is HttpStatusCode.Unauthorized
+                                          or HttpStatusCode.Forbidden
+                                          or HttpStatusCode.PaymentRequired
+                                      || (int)response.StatusCode >= 500;
+
+                    if (attempt < MaxRetries && shouldRetry)
+                    {
+                        continue;
+                    }
+
+                    break;
+                }
+
+                if (request.Stream == true)
+                {
+                    var (streamOutputTokens, streamTimeToFirstByteMs) = await StreamOpenAiResponse(
+                        context,
+                        response,
+                        request.Model,
+                        inputTokens,
+                        stopwatch);
+                    await requestLogService.RecordSuccess(
+                        logId,
+                        stopwatch,
+                        StatusCodes.Status200OK,
+                        timeToFirstByteMs: streamTimeToFirstByteMs,
+                        promptTokens: inputTokens,
+                        completionTokens: streamOutputTokens,
+                        totalTokens: inputTokens + streamOutputTokens);
+                    return;
+                }
+
+                var responseText = await response.Content.ReadAsStringAsync(context.RequestAborted);
+                response.Dispose();
+                var (content, toolCalls) = ParseKiroResponse(responseText);
+
+                var outputTokens = CountTokens(content) + toolCalls.Sum(call => CountTokens(call.Arguments));
+                await requestLogService.RecordSuccess(
+                    logId,
+                    stopwatch,
+                    StatusCodes.Status200OK,
+                    timeToFirstByteMs: stopwatch.ElapsedMilliseconds,
+                    promptTokens: inputTokens,
+                    completionTokens: outputTokens,
+                    totalTokens: inputTokens + outputTokens);
+
+                var responsePayload = BuildOpenAiResponse(content, toolCalls, request.Model, inputTokens);
+                context.Response.ContentType = "application/json; charset=utf-8";
+                await context.Response.WriteAsync(responsePayload.ToJsonString(JsonOptions.DefaultOptions));
                 return;
             }
 
-            AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
-
-            var credentials = account.GetKiroOauth();
-            if (credentials == null)
-            {
-                await WriteOpenAIErrorResponse(context, "Kiro 账户缺少有效凭证", 401);
-                return;
-            }
-
-            if (IsExpiryDateNear(credentials))
-            {
-                await kiroOAuthService.RefreshKiroOAuthTokenAsync(account);
-                credentials = account.GetKiroOauth();
-            }
-
-            if (string.IsNullOrWhiteSpace(credentials?.AccessToken))
-            {
-                await WriteOpenAIErrorResponse(context, "Kiro 账户缺少访问令牌", 401);
-                return;
-            }
-
-            var (systemPrompt, messages) = ConvertOpenAiMessages(request.Messages);
-            var tools = BuildToolSpecificationsFromOpenAi(request.Tools);
-
-            var requestBody = BuildCodeWhispererRequest(messages, request.Model, tools, systemPrompt, credentials);
-            var requestModel = ResolveKiroModel(request.Model);
-            var inputTokens = EstimateInputTokens(systemPrompt, messages, tools);
-
-            if (request.Stream == true)
-            {
-                await StreamOpenAiResponse(context, account, credentials, requestBody, requestModel, request.Model,
-                    inputTokens);
-                return;
-            }
-
-            var responseText =
-                await CallKiroAsync(account, credentials, requestBody, requestModel, context.RequestAborted);
-            var (content, toolCalls) = ParseKiroResponse(responseText);
-
-            var responsePayload = BuildOpenAiResponse(content, toolCalls, request.Model, inputTokens);
-            context.Response.ContentType = "application/json; charset=utf-8";
-            await context.Response.WriteAsync(responsePayload.ToJsonString(JsonOptions.DefaultOptions));
+            var finalStatus = (int)(lastStatusCode ?? HttpStatusCode.ServiceUnavailable);
+            var finalMessage = lastErrorMessage ?? "Kiro 账户池暂无可用账户";
+            await requestLogService.RecordFailure(
+                logId,
+                stopwatch,
+                finalStatus,
+                finalMessage);
+            await WriteOpenAIErrorResponse(context, finalMessage, finalStatus);
         }
         catch (OperationCanceledException)
         {
@@ -266,7 +687,20 @@ public sealed class KiroService(
             logger.LogError(ex, "Kiro /v1/chat/completions 处理失败");
             if (!context.Response.HasStarted)
             {
+                await requestLogService.RecordFailure(
+                    logId,
+                    stopwatch,
+                    StatusCodes.Status500InternalServerError,
+                    $"服务器内部错误: {ex.Message}");
                 await WriteOpenAIErrorResponse(context, $"服务器内部错误: {ex.Message}", 500);
+            }
+            else
+            {
+                await requestLogService.RecordFailure(
+                    logId,
+                    stopwatch,
+                    StatusCodes.Status500InternalServerError,
+                    $"服务器内部错误: {ex.Message}");
             }
         }
         finally
@@ -319,166 +753,179 @@ public sealed class KiroService(
         return $"https://codewhisperer.{region}.amazonaws.com/SendMessageStreaming";
     }
 
-    private async Task<string> CallKiroAsync(
-        AIAccount account,
+    private async Task<HttpResponseMessage> SendKiroRequestAsync(
         KiroOAuthCredentialsDto credentials,
         JsonObject requestBody,
-        string requestModel,
+        string requestUrl,
+        bool stream,
         CancellationToken cancellationToken)
     {
-        var region = BuildRegion(credentials);
-        var requestUrl = requestModel.StartsWith("amazonq", StringComparison.OrdinalIgnoreCase)
-            ? BuildAmazonQUrl(region)
-            : BuildBaseUrl(region);
-
         var body = requestBody.ToJsonString(JsonOptions.DefaultOptions);
 
-        var attempt = 0;
-        while (true)
+        using var request = new HttpRequestMessage(HttpMethod.Post, requestUrl)
         {
-            attempt++;
+            Content = new StringContent(body, Encoding.UTF8, "application/json")
+        };
 
-            using var request = new HttpRequestMessage(HttpMethod.Post, requestUrl)
-            {
-                Content = new StringContent(body, Encoding.UTF8, "application/json")
-            };
+        ApplyKiroHeaders(request, credentials);
 
-            ApplyKiroHeaders(request, credentials);
+        return await HttpClient.SendAsync(
+            request,
+            stream ? HttpCompletionOption.ResponseHeadersRead : HttpCompletionOption.ResponseContentRead,
+            cancellationToken);
+    }
 
-            using var response = await HttpClient.SendAsync(request, cancellationToken);
-            if (response.StatusCode == HttpStatusCode.Forbidden && attempt == 1)
-            {
-                await RefreshCredentials(account, credentials);
-                continue;
-            }
+    private async Task<(bool Refreshed, string? ErrorMessage)> TryRefreshKiroTokenAsync(
+        AIAccount account,
+        KiroOAuthCredentialsDto credentials)
+    {
+        if (string.IsNullOrWhiteSpace(credentials.RefreshToken))
+        {
+            return (false, "缺少 refresh token");
+        }
 
-            if ((int)response.StatusCode == 429 && attempt < MaxRetries)
-            {
-                await Task.Delay(BaseDelayMs * attempt, cancellationToken);
-                continue;
-            }
+        var authMethod = string.IsNullOrWhiteSpace(credentials.AuthMethod)
+            ? AuthMethodSocial
+            : credentials.AuthMethod.Trim();
 
-            if ((int)response.StatusCode >= 500 && attempt < MaxRetries)
-            {
-                await Task.Delay(BaseDelayMs * attempt, cancellationToken);
-                continue;
-            }
+        if (!string.Equals(authMethod, AuthMethodSocial, StringComparison.OrdinalIgnoreCase)
+            && (string.IsNullOrWhiteSpace(credentials.ClientId)
+                || string.IsNullOrWhiteSpace(credentials.ClientSecret)))
+        {
+            return (false, "缺少 clientId 或 clientSecret");
+        }
 
-            response.EnsureSuccessStatusCode();
-
-            var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
-            return Encoding.UTF8.GetString(bytes);
+        try
+        {
+            await kiroOAuthService.RefreshKiroOAuthTokenAsync(account);
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "Kiro Token 刷新失败 (账户: {AccountId})", account.Id);
+            return (false, "token 刷新失败");
         }
     }
 
-    private async Task StreamAnthropicResponse(
+    private async Task<(int OutputTokens, long? TimeToFirstByteMs)> StreamAnthropicResponse(
         HttpContext context,
-        AIAccount account,
-        KiroOAuthCredentialsDto credentials,
-        JsonObject requestBody,
-        string requestModel,
+        HttpResponseMessage response,
         string responseModel,
-        int inputTokens)
+        int inputTokens,
+        Stopwatch stopwatch)
     {
-        var region = BuildRegion(credentials);
-        var requestUrl = requestModel.StartsWith("amazonq", StringComparison.OrdinalIgnoreCase)
-            ? BuildAmazonQUrl(region)
-            : BuildBaseUrl(region);
+        var responseStarted = false;
 
-        context.Response.ContentType = "text/event-stream;charset=utf-8";
-        context.Response.Headers.TryAdd("Cache-Control", "no-cache");
-        context.Response.Headers.TryAdd("Connection", "keep-alive");
-        context.Response.StatusCode = 200;
-
-        var messageId = Guid.NewGuid().ToString();
-        var messageStart = new JsonObject
+        async Task EnsureStreamStartedAsync()
         {
-            ["type"] = "message_start",
-            ["message"] = new JsonObject
+            if (responseStarted)
             {
-                ["id"] = messageId,
-                ["type"] = "message",
-                ["role"] = "assistant",
-                ["model"] = responseModel,
-                ["usage"] = new JsonObject
+                return;
+            }
+
+            responseStarted = true;
+            context.Response.ContentType = "text/event-stream;charset=utf-8";
+            context.Response.Headers.TryAdd("Cache-Control", "no-cache");
+            context.Response.Headers.TryAdd("Connection", "keep-alive");
+            context.Response.StatusCode = 200;
+
+            var messageId = Guid.NewGuid().ToString();
+            var messageStart = new JsonObject
+            {
+                ["type"] = "message_start",
+                ["message"] = new JsonObject
                 {
-                    ["input_tokens"] = inputTokens,
-                    ["cache_creation_input_tokens"] = 0,
-                    ["cache_read_input_tokens"] = 0,
-                    ["output_tokens"] = 0
-                },
-                ["content"] = new JsonArray()
-            }
-        };
+                    ["id"] = messageId,
+                    ["type"] = "message",
+                    ["role"] = "assistant",
+                    ["model"] = responseModel,
+                    ["usage"] = new JsonObject
+                    {
+                        ["input_tokens"] = inputTokens,
+                        ["cache_creation_input_tokens"] = 0,
+                        ["cache_read_input_tokens"] = 0,
+                        ["output_tokens"] = 0
+                    },
+                    ["content"] = new JsonArray()
+                }
+            };
 
-        await WriteSseJsonAsync(context, messageStart, context.RequestAborted);
+            await WriteSseJsonAsync(context, messageStart, context.RequestAborted);
 
-        var contentBlockStart = new JsonObject
-        {
-            ["type"] = "content_block_start",
-            ["index"] = 0,
-            ["content_block"] = new JsonObject
+            var contentBlockStart = new JsonObject
             {
-                ["type"] = "text",
-                ["text"] = string.Empty
-            }
-        };
+                ["type"] = "content_block_start",
+                ["index"] = 0,
+                ["content_block"] = new JsonObject
+                {
+                    ["type"] = "text",
+                    ["text"] = string.Empty
+                }
+            };
 
-        await WriteSseJsonAsync(context, contentBlockStart, context.RequestAborted);
+            await WriteSseJsonAsync(context, contentBlockStart, context.RequestAborted);
+        }
 
         var toolCalls = new List<KiroToolCall>();
         var currentTool = (ToolCallAccumulator?)null;
         var totalOutputTokens = 0;
+        long? timeToFirstByteMs = null;
         string? lastContent = null;
 
-        await foreach (var ev in StreamKiroEvents(account, credentials, requestBody, requestUrl,
-                           context.RequestAborted))
+        using (response)
         {
-            if (ev.Type == KiroStreamEventType.Content && !string.IsNullOrEmpty(ev.Content))
+            await using var stream = await response.Content.ReadAsStreamAsync(context.RequestAborted);
+
+            await foreach (var ev in ReadKiroEventsAsync(stream, context.RequestAborted))
             {
-                if (ev.Content == lastContent)
+                timeToFirstByteMs ??= stopwatch.ElapsedMilliseconds;
+                await EnsureStreamStartedAsync();
+                if (ev.Type == KiroStreamEventType.Content && !string.IsNullOrEmpty(ev.Content))
                 {
-                    continue;
-                }
-
-                lastContent = ev.Content;
-                totalOutputTokens += CountTokens(ev.Content);
-
-                var delta = new JsonObject
-                {
-                    ["type"] = "content_block_delta",
-                    ["index"] = 0,
-                    ["delta"] = new JsonObject
+                    if (ev.Content == lastContent)
                     {
-                        ["type"] = "text_delta",
-                        ["text"] = ev.Content
+                        continue;
                     }
-                };
 
-                await WriteSseJsonAsync(context, delta, context.RequestAborted);
-            }
-            else if (ev.Type == KiroStreamEventType.ToolUse && ev.ToolUse != null)
-            {
-                currentTool = new ToolCallAccumulator(ev.ToolUse.ToolUseId, ev.ToolUse.Name);
-                if (!string.IsNullOrEmpty(ev.ToolUse.Input))
-                {
-                    currentTool.Input.Append(ev.ToolUse.Input);
+                    lastContent = ev.Content;
+                    totalOutputTokens += CountTokens(ev.Content);
+
+                    var delta = new JsonObject
+                    {
+                        ["type"] = "content_block_delta",
+                        ["index"] = 0,
+                        ["delta"] = new JsonObject
+                        {
+                            ["type"] = "text_delta",
+                            ["text"] = ev.Content
+                        }
+                    };
+
+                    await WriteSseJsonAsync(context, delta, context.RequestAborted);
                 }
+                else if (ev.Type == KiroStreamEventType.ToolUse && ev.ToolUse != null)
+                {
+                    currentTool = new ToolCallAccumulator(ev.ToolUse.ToolUseId, ev.ToolUse.Name);
+                    if (!string.IsNullOrEmpty(ev.ToolUse.Input))
+                    {
+                        currentTool.Input.Append(ev.ToolUse.Input);
+                    }
 
-                if (ev.ToolUse.Stop)
+                    if (ev.ToolUse.Stop)
+                    {
+                        toolCalls.Add(currentTool.ToToolCall());
+                        currentTool = null;
+                    }
+                }
+                else if (ev.Type == KiroStreamEventType.ToolUseInput && currentTool != null)
+                {
+                    currentTool.Input.Append(ev.ToolInput);
+                }
+                else if (ev.Type == KiroStreamEventType.ToolUseStop && currentTool != null)
                 {
                     toolCalls.Add(currentTool.ToToolCall());
                     currentTool = null;
                 }
-            }
-            else if (ev.Type == KiroStreamEventType.ToolUseInput && currentTool != null)
-            {
-                currentTool.Input.Append(ev.ToolInput);
-            }
-            else if (ev.Type == KiroStreamEventType.ToolUseStop && currentTool != null)
-            {
-                toolCalls.Add(currentTool.ToToolCall());
-                currentTool = null;
             }
         }
 
@@ -487,6 +934,7 @@ public sealed class KiroService(
             toolCalls.Add(currentTool.ToToolCall());
         }
 
+        await EnsureStreamStartedAsync();
         await WriteSseJsonAsync(context, new JsonObject
         {
             ["type"] = "content_block_stop",
@@ -499,8 +947,6 @@ public sealed class KiroService(
             {
                 var toolCall = toolCalls[i];
                 var inputJson = BuildToolInputNode(toolCall.Arguments);
-                totalOutputTokens += CountTokens(toolCall.Arguments);
-
                 await WriteSseJsonAsync(context, new JsonObject
                 {
                     ["type"] = "content_block_start",
@@ -557,112 +1003,131 @@ public sealed class KiroService(
         {
             ["type"] = "message_stop"
         }, context.RequestAborted);
+
+        if (timeToFirstByteMs == null)
+        {
+            timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
+        }
+
+        return (totalOutputTokens, timeToFirstByteMs);
     }
 
-    private async Task StreamOpenAiResponse(
+    private async Task<(int OutputTokens, long? TimeToFirstByteMs)> StreamOpenAiResponse(
         HttpContext context,
-        AIAccount account,
-        KiroOAuthCredentialsDto credentials,
-        JsonObject requestBody,
-        string requestModel,
+        HttpResponseMessage response,
         string responseModel,
-        int inputTokens)
+        int inputTokens,
+        Stopwatch stopwatch)
     {
-        var region = BuildRegion(credentials);
-        var requestUrl = requestModel.StartsWith("amazonq", StringComparison.OrdinalIgnoreCase)
-            ? BuildAmazonQUrl(region)
-            : BuildBaseUrl(region);
-
-        context.Response.ContentType = "text/event-stream;charset=utf-8";
-        context.Response.Headers.TryAdd("Cache-Control", "no-cache");
-        context.Response.Headers.TryAdd("Connection", "keep-alive");
-        context.Response.StatusCode = 200;
-
         var responseId = Guid.NewGuid().ToString();
         var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        var responseStarted = false;
 
-        var roleChunk = new JsonObject
+        async Task EnsureStreamStartedAsync()
         {
-            ["id"] = responseId,
-            ["object"] = "chat.completion.chunk",
-            ["created"] = created,
-            ["model"] = responseModel,
-            ["choices"] = new JsonArray
+            if (responseStarted)
             {
-                new JsonObject
-                {
-                    ["index"] = 0,
-                    ["delta"] = new JsonObject
-                    {
-                        ["role"] = "assistant",
-                        ["content"] = string.Empty
-                    },
-                    ["finish_reason"] = null
-                }
+                return;
             }
-        };
 
-        await WriteSseJsonAsync(context, roleChunk, context.RequestAborted);
+            responseStarted = true;
+            context.Response.ContentType = "text/event-stream;charset=utf-8";
+            context.Response.Headers.TryAdd("Cache-Control", "no-cache");
+            context.Response.Headers.TryAdd("Connection", "keep-alive");
+            context.Response.StatusCode = 200;
+
+            var roleChunk = new JsonObject
+            {
+                ["id"] = responseId,
+                ["object"] = "chat.completion.chunk",
+                ["created"] = created,
+                ["model"] = responseModel,
+                ["choices"] = new JsonArray
+                {
+                    new JsonObject
+                    {
+                        ["index"] = 0,
+                        ["delta"] = new JsonObject
+                        {
+                            ["role"] = "assistant",
+                            ["content"] = string.Empty
+                        },
+                        ["finish_reason"] = null
+                    }
+                }
+            };
+
+            await WriteSseJsonAsync(context, roleChunk, context.RequestAborted);
+        }
 
         var toolCalls = new List<KiroToolCall>();
         var currentTool = (ToolCallAccumulator?)null;
+        var totalOutputTokens = 0;
+        long? timeToFirstByteMs = null;
         string? lastContent = null;
 
-        await foreach (var ev in StreamKiroEvents(account, credentials, requestBody, requestUrl,
-                           context.RequestAborted))
+        using (response)
         {
-            if (ev.Type == KiroStreamEventType.Content && !string.IsNullOrEmpty(ev.Content))
-            {
-                if (ev.Content == lastContent)
-                {
-                    continue;
-                }
+            await using var stream = await response.Content.ReadAsStreamAsync(context.RequestAborted);
 
-                lastContent = ev.Content;
-                var chunk = new JsonObject
+            await foreach (var ev in ReadKiroEventsAsync(stream, context.RequestAborted))
+            {
+                timeToFirstByteMs ??= stopwatch.ElapsedMilliseconds;
+                await EnsureStreamStartedAsync();
+                if (ev.Type == KiroStreamEventType.Content && !string.IsNullOrEmpty(ev.Content))
                 {
-                    ["id"] = responseId,
-                    ["object"] = "chat.completion.chunk",
-                    ["created"] = created,
-                    ["model"] = responseModel,
-                    ["choices"] = new JsonArray
+                    if (ev.Content == lastContent)
                     {
-                        new JsonObject
-                        {
-                            ["index"] = 0,
-                            ["delta"] = new JsonObject
-                            {
-                                ["content"] = ev.Content
-                            },
-                            ["finish_reason"] = null
-                        }
+                        continue;
                     }
-                };
 
-                await WriteSseJsonAsync(context, chunk, context.RequestAborted);
-            }
-            else if (ev.Type == KiroStreamEventType.ToolUse && ev.ToolUse != null)
-            {
-                currentTool = new ToolCallAccumulator(ev.ToolUse.ToolUseId, ev.ToolUse.Name);
-                if (!string.IsNullOrEmpty(ev.ToolUse.Input))
-                {
-                    currentTool.Input.Append(ev.ToolUse.Input);
+                    lastContent = ev.Content;
+                    totalOutputTokens += CountTokens(ev.Content);
+                    var chunk = new JsonObject
+                    {
+                        ["id"] = responseId,
+                        ["object"] = "chat.completion.chunk",
+                        ["created"] = created,
+                        ["model"] = responseModel,
+                        ["choices"] = new JsonArray
+                        {
+                            new JsonObject
+                            {
+                                ["index"] = 0,
+                                ["delta"] = new JsonObject
+                                {
+                                    ["content"] = ev.Content
+                                },
+                                ["finish_reason"] = null
+                            }
+                        }
+                    };
+
+                    await WriteSseJsonAsync(context, chunk, context.RequestAborted);
                 }
+                else if (ev is { Type: KiroStreamEventType.ToolUse, ToolUse: not null })
+                {
+                    currentTool = new ToolCallAccumulator(ev.ToolUse.ToolUseId, ev.ToolUse.Name);
+                    if (!string.IsNullOrEmpty(ev.ToolUse.Input))
+                    {
+                        currentTool.Input.Append(ev.ToolUse.Input);
+                    }
 
-                if (ev.ToolUse.Stop)
+                    if (ev.ToolUse.Stop)
+                    {
+                        toolCalls.Add(currentTool.ToToolCall());
+                        currentTool = null;
+                    }
+                }
+                else if (ev.Type == KiroStreamEventType.ToolUseInput && currentTool != null)
+                {
+                    currentTool.Input.Append(ev.ToolInput);
+                }
+                else if (ev.Type == KiroStreamEventType.ToolUseStop && currentTool != null)
                 {
                     toolCalls.Add(currentTool.ToToolCall());
                     currentTool = null;
                 }
-            }
-            else if (ev.Type == KiroStreamEventType.ToolUseInput && currentTool != null)
-            {
-                currentTool.Input.Append(ev.ToolInput);
-            }
-            else if (ev.Type == KiroStreamEventType.ToolUseStop && currentTool != null)
-            {
-                toolCalls.Add(currentTool.ToToolCall());
-                currentTool = null;
             }
         }
 
@@ -673,6 +1138,10 @@ public sealed class KiroService(
 
         if (toolCalls.Count > 0)
         {
+            totalOutputTokens += toolCalls.Sum(call => CountTokens(call.Arguments));
+            timeToFirstByteMs ??= stopwatch.ElapsedMilliseconds;
+            await EnsureStreamStartedAsync();
+
             var toolCallsArray = BuildOpenAiToolCalls(toolCalls, includeIndex: true);
             var toolChunk = new JsonObject
             {
@@ -698,6 +1167,8 @@ public sealed class KiroService(
         }
         else
         {
+            timeToFirstByteMs ??= stopwatch.ElapsedMilliseconds;
+            await EnsureStreamStartedAsync();
             var doneChunk = new JsonObject
             {
                 ["id"] = responseId,
@@ -725,6 +1196,13 @@ public sealed class KiroService(
         }
 
         await WriteSseDoneAsync(context, context.RequestAborted);
+
+        if (timeToFirstByteMs == null)
+        {
+            timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
+        }
+
+        return (totalOutputTokens, timeToFirstByteMs);
     }
 
     public async Task<KiroUsageLimitsResponse?> GetUsageLimitsAsync(AIAccount account)
@@ -803,86 +1281,32 @@ public sealed class KiroService(
         }
     }
 
-    private async IAsyncEnumerable<KiroStreamEvent> StreamKiroEvents(
-        AIAccount account,
-        KiroOAuthCredentialsDto credentials,
-        JsonObject requestBody,
-        string requestUrl,
+    private async IAsyncEnumerable<KiroStreamEvent> ReadKiroEventsAsync(
+        Stream stream,
         [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        var body = requestBody.ToJsonString(JsonOptions.DefaultOptions);
-        var attempt = 0;
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+        var buffer = new StringBuilder();
+        var charBuffer = new char[4096];
 
         while (true)
         {
-            attempt++;
-            using var request = new HttpRequestMessage(HttpMethod.Post, requestUrl);
-            request.Content = new StringContent(body, Encoding.UTF8, "application/json");
-            ApplyKiroHeaders(request, credentials);
-
-            HttpResponseMessage response;
-            try
+            cancellationToken.ThrowIfCancellationRequested();
+            var read = await reader.ReadAsync(charBuffer.AsMemory(0, charBuffer.Length), cancellationToken);
+            if (read == 0)
             {
-                response = await HttpClient.SendAsync(
-                    request,
-                    HttpCompletionOption.ResponseHeadersRead,
-                    cancellationToken);
-            }
-            catch when (attempt < MaxRetries)
-            {
-                await Task.Delay(BaseDelayMs * attempt, cancellationToken);
-                continue;
+                yield break;
             }
 
-            using (response)
+            buffer.Append(charBuffer, 0, read);
+            var (events, remaining) = ParseAwsEventStreamBuffer(buffer.ToString());
+            buffer.Clear();
+            buffer.Append(remaining);
+
+            foreach (var ev in events)
             {
-                if (response.StatusCode == HttpStatusCode.Forbidden && attempt == 1)
-                {
-                    await RefreshCredentials(account, credentials);
-                    continue;
-                }
-
-                if ((int)response.StatusCode == 429 && attempt < MaxRetries)
-                {
-                    await Task.Delay(BaseDelayMs * attempt, cancellationToken);
-                    continue;
-                }
-
-                if ((int)response.StatusCode >= 500 && attempt < MaxRetries)
-                {
-                    await Task.Delay(BaseDelayMs * attempt, cancellationToken);
-                    continue;
-                }
-
-                response.EnsureSuccessStatusCode();
-
-                await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-                using var reader = new StreamReader(stream, Encoding.UTF8);
-                var buffer = new StringBuilder();
-                var charBuffer = new char[4096];
-
-                while (true)
-                {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var read = await reader.ReadAsync(charBuffer.AsMemory(0, charBuffer.Length), cancellationToken);
-                    if (read == 0)
-                    {
-                        break;
-                    }
-
-                    buffer.Append(charBuffer, 0, read);
-                    var (events, remaining) = ParseAwsEventStreamBuffer(buffer.ToString());
-                    buffer.Clear();
-                    buffer.Append(remaining);
-
-                    foreach (var ev in events)
-                    {
-                        yield return ev;
-                    }
-                }
+                yield return ev;
             }
-
-            yield break;
         }
     }
 
@@ -901,22 +1325,6 @@ public sealed class KiroService(
         request.Headers.TryAddWithoutValidation("user-agent",
             $"aws-sdk-js/1.0.0 ua/2.1 os/{osName} lang/js md/dotnet#{runtimeVersion} api/codewhispererruntime#1.0.0 m/E KiroIDE-{KiroVersion}-{machineId}");
         request.Headers.ConnectionClose = true;
-    }
-
-    private async Task RefreshCredentials(AIAccount account, KiroOAuthCredentialsDto credentials)
-    {
-        await kiroOAuthService.RefreshKiroOAuthTokenAsync(account);
-        var updated = account.GetKiroOauth();
-        if (updated != null)
-        {
-            credentials.AccessToken = updated.AccessToken;
-            credentials.RefreshToken = updated.RefreshToken;
-            credentials.ProfileArn = updated.ProfileArn;
-            credentials.ExpiresAt = updated.ExpiresAt;
-            credentials.AuthMethod = updated.AuthMethod;
-            credentials.ClientId = updated.ClientId;
-            credentials.ClientSecret = updated.ClientSecret;
-        }
     }
 
     private static (string OsName, string RuntimeVersion) GetSystemRuntimeInfo()
@@ -2033,7 +2441,6 @@ public sealed class KiroService(
         var remaining = buffer;
         var searchStart = 0;
 
-        Console.WriteLine(buffer);
         while (true)
         {
             var contentStart = remaining.IndexOf("{\"content\":", searchStart, StringComparison.Ordinal);
