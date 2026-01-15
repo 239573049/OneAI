@@ -959,7 +959,7 @@ public sealed class KiroService(
                         ["input"] = new JsonObject()
                     }
                 }, context.RequestAborted);
-                
+
                 var partialJson = inputJson.ToJsonString(JsonOptions.DefaultOptions);
 
                 await WriteSseJsonAsync(context, new JsonObject
@@ -983,20 +983,22 @@ public sealed class KiroService(
         }
 
         var stopReason = toolCalls.Count > 0 ? "tool_use" : "end_turn";
+        var usage = new JsonObject
+        {
+            ["stop_reason"] = stopReason,
+            ["usage"] = new JsonObject
+            {
+                ["input_tokens"] = inputTokens,
+                ["cache_creation_input_tokens"] = 0,
+                ["cache_read_input_tokens"] = 0,
+                ["output_tokens"] = totalOutputTokens
+            }
+        };
         await WriteSseJsonAsync(context, new JsonObject
         {
             ["type"] = "message_delta",
-            ["delta"] = new JsonObject
-            {
-                ["stop_reason"] = stopReason,
-                ["usage"] = new JsonObject
-                {
-                    ["input_tokens"] = inputTokens,
-                    ["cache_creation_input_tokens"] = 0,
-                    ["cache_read_input_tokens"] = 0,
-                    ["output_tokens"] = totalOutputTokens
-                }
-            }
+            ["delta"] = usage,
+            ["usage"] = usage
         }, context.RequestAborted);
 
         await WriteSseJsonAsync(context, new JsonObject
