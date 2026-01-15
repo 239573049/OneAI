@@ -983,22 +983,31 @@ public sealed class KiroService(
         }
 
         var stopReason = toolCalls.Count > 0 ? "tool_use" : "end_turn";
-        var usage = new JsonObject
-        {
-            ["stop_reason"] = stopReason,
-            ["usage"] = new JsonObject
-            {
-                ["input_tokens"] = inputTokens,
-                ["cache_creation_input_tokens"] = 0,
-                ["cache_read_input_tokens"] = 0,
-                ["output_tokens"] = totalOutputTokens
-            }
-        };
         await WriteSseJsonAsync(context, new JsonObject
         {
             ["type"] = "message_delta",
-            ["delta"] = usage,
-            ["usage"] = usage
+            ["delta"] = new JsonObject
+            {
+                ["stop_reason"] = stopReason,
+                ["usage"] = new JsonObject
+                {
+                    ["input_tokens"] = inputTokens,
+                    ["cache_creation_input_tokens"] = 0,
+                    ["cache_read_input_tokens"] = 0,
+                    ["output_tokens"] = totalOutputTokens
+                }
+            },
+            ["usage"] = new JsonObject
+            {
+                ["stop_reason"] = stopReason,
+                ["usage"] = new JsonObject
+                {
+                    ["input_tokens"] = inputTokens,
+                    ["cache_creation_input_tokens"] = 0,
+                    ["cache_read_input_tokens"] = 0,
+                    ["output_tokens"] = totalOutputTokens
+                }
+            }
         }, context.RequestAborted);
 
         await WriteSseJsonAsync(context, new JsonObject
