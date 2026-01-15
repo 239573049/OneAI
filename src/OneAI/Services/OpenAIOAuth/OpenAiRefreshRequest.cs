@@ -1,4 +1,6 @@
-﻿namespace OneAI.Services.OpenAIOAuth;
+﻿using System.Text.Json.Serialization;
+
+namespace OneAI.Services.OpenAIOAuth;
 
 
 /// <summary>
@@ -6,8 +8,15 @@
 /// </summary>
 public class OpenAiRefreshRequest
 {
+    [JsonPropertyName("client_id")]
     public string ClientId { get; set; } = string.Empty;
+    
+    [JsonPropertyName("grant_type")]
     public string GrantType { get; set; } = "refresh_token";
+
+    [JsonPropertyName("refresh_token")]
     public string RefreshToken { get; set; } = string.Empty;
+
+    [JsonPropertyName("scope")]
     public string Scope { get; set; } = "openid profile email";
 }

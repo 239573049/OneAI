@@ -1,9 +1,16 @@
-﻿using Microsoft.EntityFrameworkCore;
+﻿using System.Net;
+using System.Net.Http.Json;
+using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 using OneAI.Constants;
 using OneAI.Data;
 using OneAI.Entities;
+using OneAI.Extensions;
 using OneAI.Models;
 using OneAI.Services.AI;
+using OneAI.Services.ClaudeCodeOAuth;
+using OneAI.Services.FactoryOAuth;
+using OneAI.Services.OpenAIOAuth;
 
 namespace OneAI.Services;
 
@@ -11,15 +18,24 @@ public class AIAccountService
 {
     private readonly AppDbContext _appDbContext;
     private readonly AccountQuotaCacheService _quotaCache;
+    private readonly OpenAIOAuthService _openAiOAuthService;
+    private readonly ClaudeCodeOAuthService _claudeCodeOAuthService;
+    private readonly FactoryOAuthService _factoryOAuthService;
     private readonly ILogger<AIAccountService> _logger;
 
     public AIAccountService(
         AppDbContext appDbContext,
         AccountQuotaCacheService quotaCache,
+        OpenAIOAuthService openAiOAuthService,
+        ClaudeCodeOAuthService claudeCodeOAuthService,
+        FactoryOAuthService factoryOAuthService,
         ILogger<AIAccountService> logger)
     {
         _appDbContext = appDbContext;
         _quotaCache = quotaCache;
+        _openAiOAuthService = openAiOAuthService;
+        _claudeCodeOAuthService = claudeCodeOAuthService;
+        _factoryOAuthService = factoryOAuthService;
         _logger = logger;
     }
 
@@ -121,7 +137,7 @@ public class AIAccountService
     /// </summary>
     /// <param name="provider">AI 提供商（如 AIProviders.Gemini）</param>
     /// <returns>最优账户，如果没有可用账户则返回null</returns>
-    public async Task<AIAccount?> GetAIAccountByProvider(string provider)
+    public async Task<AIAccount?> GetAIAccountByProvider(params string[] provider)
     {
         // 1. 尝试从缓存获取账户列表，如果缓存不存在则从数据库查询
         var allAccounts = _quotaCache.GetAccountsCache();
@@ -139,7 +155,7 @@ public class AIAccountService
         // 2. 筛选指定提供商的可用账户（已启用 + 提供商匹配 + 不在使用中 + 未限流或限流已过期）
         var availableAccounts = allAccounts
             .Where(x => x.IsEnabled &&
-                        x.Provider == provider &&
+                        provider.Contains(x.Provider) &&
                         !AIProviderAsyncLocal.AIProviderIds.Contains(x.Id) &&
                         x.IsAvailable())
             .ToList();
@@ -354,6 +370,35 @@ public class AIAccountService
     }
 
     /// <summary>
+    /// 清理已过期的限流状态（使用原子更新）
+    /// </summary>
+    /// <param name="accountId">账户ID</param>
+    public async Task ClearExpiredRateLimit(int accountId)
+    {
+        var now = DateTime.UtcNow;
+
+        var affectedRows = await _appDbContext.AIAccounts
+            .Where(x => x.Id == accountId
+                        && x.IsRateLimited
+                        && x.RateLimitResetTime.HasValue
+                        && x.RateLimitResetTime.Value <= now)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(a => a.IsRateLimited, false)
+                .SetProperty(a => a.RateLimitResetTime, (DateTime?)null)
+                .SetProperty(a => a.UpdatedAt, now));
+
+        if (affectedRows == 0)
+        {
+            return;
+        }
+
+        // 清除账户列表缓存（因为限流状态发生了变化）
+        _quotaCache.ClearAccountsCache();
+
+        _logger.LogInformation("账户 {AccountId} 限流已过期，已自动清除限流状态", accountId);
+    }
+
+    /// <summary>
     /// 禁用账户（用于401等认证失败的情况，使用原子更新）
     /// </summary>
     /// <param name="accountId">账户ID</param>
@@ -423,7 +468,7 @@ public class AIAccountService
             };
         }
 
-        return new AccountQuotaStatusDto
+        var dto = new AccountQuotaStatusDto
         {
             AccountId = accountId,
             HasCacheData = true,
@@ -433,8 +478,34 @@ public class AIAccountService
             PrimaryResetAfterSeconds = quotaInfo.PrimaryResetAfterSeconds,
             SecondaryResetAfterSeconds = quotaInfo.SecondaryResetAfterSeconds,
             StatusDescription = quotaInfo.GetStatusDescription(),
-            LastUpdatedAt = quotaInfo.LastUpdatedAt
+            LastUpdatedAt = quotaInfo.LastUpdatedAt,
+            // Anthropic 风格的限流信息
+            TokensLimit = quotaInfo.TokensLimit,
+            TokensRemaining = quotaInfo.TokensRemaining,
+            InputTokensLimit = quotaInfo.InputTokensLimit,
+            InputTokensRemaining = quotaInfo.InputTokensRemaining,
+            OutputTokensLimit = quotaInfo.OutputTokensLimit,
+            OutputTokensRemaining = quotaInfo.OutputTokensRemaining,
+            // Anthropic Unified 限流信息
+            AnthropicUnifiedStatus = quotaInfo.AnthropicUnifiedStatus,
+            AnthropicUnifiedFiveHourStatus = quotaInfo.AnthropicUnifiedFiveHourStatus,
+            AnthropicUnifiedFiveHourUtilization = quotaInfo.AnthropicUnifiedFiveHourUtilization,
+            AnthropicUnifiedSevenDayStatus = quotaInfo.AnthropicUnifiedSevenDayStatus,
+            AnthropicUnifiedSevenDayUtilization = quotaInfo.AnthropicUnifiedSevenDayUtilization,
+            AnthropicUnifiedRepresentativeClaim = quotaInfo.AnthropicUnifiedRepresentativeClaim,
+            AnthropicUnifiedFallbackPercentage = quotaInfo.AnthropicUnifiedFallbackPercentage,
+            AnthropicUnifiedResetAt = quotaInfo.AnthropicUnifiedResetAt,
+            AnthropicUnifiedOverageDisabledReason = quotaInfo.AnthropicUnifiedOverageDisabledReason,
+            AnthropicUnifiedOverageStatus = quotaInfo.AnthropicUnifiedOverageStatus
         };
+
+        // 计算 token 使用百分比
+        if (quotaInfo.TokensLimit.HasValue && quotaInfo.TokensLimit.Value > 0)
+        {
+            dto.TokensUsedPercent = 100 - (int)((quotaInfo.TokensRemaining ?? 0) * 100.0 / quotaInfo.TokensLimit.Value);
+        }
+
+        return dto;
     }
 
     /// <summary>
@@ -547,7 +618,35 @@ public class AIAccountService
 
         try
         {
-            var accessToken = account.GetOpenAiOauth()!.AccessToken;
+            var oauth = account.GetOpenAiOauth();
+            if (oauth == null)
+            {
+                _logger.LogWarning("账户 {AccountId} 没有 OpenAI OAuth 凭证，无法刷新 OpenAI 配额", account.Id);
+                return null;
+            }
+
+            if (string.IsNullOrWhiteSpace(oauth.AccessToken))
+            {
+                _logger.LogWarning("账户 {AccountId} 的 OpenAI AccessToken 为空，无法刷新 OpenAI 配额", account.Id);
+                return null;
+            }
+
+            var nowUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            var isTokenExpired = oauth.ExpiresAt > 0 && oauth.ExpiresAt <= nowUnixSeconds;
+            if (isTokenExpired)
+            {
+                _logger.LogInformation("账户 {AccountId} OpenAI AccessToken 已过期，尝试刷新后再刷新配额", account.Id);
+                await _openAiOAuthService.RefreshOpenAiOAuthTokenAsync(account);
+
+                oauth = account.GetOpenAiOauth();
+                if (oauth == null || string.IsNullOrWhiteSpace(oauth.AccessToken))
+                {
+                    _logger.LogWarning("账户 {AccountId} OpenAI Token 刷新后仍无效，无法刷新 OpenAI 配额", account.Id);
+                    return null;
+                }
+            }
+
+            var accessToken = oauth.AccessToken;
             var address = string.IsNullOrEmpty(account.BaseUrl)
                 ? "https://chatgpt.com/backend-api/codex"
                 : account.BaseUrl;
@@ -563,13 +662,36 @@ public class AIAccountService
 
             using var httpClient = new HttpClient();
             httpClient.DefaultRequestHeaders.Clear();
-            foreach (var header in headers)
-            {
-                httpClient.DefaultRequestHeaders.TryAddWithoutValidation(header.Key, header.Value);
-            }
 
             // 发送一个简单的 HEAD 请求来获取配额头信息
-            var response = await httpClient.GetAsync($"{address.TrimEnd('/')}/responses");
+            var response = await httpClient.HttpRequestRaw($"{address.TrimEnd('/')}/responses", new
+            {
+                model = "gpt-5.2",
+                instructions = AIPrompt.CodeXPrompt,
+                store = false,
+                stream = true,
+                input = new object[]
+                {
+                    new
+                    {
+                        role = "user",
+                        type = "message",
+                        content = new[]
+                        {
+                            new
+                            {
+                                type = "input_text",
+                                text = "Say 1"
+                            }
+                        }
+                    }
+                }
+            }, headers);
+
+            if (!response.IsSuccessStatusCode && response.StatusCode != HttpStatusCode.TooManyRequests)
+            {
+                throw new Exception(await response.Content.ReadAsStringAsync());
+            }
 
             // 提取配额信息
             var quotaInfo = AccountQuotaCacheService.ExtractFromHeaders(account.Id, response.Headers);
@@ -646,11 +768,13 @@ public class AIAccountService
             }
 
             // 调用 Antigravity API 获取配额信息
-            var apiUrl = $"{Services.GeminiOAuth.GeminiAntigravityOAuthConfig.AntigravityApiUrl}/v1internal:fetchAvailableModels";
+            var apiUrl =
+                $"{Services.GeminiOAuth.GeminiAntigravityOAuthConfig.AntigravityApiUrl}/v1internal:fetchAvailableModels";
 
             using var httpClient = new HttpClient();
             httpClient.DefaultRequestHeaders.Clear();
-            httpClient.DefaultRequestHeaders.Add("User-Agent", Services.GeminiOAuth.GeminiAntigravityOAuthConfig.UserAgent);
+            httpClient.DefaultRequestHeaders.Add("User-Agent",
+                Services.GeminiOAuth.GeminiAntigravityOAuthConfig.UserAgent);
             httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {accessToken}");
             httpClient.Timeout = TimeSpan.FromSeconds(30);
 
@@ -670,7 +794,8 @@ public class AIAccountService
             var root = jsonDoc.RootElement;
 
             // 解析 models 字段获取配额信息
-            if (!root.TryGetProperty("models", out var modelsElement) || modelsElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+            if (!root.TryGetProperty("models", out var modelsElement) ||
+                modelsElement.ValueKind != System.Text.Json.JsonValueKind.Object)
             {
                 _logger.LogWarning("Antigravity API 响应中没有 models 字段");
                 return new AccountQuotaStatusDto
@@ -680,31 +805,103 @@ public class AIAccountService
                 };
             }
 
+            int? TryGetResetAfterSeconds(string? resetTimeRaw)
+            {
+                if (string.IsNullOrWhiteSpace(resetTimeRaw))
+                {
+                    return null;
+                }
+
+                if (DateTimeOffset.TryParse(resetTimeRaw, out var resetTime))
+                {
+                    var delta = resetTime.ToUniversalTime() - DateTimeOffset.UtcNow;
+                    return Math.Max(0, (int)delta.TotalSeconds);
+                }
+
+                try
+                {
+                    var resetTimeFallback = DateTime.Parse(resetTimeRaw.Replace("Z", "+00:00"));
+                    var delta = resetTimeFallback.ToUniversalTime() - DateTime.UtcNow;
+                    return Math.Max(0, (int)delta.TotalSeconds);
+                }
+                catch
+                {
+                    return null;
+                }
+            }
+
+            // Antigravity 按模型提供 quotaInfo，这里返回所有模型的配额信息（用于前端展示）
+            var antigravityModelQuotas = new List<AntigravityModelQuotaDto>();
+            foreach (var modelProperty in modelsElement.EnumerateObject())
+            {
+                var quotaDto = new AntigravityModelQuotaDto
+                {
+                    Model = modelProperty.Name
+                };
+
+                if (modelProperty.Value.TryGetProperty("quotaInfo", out var quotaInfo)
+                    && quotaInfo.ValueKind == System.Text.Json.JsonValueKind.Object)
+                {
+                    quotaDto.HasQuotaInfo = true;
+
+                    if (quotaInfo.TryGetProperty("remainingFraction", out var remaining)
+                        && remaining.ValueKind == System.Text.Json.JsonValueKind.Number)
+                    {
+                        var remainingFractionValue = remaining.GetDouble();
+                        remainingFractionValue = Math.Max(0, Math.Min(1, remainingFractionValue));
+
+                        quotaDto.RemainingFraction = remainingFractionValue;
+                        quotaDto.RemainingPercent = (int)Math.Round(remainingFractionValue * 100);
+                        quotaDto.UsedPercent = (int)Math.Round((1 - remainingFractionValue) * 100);
+                    }
+
+                    if (quotaInfo.TryGetProperty("resetTime", out var resetTime)
+                        && resetTime.ValueKind == System.Text.Json.JsonValueKind.String)
+                    {
+                        quotaDto.ResetTime = resetTime.GetString();
+                        quotaDto.ResetAfterSeconds = TryGetResetAfterSeconds(quotaDto.ResetTime);
+                    }
+                }
+
+                antigravityModelQuotas.Add(quotaDto);
+            }
+
             // 查找第一个包含 quotaInfo 的模型（优先选择 gemini 开头的模型）
             string? selectedModel = null;
             double remainingFraction = 0;
             string? resetTimeRaw = null;
 
-            // 第一遍：查找 gemini 开头的模型
-            foreach (var modelProperty in modelsElement.EnumerateObject())
+            // 第一遍：优先查找 gemini / claude 开头的模型
+            var preferredPrefixes = new[] { "gemini", "claude" };
+            foreach (var prefix in preferredPrefixes)
             {
-                if (modelProperty.Name.ToLower().StartsWith("gemini") &&
-                    modelProperty.Value.TryGetProperty("quotaInfo", out var quotaInfo))
+                foreach (var modelProperty in modelsElement.EnumerateObject())
                 {
-                    selectedModel = modelProperty.Name;
-                    if (quotaInfo.TryGetProperty("remainingFraction", out var remaining))
+                    if (modelProperty.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) &&
+                        modelProperty.Value.TryGetProperty("quotaInfo", out var quotaInfo))
                     {
-                        remainingFraction = remaining.GetDouble();
+                        selectedModel = modelProperty.Name;
+                        if (quotaInfo.TryGetProperty("remainingFraction", out var remaining))
+                        {
+                            remainingFraction = remaining.GetDouble();
+                        }
+
+                        if (quotaInfo.TryGetProperty("resetTime", out var resetTime))
+                        {
+                            resetTimeRaw = resetTime.GetString();
+                        }
+
+                        break;
                     }
-                    if (quotaInfo.TryGetProperty("resetTime", out var resetTime))
-                    {
-                        resetTimeRaw = resetTime.GetString();
-                    }
+                }
+
+                if (selectedModel != null)
+                {
                     break;
                 }
             }
 
-            // 第二遍：如果没找到 gemini 模型，使用第一个有 quotaInfo 的模型
+            // 第二遍：如果没找到 gemini/claude 模型，使用第一个有 quotaInfo 的模型
             if (selectedModel == null)
             {
                 foreach (var modelProperty in modelsElement.EnumerateObject())
@@ -716,10 +913,12 @@ public class AIAccountService
                         {
                             remainingFraction = remaining.GetDouble();
                         }
+
                         if (quotaInfo.TryGetProperty("resetTime", out var resetTime))
                         {
                             resetTimeRaw = resetTime.GetString();
                         }
+
                         break;
                     }
                 }
@@ -731,7 +930,8 @@ public class AIAccountService
                 return new AccountQuotaStatusDto
                 {
                     AccountId = account.Id,
-                    HasCacheData = false
+                    HasCacheData = false,
+                    AntigravityModelQuotas = antigravityModelQuotas
                 };
             }
 
@@ -789,7 +989,8 @@ public class AIAccountService
                 PrimaryResetAfterSeconds = resetAfterSeconds ?? 0,
                 SecondaryResetAfterSeconds = resetAfterSeconds ?? 0,
                 StatusDescription = statusDescription,
-                LastUpdatedAt = DateTime.UtcNow
+                LastUpdatedAt = DateTime.UtcNow,
+                AntigravityModelQuotas = antigravityModelQuotas
             };
         }
         catch (Exception ex)
@@ -797,5 +998,439 @@ public class AIAccountService
             _logger.LogError(ex, "刷新账户 {AccountId} 的 Antigravity 配额状态失败", id);
             return null;
         }
+    }
+
+    /// <summary>
+    /// 刷新 Claude 账户的配额状态（通过请求上游并解析响应头）
+    /// </summary>
+    public async Task<AccountQuotaStatusDto?> RefreshClaudeQuotaStatusAsync(int id)
+    {
+        var account = await _appDbContext.AIAccounts.FindAsync(id);
+        if (account == null)
+        {
+            _logger.LogWarning("尝试刷新不存在的账户 {AccountId} 的配额状态", id);
+            return null;
+        }
+
+        if (account.Provider != AIProviders.Claude)
+        {
+            _logger.LogWarning("账户 {AccountId} 不是 Claude 账户，无法刷新配额", id);
+            return null;
+        }
+
+        try
+        {
+            var hasExplicitApiKey = !string.IsNullOrWhiteSpace(account.ApiKey);
+            var upstreamUrl = BuildClaudeMessagesUrl(account.BaseUrl);
+            var upstreamUri = new Uri(upstreamUrl);
+            var isAnthropicBase =
+                string.Equals(upstreamUri.Scheme, "https", StringComparison.OrdinalIgnoreCase)
+                && string.Equals(upstreamUri.Host, "api.anthropic.com", StringComparison.OrdinalIgnoreCase);
+
+            var claudeOauth = account.GetClaudeOauth();
+            if (!hasExplicitApiKey)
+            {
+                if (claudeOauth == null || string.IsNullOrWhiteSpace(claudeOauth.AccessToken))
+                {
+                    _logger.LogWarning("账户 {AccountId} 没有有效的 Claude Oauth 凭证，无法刷新配额", id);
+                    return null;
+                }
+
+                if (IsClaudeTokenExpired(claudeOauth))
+                {
+                    _logger.LogInformation("账户 {AccountId} Claude Token 已过期，尝试刷新后再刷新配额", id);
+                    await _claudeCodeOAuthService.RefreshClaudeOAuthTokenAsync(account);
+
+                    // RefreshClaudeOAuthTokenAsync 会更新数据库，重新读取以拿到最新 token
+                    account = await _appDbContext.AIAccounts.FindAsync(id) ?? account;
+                    claudeOauth = account.GetClaudeOauth();
+                    if (claudeOauth == null || string.IsNullOrWhiteSpace(claudeOauth.AccessToken))
+                    {
+                        _logger.LogWarning("账户 {AccountId} Claude Token 刷新后仍无效，无法刷新配额", id);
+                        return null;
+                    }
+                }
+            }
+
+            var authToken = hasExplicitApiKey
+                ? account.ApiKey!.Trim()
+                : claudeOauth!.AccessToken;
+
+            var useApiKeyHeader = isAnthropicBase && hasExplicitApiKey;
+
+            using var httpClient = new HttpClient
+            {
+                Timeout = TimeSpan.FromSeconds(30)
+            };
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, upstreamUrl);
+
+            request.Headers.TryAddWithoutValidation("User-Agent", "claude-cli/2.0.5 (external, cli)");
+            request.Headers.TryAddWithoutValidation("Accept", "application/json");
+            request.Headers.TryAddWithoutValidation("Accept-Encoding", "gzip, deflate, br, zstd");
+            request.Headers.TryAddWithoutValidation("Accept-Language", "*");
+            request.Headers.TryAddWithoutValidation("anthropic-dangerous-direct-browser-access", "true");
+            request.Headers.TryAddWithoutValidation("anthropic-version", "2023-06-01");
+
+            request.Headers.TryAddWithoutValidation(
+                "anthropic-beta",
+                useApiKeyHeader
+                    ? "claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+                    : "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14");
+
+            // Follow upstream conventions:
+            // - Official Anthropic API uses x-api-key
+            // - Reverse/proxy channels typically accept Authorization: Bearer
+            if (useApiKeyHeader)
+            {
+                request.Headers.TryAddWithoutValidation("x-api-key", authToken);
+            }
+            else
+            {
+                request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + authToken);
+            }
+
+            request.Content = JsonContent.Create(new
+            {
+                model = "claude-haiku-4-5-20251001",
+                max_tokens = 1,
+                messages = new[]
+                {
+                    new
+                    {
+                        role = "user",
+                        content = "ping"
+                    }
+                }
+            });
+
+            using var response = await httpClient.SendAsync(request);
+
+            if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+            {
+                _logger.LogWarning("Claude 配额刷新鉴权失败（HTTP {StatusCode}），将禁用账户 {AccountId}",
+                    (int)response.StatusCode,
+                    id);
+                await DisableAccount(id);
+                return null;
+            }
+
+            if (!response.IsSuccessStatusCode && response.StatusCode != HttpStatusCode.TooManyRequests)
+            {
+                var errorBody = await response.Content.ReadAsStringAsync();
+                _logger.LogError("Claude 配额刷新失败（HTTP {StatusCode}）: {Error}",
+                    (int)response.StatusCode,
+                    errorBody);
+                return null;
+            }
+
+            var quotaInfo = AccountQuotaCacheService.ExtractFromAnthropicHeaders(account.Id, response.Headers);
+            if (quotaInfo != null)
+            {
+                _quotaCache.UpdateQuota(quotaInfo);
+            }
+
+            return GetAccountQuotaStatus(account.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "刷新账户 {AccountId} 的 Claude 配额状态失败", id);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 刷新 Factory 账户的配额状态（通过请求上游并解析响应头）
+    /// </summary>
+    public async Task<AccountQuotaStatusDto?> RefreshFactoryQuotaStatusAsync(int id)
+    {
+        var account = await _appDbContext.AIAccounts.FindAsync(id);
+        if (account == null)
+        {
+            _logger.LogWarning("尝试刷新不存在的账户 {AccountId} 的配额状态", id);
+            return null;
+        }
+
+        if (account.Provider != AIProviders.Factory)
+        {
+            _logger.LogWarning("账户 {AccountId} 不是 Factory 账户，无法刷新配额", id);
+            return null;
+        }
+
+        try
+        {
+            var factoryOauth = account.GetFactoryOauth();
+            if (factoryOauth == null || string.IsNullOrWhiteSpace(factoryOauth.AccessToken))
+            {
+                _logger.LogWarning("账户 {AccountId} 没有有效的 Factory Oauth 凭证，无法刷新配额", id);
+                return null;
+            }
+
+            if (IsOAuthTokenExpired(factoryOauth.ExpiresAt) && !string.IsNullOrWhiteSpace(factoryOauth.RefreshToken))
+            {
+                _logger.LogInformation("账户 {AccountId} Factory Token 已过期，尝试刷新后再刷新配额", id);
+
+                var refreshed = await _factoryOAuthService.RefreshTokenAsync(
+                    factoryOauth.RefreshToken,
+                    factoryOauth.OrganizationId);
+
+                account.SetFactoryOAuth(refreshed);
+                _appDbContext.AIAccounts.Update(account);
+                await _appDbContext.SaveChangesAsync();
+
+                _quotaCache.ClearAccountsCache();
+
+                factoryOauth = refreshed;
+            }
+
+            using var httpClient = new HttpClient
+            {
+                Timeout = TimeSpan.FromSeconds(30)
+            };
+
+            using var request =
+                new HttpRequestMessage(HttpMethod.Post, "https://app.factory.ai/api/llm/a/v1/messages");
+
+            request.Headers.TryAddWithoutValidation("Authorization", "Bearer " + factoryOauth.AccessToken);
+            request.Headers.TryAddWithoutValidation("User-Agent", "factory-cli/0.41.0");
+            request.Headers.TryAddWithoutValidation("Accept", "text/event-stream");
+            request.Headers.TryAddWithoutValidation("Accept-Encoding", "gzip, deflate, br");
+            request.Headers.TryAddWithoutValidation("Accept-Language", "*");
+            request.Headers.TryAddWithoutValidation("x-factory-client", "cli");
+            request.Headers.TryAddWithoutValidation("x-session-id", Guid.NewGuid().ToString());
+            request.Headers.TryAddWithoutValidation("x-assistant-message-id", Guid.NewGuid().ToString());
+            request.Headers.TryAddWithoutValidation("x-stainless-arch", "x64");
+            request.Headers.TryAddWithoutValidation("x-stainless-helper-method", "stream");
+            request.Headers.TryAddWithoutValidation("x-stainless-lang", "js");
+            request.Headers.TryAddWithoutValidation("x-stainless-os", "Windows");
+            request.Headers.TryAddWithoutValidation("x-stainless-package-version", "0.70.0");
+            request.Headers.TryAddWithoutValidation("x-stainless-retry-count", "0");
+            request.Headers.TryAddWithoutValidation("x-stainless-runtime", "node");
+            request.Headers.TryAddWithoutValidation("x-stainless-runtime-version", "v24.3.0");
+            request.Headers.TryAddWithoutValidation("anthropic-dangerous-direct-browser-access", "true");
+            request.Headers.TryAddWithoutValidation(
+                "anthropic-beta",
+                "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14");
+
+            request.Headers.Referrer = new Uri("https://app.factory.ai/");
+
+            request.Content = JsonContent.Create(new
+            {
+                model = "claude-haiku-4-5-20251001",
+                max_tokens = 1,
+                stream = true,
+                system = new object[]
+                {
+                    new
+                    {
+                        type = "text",
+                        text = "You are Droid, an AI software engineering agent built by Factory."
+                    },
+                    new
+                    {
+                        type = "text",
+                        text =
+                            "You work within an interactive cli tool and you are focused on helping users with any software engineering tasks.\nGuidelines:\n- Use tools when necessary.\n- Don't stop until all user tasks are completed.\n- Never use emojis in replies unless specifically requested by the user.\n- Only add absolutely necessary comments to the code you generate.\n- Your replies should be concise and you should preserve users tokens.\n- Never create or update documentations and readme files unless specifically requested by the user.\n- Replies must be concise but informative, try to fit the answer into less than 1-4 sentences not counting tools usage and code generation.\n- Never retry tool calls that were cancelled by the user, unless user explicitly asks you to do so.\n- Use FetchUrl to fetch Factory docs (https://docs.factory.ai/factory-docs-map.md) when:\n  - Asks questions in the second person (eg. \"are you able...\", \"can you do...\")\n  - User asks about Droid capabilities or features\n  - User needs help with Droid commands, configuration, or settings\n  - User asks about skills, MCP, hooks, custom droids, BYOK, or other Factory specific features\nFocus on the task at hand, don't try to jump to related but not requested tasks.\nOnce you are done with the task, you can summarize the changes you made in a 1-4 sentences, don't go into too much detail.\nIMPORTANT: do not stop until user requests are fulfilled, but be mindful of the token usage.\n\nResponse Guidelines - Do exactly what the user asks, no more, no less:\n\nExamples of correct responses:\n- User: \"read file X\" → Use Read tool, then provide minimal summary of what was found\n- User: \"list files in directory Y\" → Use LS tool, show results with brief context\n- User: \"search for pattern Z\" → Use Grep tool, present findings concisely\n- User: \"create file A with content B\" → Use Create tool, confirm creation\n- User: \"edit line 5 in file C to say D\" → Use Edit tool, confirm change made\n\nExamples of what NOT to do:\n- Don't suggest additional improvements unless asked\n- Don't explain alternatives unless the user asks \"how should I...\"\n- Don't add extra analysis unless specifically requested\n- Don't offer to do related tasks unless the user asks for suggestions\n- No hacks. No unreasonable shortcuts.\n- Do not give up if you encounter unexpected problems. Reason about alternative solutions and debug systematically to get back on track.\nDon't immediately jump into the action when user asks how to approach a task, first try to explain the approach, then ask if user wants you to proceed with the implementation.\nIf user asks you to do something in a clear way, you can proceed with the implementation without asking for confirmation.\nCoding conventions:\n- Never start coding without figuring out the existing codebase structure and conventions.\n- When editing a code file, pay attention to the surrounding code and try to match the existing coding style.\n- Follow approaches and use already used libraries and patterns. Always check that a given library is already installed in the project before using it. Even most popular libraries can be missing in the project.\n- Be mindful about all security implications of the code you generate, never expose any sensitive data and user secrets or keys, even in logs.\n- Before ANY git commit or push operation:\n    - Run 'git diff --cached' to review ALL changes being committed\n    - Run 'git status' to confirm all files being included\n    - Examine the diff for secrets, credentials, API keys, or sensitive data (especially in config files, logs, environment files, and build outputs) \n    - if detected, STOP and warn the user\nTesting and verification:\nBefore completing the task, always verify that the code you generated works as expected. Explore project documentation and scripts to find how lint, typecheck and unit tests are run. Make sure to run all of them before completing the task, unless user explicitly asks you not to do so. Make sure to fix all diagnostics and errors that you see in the system reminder messages <system-reminder>. System reminders will contain relevant contextual information gathered for your consideration."
+                    }
+                },
+                messages = new[]
+                {
+                    new
+                    {
+                        role = "user",
+                        content = new object[]
+                        {
+                            new
+                            {
+                                type = "text",
+                                text = "ping"
+                            }
+                        }
+                    }
+                }
+            });
+
+            using var response = await httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+
+            if (response.StatusCode is HttpStatusCode.Unauthorized)
+            {
+                var errorBody = await response.Content.ReadAsStringAsync();
+                _logger.LogWarning("Factory 配额刷新鉴权失败（HTTP 401）：{Error}，将禁用账户 {AccountId}",
+                    errorBody,
+                    id);
+                await DisableAccount(id);
+                return null;
+            }
+
+            if (response.StatusCode is HttpStatusCode.Forbidden)
+            {
+                var errorBody = await response.Content.ReadAsStringAsync();
+                _logger.LogWarning("Factory 配额刷新被拒绝（HTTP 403）：{Error}，账户 {AccountId}",
+                    errorBody,
+                    id);
+                return null;
+            }
+
+            if (!response.IsSuccessStatusCode && response.StatusCode != HttpStatusCode.TooManyRequests)
+            {
+                var errorBody = await response.Content.ReadAsStringAsync();
+                _logger.LogError("Factory 配额刷新失败（HTTP {StatusCode}）: {Error}",
+                    (int)response.StatusCode,
+                    errorBody);
+                return null;
+            }
+
+            var quotaInfo = AccountQuotaCacheService.ExtractFromAnthropicHeaders(account.Id, response.Headers);
+            if (quotaInfo != null)
+            {
+                _quotaCache.UpdateQuota(quotaInfo);
+            }
+
+            return GetAccountQuotaStatus(account.Id);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "刷新账户 {AccountId} 的 Factory 配额状态失败", id);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// 获取 Gemini Antigravity 可用模型列表
+    /// </summary>
+    /// <param name="id">账户 ID</param>
+    /// <returns>模型名称列表，失败返回 null</returns>
+    public async Task<List<string>?> GetAntigravityAvailableModelsAsync(int id)
+    {
+        var account = await _appDbContext.AIAccounts.FindAsync(id);
+        if (account == null)
+        {
+            _logger.LogWarning("尝试获取不存在账户 {AccountId} 的 Antigravity 模型列表", id);
+            return null;
+        }
+
+        if (account.Provider != AIProviders.GeminiAntigravity)
+        {
+            _logger.LogWarning("账户 {AccountId} 不是 Gemini Antigravity 账户，无法获取模型列表", id);
+            return null;
+        }
+
+        var geminiOauth = account.GetGeminiOauth();
+        if (geminiOauth == null)
+        {
+            _logger.LogWarning("账户 {AccountId} 没有 Gemini OAuth 凭证", id);
+            return null;
+        }
+
+        var accessToken = geminiOauth.Token;
+        if (string.IsNullOrEmpty(accessToken))
+        {
+            _logger.LogWarning("账户 {AccountId} 的 Access Token 为空", id);
+            return null;
+        }
+
+        var apiUrl =
+            $"{Services.GeminiOAuth.GeminiAntigravityOAuthConfig.AntigravityApiUrl}/v1internal:fetchAvailableModels";
+
+        try
+        {
+            using var httpClient = new HttpClient();
+            httpClient.DefaultRequestHeaders.Clear();
+            httpClient.DefaultRequestHeaders.Add("User-Agent",
+                Services.GeminiOAuth.GeminiAntigravityOAuthConfig.UserAgent);
+            httpClient.DefaultRequestHeaders.Add("Authorization", $"Bearer {accessToken}");
+            httpClient.Timeout = TimeSpan.FromSeconds(30);
+
+            using var requestContent = new StringContent("{}", System.Text.Encoding.UTF8, "application/json");
+            var response = await httpClient.PostAsync(apiUrl, requestContent);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                var errorBody = await response.Content.ReadAsStringAsync();
+                _logger.LogError("Antigravity API 返回错误 {StatusCode}: {Error}",
+                    (int)response.StatusCode, errorBody);
+                return null;
+            }
+
+            var responseBody = await response.Content.ReadAsStringAsync();
+            using var jsonDoc = System.Text.Json.JsonDocument.Parse(responseBody);
+            var root = jsonDoc.RootElement;
+
+            if (!root.TryGetProperty("models", out var modelsElement) ||
+                modelsElement.ValueKind != System.Text.Json.JsonValueKind.Object)
+            {
+                _logger.LogWarning("Antigravity API 响应中没有 models 字段");
+                return new List<string>();
+            }
+
+            var models = new List<string>();
+            foreach (var modelProperty in modelsElement.EnumerateObject())
+            {
+                models.Add(modelProperty.Name);
+            }
+
+            return models;
+        }
+        catch (System.Net.Http.HttpRequestException ex)
+        {
+            _logger.LogError(ex, "调用 Antigravity API 获取模型列表时发生 HTTP 错误，账户 {AccountId}", id);
+            return null;
+        }
+        catch (System.Threading.Tasks.TaskCanceledException ex)
+        {
+            _logger.LogError(ex, "调用 Antigravity API 获取模型列表超时或被取消，账户 {AccountId}", id);
+            return null;
+        }
+        catch (System.Text.Json.JsonException ex)
+        {
+            _logger.LogError(ex, "解析 Antigravity API 响应失败，账户 {AccountId}", id);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "获取 Antigravity 模型列表时发生未知错误，账户 {AccountId}", id);
+            return null;
+        }
+    }
+
+    private static bool IsOAuthTokenExpired(long expiresAtUnixSeconds)
+    {
+        if (expiresAtUnixSeconds <= 0)
+        {
+            return false;
+        }
+
+        // 提前一点刷新，避免临界点卡住
+        const int expirySkewSeconds = 60;
+        var nowUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        return expiresAtUnixSeconds <= nowUnixSeconds + expirySkewSeconds;
+    }
+
+    private static bool IsClaudeTokenExpired(ClaudeAiOAuth claudeOauth)
+    {
+        return IsOAuthTokenExpired(claudeOauth.ExpiresAt);
+    }
+
+    private static string BuildClaudeMessagesUrl(string? baseUrl)
+    {
+        if (string.IsNullOrWhiteSpace(baseUrl))
+        {
+            return "https://api.anthropic.com/v1/messages?beta=true";
+        }
+
+        var trimmed = baseUrl.Trim();
+        if (trimmed.EndsWith("/v1/messages", StringComparison.OrdinalIgnoreCase))
+        {
+            return trimmed + "?beta=true";
+        }
+
+        trimmed = trimmed.TrimEnd('/');
+
+        if (trimmed.EndsWith("/v1", StringComparison.OrdinalIgnoreCase))
+        {
+            return trimmed + "/messages?beta=true";
+        }
+
+        return trimmed + "/v1/messages?beta=true";
     }
 }

@@ -88,6 +88,79 @@ public class AccountQuotaInfo
 
     #endregion
 
+    #region Anthropic 风格限流信息（基于 token 数量）
+
+    /// <summary>
+    /// Input tokens 限制
+    /// </summary>
+    public long? InputTokensLimit { get; set; }
+
+    /// <summary>
+    /// Input tokens 剩余量
+    /// </summary>
+    public long? InputTokensRemaining { get; set; }
+
+    /// <summary>
+    /// Input tokens 重置时间
+    /// </summary>
+    public DateTime? InputTokensResetAt { get; set; }
+
+    /// <summary>
+    /// Output tokens 限制
+    /// </summary>
+    public long? OutputTokensLimit { get; set; }
+
+    /// <summary>
+    /// Output tokens 剩余量
+    /// </summary>
+    public long? OutputTokensRemaining { get; set; }
+
+    /// <summary>
+    /// Output tokens 重置时间
+    /// </summary>
+    public DateTime? OutputTokensResetAt { get; set; }
+
+    /// <summary>
+    /// Total tokens 限制
+    /// </summary>
+    public long? TokensLimit { get; set; }
+
+    /// <summary>
+    /// Total tokens 剩余量
+    /// </summary>
+    public long? TokensRemaining { get; set; }
+
+    /// <summary>
+    /// Total tokens 重置时间
+    /// </summary>
+    public DateTime? TokensResetAt { get; set; }
+
+    #endregion
+
+    #region Anthropic Unified 限流信息（基于窗口/利用率）
+
+    public string? AnthropicUnifiedStatus { get; set; }
+
+    public string? AnthropicUnifiedFiveHourStatus { get; set; }
+
+    public double? AnthropicUnifiedFiveHourUtilization { get; set; }
+
+    public string? AnthropicUnifiedSevenDayStatus { get; set; }
+
+    public double? AnthropicUnifiedSevenDayUtilization { get; set; }
+
+    public string? AnthropicUnifiedRepresentativeClaim { get; set; }
+
+    public double? AnthropicUnifiedFallbackPercentage { get; set; }
+
+    public long? AnthropicUnifiedResetAt { get; set; }
+
+    public string? AnthropicUnifiedOverageDisabledReason { get; set; }
+
+    public string? AnthropicUnifiedOverageStatus { get; set; }
+
+    #endregion
+
     /// <summary>
     /// 最后更新时间
     /// </summary>
@@ -112,6 +185,26 @@ public class AccountQuotaInfo
             return 95;
         }
 
+        // 检查是否是 Anthropic 风格的限流（基于 token 数量）
+        if (TokensLimit.HasValue && TokensLimit.Value > 0)
+        {
+            // 计算总 token 使用率
+            var tokensUsedPercent = 100 - (int)((TokensRemaining ?? 0) * 100.0 / TokensLimit.Value);
+            var tokensScore = Math.Max(0, 100 - tokensUsedPercent);
+
+            // 如果有独立的 input/output tokens 限制，也考虑进去
+            if (InputTokensLimit.HasValue && InputTokensLimit.Value > 0)
+            {
+                var inputUsedPercent = 100 - (int)((InputTokensRemaining ?? 0) * 100.0 / InputTokensLimit.Value);
+                var inputScore = Math.Max(0, 100 - inputUsedPercent);
+
+                return (int)(tokensScore * 0.7 + inputScore * 0.3);
+            }
+
+            return tokensScore;
+        }
+
+        // OpenAI Codex 风格的限流（基于百分比）
         // 优先考虑主窗口使用率（权重70%）
         // 使用率越低，分数越高
         var primaryScore = Math.Max(0, 100 - PrimaryUsedPercent);
@@ -131,7 +224,13 @@ public class AccountQuotaInfo
     /// <returns>true表示配额已耗尽，不应继续使用此账户</returns>
     public bool IsQuotaExhausted()
     {
-        // 主窗口达到或超过100%，或次级窗口达到或超过100%
+        // Anthropic 风格的限流检查
+        if (TokensLimit.HasValue && TokensLimit.Value > 0)
+        {
+            return (TokensRemaining ?? 0) <= 0;
+        }
+
+        // OpenAI Codex 风格的限流检查
         return PrimaryUsedPercent >= 100 || SecondaryUsedPercent >= 100;
     }
 
@@ -190,6 +289,13 @@ public class AccountQuotaInfo
     {
         if (IsQuotaExhausted())
         {
+            // Anthropic 风格
+            if (TokensLimit.HasValue && TokensLimit.Value > 0)
+            {
+                return $"配额耗尽 - Tokens: {TokensRemaining}/{TokensLimit}";
+            }
+
+            // OpenAI Codex 风格
             return $"配额耗尽 - 主窗口: {PrimaryUsedPercent}%, 次级: {SecondaryUsedPercent}%";
         }
 
@@ -203,6 +309,32 @@ public class AccountQuotaInfo
             return $"有信用额度 (余额: {CreditsBalance})";
         }
 
+        // Anthropic 风格
+        if (TokensLimit.HasValue && TokensLimit.Value > 0)
+        {
+            var tokensUsedPercent = 100 - (int)((TokensRemaining ?? 0) * 100.0 / TokensLimit.Value);
+            return $"正常 - Tokens: {FormatTokens(TokensRemaining ?? 0)}/{FormatTokens(TokensLimit.Value)} ({tokensUsedPercent}% 已使用), 健康度: {GetHealthScore()}";
+        }
+
+        // OpenAI Codex 风格
         return $"正常 - 主窗口: {PrimaryUsedPercent}%, 次级: {SecondaryUsedPercent}%, 健康度: {GetHealthScore()}";
+    }
+
+    /// <summary>
+    /// 格式化 token 数量为易读格式（如 1M, 1.5M 等）
+    /// </summary>
+    private static string FormatTokens(long tokens)
+    {
+        if (tokens >= 1_000_000)
+        {
+            return $"{tokens / 1_000_000.0:F1}M";
+        }
+
+        if (tokens >= 1_000)
+        {
+            return $"{tokens / 1_000.0:F1}K";
+        }
+
+        return tokens.ToString();
     }
 }

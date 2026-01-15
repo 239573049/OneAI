@@ -1,7 +1,10 @@
 using System.Text.Json;
 using OneAI.Constants;
+using OneAI.Services.ClaudeCodeOAuth;
+using OneAI.Services.FactoryOAuth;
 using OneAI.Services.OpenAIOAuth;
 using OneAI.Services.GeminiOAuth;
+using OneAI.Services.KiroOAuth;
 
 namespace OneAI.Entities;
 
@@ -96,6 +99,21 @@ public class AIAccount
         return JsonSerializer.Deserialize<OpenAiOauth>(OAuthToken, JsonSerializerOptions.Web);
     }
 
+    public void SetClaudeOAuth(ClaudeAiOAuth claudeOauth)
+    {
+        OAuthToken = JsonSerializer.Serialize(claudeOauth, JsonSerializerOptions.Web);
+    }
+
+    public ClaudeAiOAuth? GetClaudeOauth()
+    {
+        if (string.IsNullOrEmpty(OAuthToken) || Provider != AIProviders.Claude)
+        {
+            return null;
+        }
+
+        return JsonSerializer.Deserialize<ClaudeAiOAuth>(OAuthToken, JsonSerializerOptions.Web);
+    }
+
     public void SetGeminiOAuth(GeminiOAuthCredentialsDto geminiOauth)
     {
         OAuthToken = JsonSerializer.Serialize(geminiOauth, JsonSerializerOptions.Web);
@@ -110,6 +128,36 @@ public class AIAccount
         }
 
         return JsonSerializer.Deserialize<GeminiOAuthCredentialsDto>(OAuthToken, JsonSerializerOptions.Web);
+    }
+
+    public void SetFactoryOAuth(FactoryOauth factoryOauth)
+    {
+        OAuthToken = JsonSerializer.Serialize(factoryOauth, JsonSerializerOptions.Web);
+    }
+
+    public FactoryOauth? GetFactoryOauth()
+    {
+        if (string.IsNullOrEmpty(OAuthToken) || Provider != AIProviders.Factory)
+        {
+            return null;
+        }
+
+        return JsonSerializer.Deserialize<FactoryOauth>(OAuthToken, JsonSerializerOptions.Web);
+    }
+
+    public void SetKiroOAuth(KiroOAuthCredentialsDto kiroOauth)
+    {
+        OAuthToken = JsonSerializer.Serialize(kiroOauth, JsonSerializerOptions.Web);
+    }
+
+    public KiroOAuthCredentialsDto? GetKiroOauth()
+    {
+        if (string.IsNullOrEmpty(OAuthToken) || Provider != AIProviders.Kiro)
+        {
+            return null;
+        }
+
+        return JsonSerializer.Deserialize<KiroOAuthCredentialsDto>(OAuthToken, JsonSerializerOptions.Web);
     }
 
     /// <summary>

@@ -57,6 +57,7 @@ public class ResponsesService
             sessionStickinessUsed: false);
 
         bool sessionStickinessUsed = false;
+        var expiredRateLimitAccountIds = new HashSet<int>();
 
         try
         {
@@ -98,7 +99,7 @@ public class ResponsesService
 
                         account = await aiAccountService.TryGetAccountById(lastAccountId.Value);
 
-                        if (account != null && account.Provider == AIProviders.OpenAI)
+                        if (account is { Provider: AIProviders.OpenAI })
                         {
                             sessionStickinessUsed = true;
                             _logger.LogInformation(
@@ -125,20 +126,24 @@ public class ResponsesService
 
                 if (account == null)
                 {
-                    const string noAccountMessage = "账户池都无可用";
-                    _logger.LogWarning(noAccountMessage);
+                    if (!string.IsNullOrWhiteSpace(lastErrorMessage))
+                    {
+                        _logger.LogWarning(
+                            "账户池都无可用，返回上一次错误 (状态码: {StatusCode}): {ErrorMessage}",
+                            (int)(lastStatusCode ?? HttpStatusCode.ServiceUnavailable),
+                            lastErrorMessage);
+                        break;
+                    }
 
-                    await _requestLogService.RecordFailure(
-                        logId,
-                        stopwatch,
-                        StatusCodes.Status503ServiceUnavailable,
-                        noAccountMessage);
+                    lastErrorMessage = "账户池都无可用";
+                    lastStatusCode = HttpStatusCode.TooManyRequests;
+                    _logger.LogWarning(lastErrorMessage);
+                    break;
+                }
 
-                    await WriteOpenAiErrorResponse(
-                        context,
-                        noAccountMessage,
-                        StatusCodes.Status503ServiceUnavailable);
-                    return;
+                if (account.IsRateLimitExpired())
+                {
+                    expiredRateLimitAccountIds.Add(account.Id);
                 }
 
                 AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
@@ -770,6 +775,21 @@ public class ResponsesService
         }
         finally
         {
+            try
+            {
+                if (expiredRateLimitAccountIds.Count > 0)
+                {
+                    foreach (var accountId in expiredRateLimitAccountIds)
+                    {
+                        await aiAccountService.ClearExpiredRateLimit(accountId);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "清理过期限流状态时发生异常");
+            }
+
             // 确保每次请求结束后清理 AsyncLocal，避免污染后续异步链路
             AIProviderAsyncLocal.AIProviderIds.Clear();
         }

@@ -107,189 +107,154 @@ public class GeminiAPIService(
 
                 if (account == null)
                 {
-                    if (!string.IsNullOrEmpty(lastErrorMessage))
+                    if (!string.IsNullOrWhiteSpace(lastErrorMessage))
                     {
-                        await context.Response.WriteAsJsonAsync(lastErrorMessage);
-                        return;
+                        logger.LogWarning(
+                            "无可用的 Gemini 账户，返回上一次错误 (状态码: {StatusCode}): {ErrorMessage}",
+                            (int)(lastStatusCode ?? HttpStatusCode.ServiceUnavailable),
+                            lastErrorMessage);
+                        break;
                     }
 
                     lastErrorMessage = $"无可用的 Gemini 账户（尝试 {attempt}/{maxRetries}）";
                     lastStatusCode = HttpStatusCode.ServiceUnavailable;
 
                     logger.LogWarning(lastErrorMessage);
-
-                    if (attempt < maxRetries)
-                    {
-                        await Task.Delay(1000); // 等待后重试
-                        continue;
-                    }
-
                     break;
                 }
 
                 AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
 
-                var geminiOAuth = await GetValidGeminiOAuthAsync(account, aiAccountService);
-                if (geminiOAuth == null)
+                if (account.Provider == AIProviders.Gemini)
                 {
-                    if (!string.IsNullOrEmpty(lastErrorMessage))
+                    var geminiOAuth = await GetValidGeminiOAuthAsync(account, aiAccountService);
+                    if (geminiOAuth == null)
                     {
-                        await context.Response.WriteAsJsonAsync(lastErrorMessage);
-                        return;
-                    }
+                        lastErrorMessage = $"账户 {account.Id} Gemini Token 无效或已过期且刷新失败";
+                        lastStatusCode = HttpStatusCode.Unauthorized;
 
-                    lastErrorMessage = $"账户 {account.Id} Gemini Token 无效或已过期且刷新失败";
-                    lastStatusCode = HttpStatusCode.Unauthorized;
+                        logger.LogWarning(lastErrorMessage);
 
-                    logger.LogWarning(lastErrorMessage);
-
-                    if (attempt < maxRetries)
-                    {
-                        continue;
-                    }
-
-                    break;
-                }
-
-                // 发送请求
-                try
-                {
-                    var codeAssistEndpoint = configuration["Gemini:CodeAssistEndpoint"] ??
-                                             throw new InvalidOperationException(
-                                                 "Gemini CodeAssistEndpoint is not configured");
-                    var action = "generateContent";
-                    var url = $"{codeAssistEndpoint}/v1internal:{action}";
-                    var userAgent = GetUserAgent();
-
-                    using var response = await SendGeminiRequest(
-                        url,
-                        input,
-                        geminiOAuth.Token,
-                        geminiOAuth.ProjectId,
-                        model,
-                        isStream: false,
-                        userAgent: userAgent);
-
-                    var timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
-
-                    await requestLogService.UpdateRetry(logId, attempt, account.Id);
-
-                    // 处理响应
-                    if (response.StatusCode >= HttpStatusCode.BadRequest)
-                    {
-                        var error = await response.Content.ReadAsStringAsync();
-
-                        lastErrorMessage = error;
-                        lastStatusCode = response.StatusCode;
-
-                        logger.LogError(
-                            "Gemini 请求失败 (账户: {AccountId}, 状态码: {StatusCode}, 尝试: {Attempt}/{MaxRetries}): {Error}",
-                            account.Id,
-                            response.StatusCode,
-                            attempt,
-                            maxRetries,
-                            error);
-
-                        // 检查是否是客户端错误
-                        bool isClientError = ClientErrorKeywords.Any(keyword => error.Contains(keyword));
-
-                        if (response.StatusCode == HttpStatusCode.Unauthorized || response.StatusCode == HttpStatusCode.Forbidden)
+                        if (attempt < maxRetries)
                         {
-                            await aiAccountService.DisableAccount(account.Id);
+                            continue;
+                        }
 
-                            if (response.StatusCode == HttpStatusCode.Unauthorized || isClientError)
+                        break;
+                    }
+
+                    // 发送请求
+                    try
+                    {
+                        var codeAssistEndpoint = configuration["Gemini:CodeAssistEndpoint"] ??
+                                                 throw new InvalidOperationException(
+                                                     "Gemini CodeAssistEndpoint is not configured");
+                        var action = "generateContent";
+                        var url = $"{codeAssistEndpoint}/v1internal:{action}";
+                        var userAgent = GetUserAgent();
+
+                        using var response = await SendGeminiRequest(
+                            url,
+                            input,
+                            geminiOAuth.Token,
+                            geminiOAuth.ProjectId,
+                            model,
+                            isStream: false,
+                            userAgent: userAgent);
+
+                        var timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
+
+                        await requestLogService.UpdateRetry(logId, attempt, account.Id);
+
+                        // 处理响应
+                        if (response.StatusCode >= HttpStatusCode.BadRequest)
+                        {
+                            var error = await response.Content.ReadAsStringAsync();
+
+                            lastErrorMessage = error;
+                            lastStatusCode = response.StatusCode;
+
+                            logger.LogError(
+                                "Gemini 请求失败 (账户: {AccountId}, 状态码: {StatusCode}, 尝试: {Attempt}/{MaxRetries}): {Error}",
+                                account.Id,
+                                response.StatusCode,
+                                attempt,
+                                maxRetries,
+                                error);
+
+                            // 检查是否是客户端错误
+                            bool isClientError = ClientErrorKeywords.Any(keyword => error.Contains(keyword));
+
+                            if (response.StatusCode == HttpStatusCode.Unauthorized ||
+                                response.StatusCode == HttpStatusCode.Forbidden)
                             {
-                                if (attempt < maxRetries)
-                                {
-                                    continue;
-                                }
+                                await aiAccountService.DisableAccount(account.Id);
 
+                                if (response.StatusCode == HttpStatusCode.Unauthorized || isClientError)
+                                {
+                                    if (attempt < maxRetries)
+                                    {
+                                        continue;
+                                    }
+
+                                    await requestLogService.RecordFailure(
+                                        logId,
+                                        stopwatch,
+                                        (int)response.StatusCode,
+                                        error);
+
+                                    break;
+                                }
+                            }
+
+                            if (isClientError)
+                            {
                                 await requestLogService.RecordFailure(
                                     logId,
                                     stopwatch,
                                     (int)response.StatusCode,
                                     error);
 
-                                break;
+                                context.Response.ContentType = "application/json";
+                                context.Response.StatusCode = (int)response.StatusCode;
+                                await context.Response.WriteAsync(error, context.RequestAborted);
+                                return;
                             }
-                        }
 
-                        if (isClientError)
-                        {
+                            if (attempt < maxRetries)
+                            {
+                                continue;
+                            }
+
                             await requestLogService.RecordFailure(
                                 logId,
                                 stopwatch,
                                 (int)response.StatusCode,
                                 error);
 
-                            context.Response.ContentType = "application/json";
-                            context.Response.StatusCode = (int)response.StatusCode;
-                            await context.Response.WriteAsync(error, context.RequestAborted);
-                            return;
+                            break;
                         }
 
-                        if (attempt < maxRetries)
-                        {
-                            continue;
-                        }
-
-                        await requestLogService.RecordFailure(
-                            logId,
-                            stopwatch,
-                            (int)response.StatusCode,
-                            error);
-
-                        break;
-                    }
-
-                    // 成功响应
-                    logger.LogInformation(
-                        "成功处理 Gemini 请求 (账户: {AccountId}, 模型: {Model}, 尝试: {Attempt}/{MaxRetries})",
-                        account.Id,
-                        model,
-                        attempt, maxRetries);
-
-                    if (!string.IsNullOrEmpty(conversationId))
-                    {
-                        quotaCache.SetConversationAccount(conversationId, account.Id);
-                    }
-
-                    var responseText = await response.Content.ReadAsStringAsync(context.RequestAborted);
-                    if (!TryParseJson(responseText, out var doc))
-                    {
-                        lastErrorMessage = "Gemini 响应不是有效的 JSON";
-                        lastStatusCode = HttpStatusCode.BadGateway;
-
-                        logger.LogError(
-                            "Gemini 响应不是有效的 JSON (账户: {AccountId}, 尝试: {Attempt}/{MaxRetries}): {Body}",
+                        // 成功响应
+                        logger.LogInformation(
+                            "成功处理 Gemini 请求 (账户: {AccountId}, 模型: {Model}, 尝试: {Attempt}/{MaxRetries})",
                             account.Id,
-                            attempt,
-                            maxRetries,
-                            responseText);
+                            model,
+                            attempt, maxRetries);
 
-                        if (attempt < maxRetries)
+                        if (!string.IsNullOrEmpty(conversationId))
                         {
-                            continue;
+                            quotaCache.SetConversationAccount(conversationId, account.Id);
                         }
 
-                        await requestLogService.RecordFailure(
-                            logId,
-                            stopwatch,
-                            (int)lastStatusCode,
-                            lastErrorMessage);
-
-                        break;
-                    }
-
-                    using (doc)
-                    {
-                        if (!TryGetResponseAndCandidate(doc.RootElement, out var responseElement, out var candidate))
+                        var responseText = await response.Content.ReadAsStringAsync(context.RequestAborted);
+                        if (!TryParseJson(responseText, out var doc))
                         {
-                            lastErrorMessage = "Gemini 响应缺少 response/candidates 字段";
+                            lastErrorMessage = "Gemini 响应不是有效的 JSON";
                             lastStatusCode = HttpStatusCode.BadGateway;
 
                             logger.LogError(
-                                "Gemini 响应缺少 response/candidates 字段 (账户: {AccountId}, 尝试: {Attempt}/{MaxRetries}): {Body}",
+                                "Gemini 响应不是有效的 JSON (账户: {AccountId}, 尝试: {Attempt}/{MaxRetries}): {Body}",
                                 account.Id,
                                 attempt,
                                 maxRetries,
@@ -309,49 +274,83 @@ public class GeminiAPIService(
                             break;
                         }
 
-                        _ = TryGetUsageMetadata(
-                            responseElement,
-                            candidate,
-                            out var promptTokens,
-                            out var completionTokens,
-                            out var totalTokens);
+                        using (doc)
+                        {
+                            if (!TryGetResponseAndCandidate(doc.RootElement, out var responseElement,
+                                    out var candidate))
+                            {
+                                lastErrorMessage = "Gemini 响应缺少 response/candidates 字段";
+                                lastStatusCode = HttpStatusCode.BadGateway;
 
-                        await requestLogService.RecordSuccess(
+                                logger.LogError(
+                                    "Gemini 响应缺少 response/candidates 字段 (账户: {AccountId}, 尝试: {Attempt}/{MaxRetries}): {Body}",
+                                    account.Id,
+                                    attempt,
+                                    maxRetries,
+                                    responseText);
+
+                                if (attempt < maxRetries)
+                                {
+                                    continue;
+                                }
+
+                                await requestLogService.RecordFailure(
+                                    logId,
+                                    stopwatch,
+                                    (int)lastStatusCode,
+                                    lastErrorMessage);
+
+                                break;
+                            }
+
+                            _ = TryGetUsageMetadata(
+                                responseElement,
+                                candidate,
+                                out var promptTokens,
+                                out var completionTokens,
+                                out var totalTokens);
+
+                            await requestLogService.RecordSuccess(
+                                logId,
+                                stopwatch,
+                                (int)response.StatusCode,
+                                timeToFirstByteMs: timeToFirstByteMs,
+                                promptTokens: promptTokens,
+                                completionTokens: completionTokens,
+                                totalTokens: totalTokens);
+
+                            context.Response.ContentType = "application/json";
+                            context.Response.StatusCode = (int)response.StatusCode;
+                            await context.Response.WriteAsync(responseElement.GetRawText(), context.RequestAborted);
+                            return;
+                        }
+
+                        // 走到这里说明解析失败但不再重试，交由外层统一失败处理
+                    }
+                    catch (Exception ex)
+                    {
+                        lastErrorMessage = $"请求异常 (账户: {account.Id}): {ex.Message}";
+                        lastStatusCode = HttpStatusCode.InternalServerError;
+
+                        logger.LogError(ex, "Gemini 请求异常（尝试 {Attempt}/{MaxRetries}）", attempt, maxRetries);
+
+                        if (attempt < maxRetries)
+                        {
+                            continue;
+                        }
+
+                        await requestLogService.RecordFailure(
                             logId,
                             stopwatch,
-                            (int)response.StatusCode,
-                            timeToFirstByteMs: timeToFirstByteMs,
-                            promptTokens: promptTokens,
-                            completionTokens: completionTokens,
-                            totalTokens: totalTokens);
+                            (int)lastStatusCode,
+                            lastErrorMessage);
 
-                        context.Response.ContentType = "application/json";
-                        context.Response.StatusCode = (int)response.StatusCode;
-                        await context.Response.WriteAsync(responseElement.GetRawText(), context.RequestAborted);
-                        return;
+                        break;
                     }
-
-                    // 走到这里说明解析失败但不再重试，交由外层统一失败处理
                 }
-                catch (Exception ex)
+                else if (account.Provider == AIProviders.Factory)
                 {
-                    lastErrorMessage = $"请求异常 (账户: {account.Id}): {ex.Message}";
-                    lastStatusCode = HttpStatusCode.InternalServerError;
-
-                    logger.LogError(ex, "Gemini 请求异常（尝试 {Attempt}/{MaxRetries}）", attempt, maxRetries);
-
-                    if (attempt < maxRetries)
-                    {
-                        continue;
-                    }
-
-                    await requestLogService.RecordFailure(
-                        logId,
-                        stopwatch,
-                        (int)lastStatusCode,
-                        lastErrorMessage);
-
-                    break;
+                    
                 }
             }
 
@@ -465,23 +464,19 @@ public class GeminiAPIService(
 
                 if (account == null)
                 {
+                    if (!string.IsNullOrWhiteSpace(lastErrorMessage))
+                    {
+                        logger.LogWarning(
+                            "无可用的 Gemini 账户，返回上一次错误 (状态码: {StatusCode}): {ErrorMessage}",
+                            (int)(lastStatusCode ?? HttpStatusCode.ServiceUnavailable),
+                            lastErrorMessage);
+                        break;
+                    }
+
                     lastErrorMessage = $"无可用的 Gemini 账户（尝试 {attempt}/{maxRetries}）";
                     lastStatusCode = HttpStatusCode.ServiceUnavailable;
 
                     logger.LogWarning(lastErrorMessage);
-
-                    if (!string.IsNullOrEmpty(lastErrorMessage))
-                    {
-                        await context.Response.WriteAsJsonAsync(lastErrorMessage);
-                        return;
-                    }
-
-                    if (attempt < maxRetries)
-                    {
-                        await Task.Delay(1000);
-                        continue;
-                    }
-
                     break;
                 }
 

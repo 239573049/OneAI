@@ -16,6 +16,11 @@ public static class AIProviders
     public const string Claude = "Claude";
 
     /// <summary>
+    /// Factory（WorkOS OAuth）
+    /// </summary>
+    public const string Factory = "Factory";
+
+    /// <summary>
     /// Google Gemini (Gemini Pro, Ultra 等)
     /// </summary>
     public const string Gemini = "Gemini";
@@ -26,14 +31,21 @@ public static class AIProviders
     public const string GeminiAntigravity = "Gemini-Antigravity";
 
     /// <summary>
+    /// Kiro Reverse (Amazon CodeWhisperer via Kiro)
+    /// </summary>
+    public const string Kiro = "Kiro";
+
+    /// <summary>
     /// 获取所有支持的提供商列表
     /// </summary>
     public static readonly string[] All =
     [
         OpenAI,
         Claude,
+        Factory,
         Gemini,
-        GeminiAntigravity
+        GeminiAntigravity,
+        Kiro
     ];
 
     /// <summary>
@@ -53,8 +65,10 @@ public static class AIProviders
         {
             OpenAI => "OpenAI (ChatGPT)",
             Claude => "Anthropic Claude",
+            Factory => "Factory",
             Gemini => "Google Gemini",
             GeminiAntigravity => "Google Gemini (Antigravity)",
+            Kiro => "Kiro Reverse",
             _ => provider
         };
     }

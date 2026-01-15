@@ -1,0 +1,2126 @@
+using System.Net;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
+using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
+using OneAI.Constants;
+using OneAI.Entities;
+using OneAI.Services;
+using OneAI.Services.AI.Anthropic;
+using OneAI.Services.AI.Models.Dtos;
+using OneAI.Services.KiroOAuth;
+using Thor.Abstractions.Chats.Dtos;
+
+namespace OneAI.Services.AI;
+
+/// <summary>
+/// Kiro Reverse API service (Amazon CodeWhisperer via Kiro)
+/// </summary>
+public sealed class KiroService(
+    ILogger<KiroService> logger,
+    KiroOAuthService kiroOAuthService)
+{
+    private static readonly HttpClient HttpClient = CreateHttpClient();
+
+    private const int MaxRetries = 3;
+    private const int BaseDelayMs = 1000;
+    private const string DefaultModelName = "claude-opus-4-5";
+    private const string AuthMethodSocial = "social";
+    private const string ChatTriggerManual = "MANUAL";
+    private const string OriginAiEditor = "AI_EDITOR";
+    private const string KiroVersion = "0.7.5";
+
+    private static readonly Dictionary<string, string> ModelMapping = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["claude-opus-4-5"] = "claude-opus-4.5",
+        ["claude-opus-4-5-20251101"] = "claude-opus-4.5",
+        ["claude-haiku-4-5"] = "claude-haiku-4.5",
+        ["claude-sonnet-4-5"] = "CLAUDE_SONNET_4_5_20250929_V1_0",
+        ["claude-sonnet-4-5-20250929"] = "CLAUDE_SONNET_4_5_20250929_V1_0",
+        ["claude-sonnet-4-20250514"] = "CLAUDE_SONNET_4_20250514_V1_0",
+        ["claude-3-7-sonnet-20250219"] = "CLAUDE_3_7_SONNET_20250219_V1_0"
+    };
+
+    public async Task ExecuteMessagesAsync(
+        HttpContext context,
+        AnthropicInput input,
+        AIAccountService aiAccountService)
+    {
+        if (string.IsNullOrWhiteSpace(input.Model) || input.MaxTokens == null || input.Messages == null)
+        {
+            await WriteAnthropicError(context, StatusCodes.Status400BadRequest,
+                "缺少必填字段：model / max_tokens / messages", "invalid_request_error");
+            return;
+        }
+
+        AIProviderAsyncLocal.AIProviderIds = [];
+
+        try
+        {
+            var account = await aiAccountService.GetAIAccountByProvider(AIProviders.Kiro);
+            if (account == null)
+            {
+                await WriteAnthropicError(context, StatusCodes.Status503ServiceUnavailable,
+                    "Kiro 账户池暂无可用账户", "api_error");
+                return;
+            }
+
+            AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
+
+            var credentials = account.GetKiroOauth();
+            if (credentials == null)
+            {
+                await WriteAnthropicError(context, StatusCodes.Status401Unauthorized,
+                    "Kiro 账户缺少有效凭证", "authentication_error");
+                return;
+            }
+
+            if (IsExpiryDateNear(credentials))
+            {
+                await kiroOAuthService.RefreshKiroOAuthTokenAsync(account);
+                credentials = account.GetKiroOauth();
+            }
+
+            if (string.IsNullOrWhiteSpace(credentials?.AccessToken))
+            {
+                await WriteAnthropicError(context, StatusCodes.Status401Unauthorized,
+                    "Kiro 账户缺少访问令牌", "authentication_error");
+                return;
+            }
+
+            var tools = BuildToolSpecificationsFromAnthropic(input.Tools);
+            var systemPrompt = BuildAnthropicSystemPrompt(input);
+            var messages = ConvertAnthropicMessages(input);
+
+            var requestBody = BuildCodeWhispererRequest(messages, input.Model, tools, systemPrompt, credentials);
+            var requestModel = ResolveKiroModel(input.Model);
+            var inputTokens = EstimateInputTokens(systemPrompt, messages, tools);
+
+            if (input.Stream)
+            {
+                await StreamAnthropicResponse(context, account, credentials, requestBody, requestModel, input.Model,
+                    inputTokens);
+                return;
+            }
+
+            var responseText = await CallKiroAsync(account, credentials, requestBody, requestModel, context.RequestAborted);
+            var (content, toolCalls) = ParseKiroResponse(responseText);
+
+            var responsePayload = BuildAnthropicResponse(content, toolCalls, input.Model, inputTokens);
+            context.Response.ContentType = "application/json";
+            await context.Response.WriteAsync(responsePayload.ToJsonString(JsonOptions.DefaultOptions));
+        }
+        catch (OperationCanceledException)
+        {
+            logger.LogInformation("客户端取消 /kiro/v1/messages 请求");
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Kiro /v1/messages 处理失败");
+            if (!context.Response.HasStarted)
+            {
+                await WriteAnthropicError(context, StatusCodes.Status500InternalServerError,
+                    $"服务器内部错误: {ex.Message}", "api_error");
+            }
+        }
+        finally
+        {
+            AIProviderAsyncLocal.AIProviderIds.Clear();
+        }
+    }
+
+    public async Task ExecuteChatCompletionsAsync(
+        HttpContext context,
+        ThorChatCompletionsRequest request,
+        AIAccountService aiAccountService)
+    {
+        if (string.IsNullOrWhiteSpace(request.Model) || request.Messages == null)
+        {
+            await WriteOpenAIErrorResponse(context, "缺少必填字段：model / messages", 400);
+            return;
+        }
+
+        AIProviderAsyncLocal.AIProviderIds = [];
+
+        try
+        {
+            var account = await aiAccountService.GetAIAccountByProvider(AIProviders.Kiro);
+            if (account == null)
+            {
+                await WriteOpenAIErrorResponse(context, "Kiro 账户池暂无可用账户", 503);
+                return;
+            }
+
+            AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
+
+            var credentials = account.GetKiroOauth();
+            if (credentials == null)
+            {
+                await WriteOpenAIErrorResponse(context, "Kiro 账户缺少有效凭证", 401);
+                return;
+            }
+
+            if (IsExpiryDateNear(credentials))
+            {
+                await kiroOAuthService.RefreshKiroOAuthTokenAsync(account);
+                credentials = account.GetKiroOauth();
+            }
+
+            if (string.IsNullOrWhiteSpace(credentials?.AccessToken))
+            {
+                await WriteOpenAIErrorResponse(context, "Kiro 账户缺少访问令牌", 401);
+                return;
+            }
+
+            var (systemPrompt, messages) = ConvertOpenAiMessages(request.Messages);
+            var tools = BuildToolSpecificationsFromOpenAi(request.Tools);
+
+            var requestBody = BuildCodeWhispererRequest(messages, request.Model, tools, systemPrompt, credentials);
+            var requestModel = ResolveKiroModel(request.Model);
+            var inputTokens = EstimateInputTokens(systemPrompt, messages, tools);
+
+            if (request.Stream == true)
+            {
+                await StreamOpenAiResponse(context, account, credentials, requestBody, requestModel, request.Model,
+                    inputTokens);
+                return;
+            }
+
+            var responseText = await CallKiroAsync(account, credentials, requestBody, requestModel, context.RequestAborted);
+            var (content, toolCalls) = ParseKiroResponse(responseText);
+
+            var responsePayload = BuildOpenAiResponse(content, toolCalls, request.Model, inputTokens);
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(responsePayload.ToJsonString(JsonOptions.DefaultOptions));
+        }
+        catch (OperationCanceledException)
+        {
+            logger.LogInformation("客户端取消 /kiro/v1/chat/completions 请求");
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "Kiro /v1/chat/completions 处理失败");
+            if (!context.Response.HasStarted)
+            {
+                await WriteOpenAIErrorResponse(context, $"服务器内部错误: {ex.Message}", 500);
+            }
+        }
+        finally
+        {
+            AIProviderAsyncLocal.AIProviderIds.Clear();
+        }
+    }
+
+    private static HttpClient CreateHttpClient()
+    {
+        var handler = new SocketsHttpHandler
+        {
+            AutomaticDecompression = DecompressionMethods.All,
+            PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+            AllowAutoRedirect = false
+        };
+
+        return new HttpClient(handler)
+        {
+            Timeout = TimeSpan.FromMinutes(10)
+        };
+    }
+
+    private static string ResolveKiroModel(string model)
+    {
+        return ModelMapping.ContainsKey(model) ? model : DefaultModelName;
+    }
+
+    private static string ResolveCodewhispererModel(string model)
+    {
+        return ModelMapping.TryGetValue(model, out var mapped)
+            ? mapped
+            : ModelMapping[DefaultModelName];
+    }
+
+    private static string BuildRegion(KiroOAuthCredentialsDto credentials)
+    {
+        return string.IsNullOrWhiteSpace(credentials.Region)
+            ? "us-east-1"
+            : credentials.Region.Trim();
+    }
+
+    private static string BuildBaseUrl(string region)
+    {
+        return $"https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse";
+    }
+
+    private static string BuildAmazonQUrl(string region)
+    {
+        return $"https://codewhisperer.{region}.amazonaws.com/SendMessageStreaming";
+    }
+
+    private async Task<string> CallKiroAsync(
+        AIAccount account,
+        KiroOAuthCredentialsDto credentials,
+        JsonObject requestBody,
+        string requestModel,
+        CancellationToken cancellationToken)
+    {
+        var region = BuildRegion(credentials);
+        var requestUrl = requestModel.StartsWith("amazonq", StringComparison.OrdinalIgnoreCase)
+            ? BuildAmazonQUrl(region)
+            : BuildBaseUrl(region);
+
+        var body = requestBody.ToJsonString(JsonOptions.DefaultOptions);
+
+        var attempt = 0;
+        while (true)
+        {
+            attempt++;
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, requestUrl)
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/json")
+            };
+
+            ApplyKiroHeaders(request, credentials);
+
+            using var response = await HttpClient.SendAsync(request, cancellationToken);
+            if (response.StatusCode == HttpStatusCode.Forbidden && attempt == 1)
+            {
+                await RefreshCredentials(account, credentials);
+                continue;
+            }
+
+            if ((int)response.StatusCode == 429 && attempt < MaxRetries)
+            {
+                await Task.Delay(BaseDelayMs * attempt, cancellationToken);
+                continue;
+            }
+
+            if ((int)response.StatusCode >= 500 && attempt < MaxRetries)
+            {
+                await Task.Delay(BaseDelayMs * attempt, cancellationToken);
+                continue;
+            }
+
+            response.EnsureSuccessStatusCode();
+
+            var bytes = await response.Content.ReadAsByteArrayAsync(cancellationToken);
+            return Encoding.UTF8.GetString(bytes);
+        }
+    }
+
+    private async Task StreamAnthropicResponse(
+        HttpContext context,
+        AIAccount account,
+        KiroOAuthCredentialsDto credentials,
+        JsonObject requestBody,
+        string requestModel,
+        string responseModel,
+        int inputTokens)
+    {
+        var region = BuildRegion(credentials);
+        var requestUrl = requestModel.StartsWith("amazonq", StringComparison.OrdinalIgnoreCase)
+            ? BuildAmazonQUrl(region)
+            : BuildBaseUrl(region);
+
+        context.Response.ContentType = "text/event-stream;charset=utf-8";
+        context.Response.Headers.TryAdd("Cache-Control", "no-cache");
+        context.Response.Headers.TryAdd("Connection", "keep-alive");
+        context.Response.StatusCode = 200;
+
+        var messageId = Guid.NewGuid().ToString();
+        var messageStart = new JsonObject
+        {
+            ["type"] = "message_start",
+            ["message"] = new JsonObject
+            {
+                ["id"] = messageId,
+                ["type"] = "message",
+                ["role"] = "assistant",
+                ["model"] = responseModel,
+                ["usage"] = new JsonObject
+                {
+                    ["input_tokens"] = inputTokens,
+                    ["cache_creation_input_tokens"] = 0,
+                    ["cache_read_input_tokens"] = 0,
+                    ["output_tokens"] = 0
+                },
+                ["content"] = new JsonArray()
+            }
+        };
+
+        await WriteSseJsonAsync(context, messageStart, context.RequestAborted);
+
+        var contentBlockStart = new JsonObject
+        {
+            ["type"] = "content_block_start",
+            ["index"] = 0,
+            ["content_block"] = new JsonObject
+            {
+                ["type"] = "text",
+                ["text"] = string.Empty
+            }
+        };
+
+        await WriteSseJsonAsync(context, contentBlockStart, context.RequestAborted);
+
+        var toolCalls = new List<KiroToolCall>();
+        var currentTool = (ToolCallAccumulator?)null;
+        var totalOutputTokens = 0;
+        string? lastContent = null;
+
+        await foreach (var ev in StreamKiroEvents(account, credentials, requestBody, requestUrl, context.RequestAborted))
+        {
+            if (ev.Type == KiroStreamEventType.Content && !string.IsNullOrEmpty(ev.Content))
+            {
+                if (ev.Content == lastContent)
+                {
+                    continue;
+                }
+
+                lastContent = ev.Content;
+                totalOutputTokens += CountTokens(ev.Content);
+
+                var delta = new JsonObject
+                {
+                    ["type"] = "content_block_delta",
+                    ["index"] = 0,
+                    ["delta"] = new JsonObject
+                    {
+                        ["type"] = "text_delta",
+                        ["text"] = ev.Content
+                    }
+                };
+
+                await WriteSseJsonAsync(context, delta, context.RequestAborted);
+            }
+            else if (ev.Type == KiroStreamEventType.ToolUse && ev.ToolUse != null)
+            {
+                currentTool = new ToolCallAccumulator(ev.ToolUse.ToolUseId, ev.ToolUse.Name);
+                if (!string.IsNullOrEmpty(ev.ToolUse.Input))
+                {
+                    currentTool.Input.Append(ev.ToolUse.Input);
+                }
+
+                if (ev.ToolUse.Stop)
+                {
+                    toolCalls.Add(currentTool.ToToolCall());
+                    currentTool = null;
+                }
+            }
+            else if (ev.Type == KiroStreamEventType.ToolUseInput && currentTool != null)
+            {
+                currentTool.Input.Append(ev.ToolInput);
+            }
+            else if (ev.Type == KiroStreamEventType.ToolUseStop && currentTool != null)
+            {
+                toolCalls.Add(currentTool.ToToolCall());
+                currentTool = null;
+            }
+        }
+
+        if (currentTool != null)
+        {
+            toolCalls.Add(currentTool.ToToolCall());
+        }
+
+        await WriteSseJsonAsync(context, new JsonObject
+        {
+            ["type"] = "content_block_stop",
+            ["index"] = 0
+        }, context.RequestAborted);
+
+        if (toolCalls.Count > 0)
+        {
+            for (var i = 0; i < toolCalls.Count; i++)
+            {
+                var toolCall = toolCalls[i];
+                var inputJson = BuildToolInputNode(toolCall.Arguments);
+                totalOutputTokens += CountTokens(toolCall.Arguments);
+
+                await WriteSseJsonAsync(context, new JsonObject
+                {
+                    ["type"] = "content_block_start",
+                    ["index"] = i + 1,
+                    ["content_block"] = new JsonObject
+                    {
+                        ["type"] = "tool_use",
+                        ["id"] = toolCall.Id,
+                        ["name"] = toolCall.Name,
+                        ["input"] = new JsonObject()
+                    }
+                }, context.RequestAborted);
+
+                await WriteSseJsonAsync(context, new JsonObject
+                {
+                    ["type"] = "content_block_delta",
+                    ["index"] = i + 1,
+                    ["delta"] = new JsonObject
+                    {
+                        ["type"] = "input_json_delta",
+                        ["partial_json"] = inputJson.ToJsonString(JsonOptions.DefaultOptions)
+                    }
+                }, context.RequestAborted);
+
+                await WriteSseJsonAsync(context, new JsonObject
+                {
+                    ["type"] = "content_block_stop",
+                    ["index"] = i + 1
+                }, context.RequestAborted);
+            }
+        }
+
+        var stopReason = toolCalls.Count > 0 ? "tool_use" : "end_turn";
+        await WriteSseJsonAsync(context, new JsonObject
+        {
+            ["type"] = "message_delta",
+            ["delta"] = new JsonObject
+            {
+                ["stop_reason"] = stopReason
+            },
+            ["usage"] = new JsonObject
+            {
+                ["input_tokens"] = inputTokens,
+                ["cache_creation_input_tokens"] = 0,
+                ["cache_read_input_tokens"] = 0,
+                ["output_tokens"] = totalOutputTokens
+            }
+        }, context.RequestAborted);
+
+        await WriteSseJsonAsync(context, new JsonObject
+        {
+            ["type"] = "message_stop"
+        }, context.RequestAborted);
+    }
+
+    private async Task StreamOpenAiResponse(
+        HttpContext context,
+        AIAccount account,
+        KiroOAuthCredentialsDto credentials,
+        JsonObject requestBody,
+        string requestModel,
+        string responseModel,
+        int inputTokens)
+    {
+        var region = BuildRegion(credentials);
+        var requestUrl = requestModel.StartsWith("amazonq", StringComparison.OrdinalIgnoreCase)
+            ? BuildAmazonQUrl(region)
+            : BuildBaseUrl(region);
+
+        context.Response.ContentType = "text/event-stream;charset=utf-8";
+        context.Response.Headers.TryAdd("Cache-Control", "no-cache");
+        context.Response.Headers.TryAdd("Connection", "keep-alive");
+        context.Response.StatusCode = 200;
+
+        var responseId = Guid.NewGuid().ToString();
+        var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+
+        var roleChunk = new JsonObject
+        {
+            ["id"] = responseId,
+            ["object"] = "chat.completion.chunk",
+            ["created"] = created,
+            ["model"] = responseModel,
+            ["choices"] = new JsonArray
+            {
+                new JsonObject
+                {
+                    ["index"] = 0,
+                    ["delta"] = new JsonObject
+                    {
+                        ["role"] = "assistant",
+                        ["content"] = string.Empty
+                    },
+                    ["finish_reason"] = null
+                }
+            }
+        };
+
+        await WriteSseJsonAsync(context, roleChunk, context.RequestAborted);
+
+        var toolCalls = new List<KiroToolCall>();
+        var currentTool = (ToolCallAccumulator?)null;
+        string? lastContent = null;
+
+        await foreach (var ev in StreamKiroEvents(account, credentials, requestBody, requestUrl, context.RequestAborted))
+        {
+            if (ev.Type == KiroStreamEventType.Content && !string.IsNullOrEmpty(ev.Content))
+            {
+                if (ev.Content == lastContent)
+                {
+                    continue;
+                }
+
+                lastContent = ev.Content;
+                var chunk = new JsonObject
+                {
+                    ["id"] = responseId,
+                    ["object"] = "chat.completion.chunk",
+                    ["created"] = created,
+                    ["model"] = responseModel,
+                    ["choices"] = new JsonArray
+                    {
+                        new JsonObject
+                        {
+                            ["index"] = 0,
+                            ["delta"] = new JsonObject
+                            {
+                                ["content"] = ev.Content
+                            },
+                            ["finish_reason"] = null
+                        }
+                    }
+                };
+
+                await WriteSseJsonAsync(context, chunk, context.RequestAborted);
+            }
+            else if (ev.Type == KiroStreamEventType.ToolUse && ev.ToolUse != null)
+            {
+                currentTool = new ToolCallAccumulator(ev.ToolUse.ToolUseId, ev.ToolUse.Name);
+                if (!string.IsNullOrEmpty(ev.ToolUse.Input))
+                {
+                    currentTool.Input.Append(ev.ToolUse.Input);
+                }
+
+                if (ev.ToolUse.Stop)
+                {
+                    toolCalls.Add(currentTool.ToToolCall());
+                    currentTool = null;
+                }
+            }
+            else if (ev.Type == KiroStreamEventType.ToolUseInput && currentTool != null)
+            {
+                currentTool.Input.Append(ev.ToolInput);
+            }
+            else if (ev.Type == KiroStreamEventType.ToolUseStop && currentTool != null)
+            {
+                toolCalls.Add(currentTool.ToToolCall());
+                currentTool = null;
+            }
+        }
+
+        if (currentTool != null)
+        {
+            toolCalls.Add(currentTool.ToToolCall());
+        }
+
+        if (toolCalls.Count > 0)
+        {
+            var toolCallsArray = BuildOpenAiToolCalls(toolCalls, includeIndex: true);
+            var toolChunk = new JsonObject
+            {
+                ["id"] = responseId,
+                ["object"] = "chat.completion.chunk",
+                ["created"] = created,
+                ["model"] = responseModel,
+                ["choices"] = new JsonArray
+                {
+                    new JsonObject
+                    {
+                        ["index"] = 0,
+                        ["delta"] = new JsonObject
+                        {
+                            ["tool_calls"] = toolCallsArray
+                        },
+                        ["finish_reason"] = "tool_calls"
+                    }
+                }
+            };
+
+            await WriteSseJsonAsync(context, toolChunk, context.RequestAborted);
+        }
+        else
+        {
+            var doneChunk = new JsonObject
+            {
+                ["id"] = responseId,
+                ["object"] = "chat.completion.chunk",
+                ["created"] = created,
+                ["model"] = responseModel,
+                ["choices"] = new JsonArray
+                {
+                    new JsonObject
+                    {
+                        ["index"] = 0,
+                        ["delta"] = new JsonObject(),
+                        ["finish_reason"] = "stop"
+                    }
+                },
+                ["usage"] = new JsonObject
+                {
+                    ["prompt_tokens"] = inputTokens,
+                    ["completion_tokens"] = 0,
+                    ["total_tokens"] = inputTokens
+                }
+            };
+
+            await WriteSseJsonAsync(context, doneChunk, context.RequestAborted);
+        }
+
+        await WriteSseDoneAsync(context, context.RequestAborted);
+    }
+
+    private async IAsyncEnumerable<KiroStreamEvent> StreamKiroEvents(
+        AIAccount account,
+        KiroOAuthCredentialsDto credentials,
+        JsonObject requestBody,
+        string requestUrl,
+        [EnumeratorCancellation] CancellationToken cancellationToken)
+    {
+        var body = requestBody.ToJsonString(JsonOptions.DefaultOptions);
+        var attempt = 0;
+
+        while (true)
+        {
+            attempt++;
+            using var request = new HttpRequestMessage(HttpMethod.Post, requestUrl)
+            {
+                Content = new StringContent(body, Encoding.UTF8, "application/json")
+            };
+            ApplyKiroHeaders(request, credentials);
+
+            HttpResponseMessage response;
+            try
+            {
+                response = await HttpClient.SendAsync(
+                    request,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    cancellationToken);
+            }
+            catch when (attempt < MaxRetries)
+            {
+                await Task.Delay(BaseDelayMs * attempt, cancellationToken);
+                continue;
+            }
+
+            using (response)
+            {
+                if (response.StatusCode == HttpStatusCode.Forbidden && attempt == 1)
+                {
+                    await RefreshCredentials(account, credentials);
+                    continue;
+                }
+
+                if ((int)response.StatusCode == 429 && attempt < MaxRetries)
+                {
+                    await Task.Delay(BaseDelayMs * attempt, cancellationToken);
+                    continue;
+                }
+
+                if ((int)response.StatusCode >= 500 && attempt < MaxRetries)
+                {
+                    await Task.Delay(BaseDelayMs * attempt, cancellationToken);
+                    continue;
+                }
+
+                response.EnsureSuccessStatusCode();
+
+                await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+                using var reader = new StreamReader(stream, Encoding.UTF8);
+                var buffer = new StringBuilder();
+                var charBuffer = new char[4096];
+
+                while (true)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var read = await reader.ReadAsync(charBuffer.AsMemory(0, charBuffer.Length), cancellationToken);
+                    if (read == 0)
+                    {
+                        break;
+                    }
+
+                    buffer.Append(charBuffer, 0, read);
+                    var (events, remaining) = ParseAwsEventStreamBuffer(buffer.ToString());
+                    buffer.Clear();
+                    buffer.Append(remaining);
+
+                    foreach (var ev in events)
+                    {
+                        yield return ev;
+                    }
+                }
+            }
+
+            yield break;
+        }
+    }
+
+    private static void ApplyKiroHeaders(HttpRequestMessage request, KiroOAuthCredentialsDto credentials)
+    {
+        var machineId = GenerateMachineId(credentials);
+        var (osName, runtimeVersion) = GetSystemRuntimeInfo();
+
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", credentials.AccessToken ?? string.Empty);
+        request.Headers.TryAddWithoutValidation("amz-sdk-invocation-id", Guid.NewGuid().ToString());
+        request.Headers.TryAddWithoutValidation("amz-sdk-request", "attempt=1; max=1");
+        request.Headers.TryAddWithoutValidation("x-amzn-kiro-agent-mode", "vibe");
+        request.Headers.TryAddWithoutValidation("x-amz-user-agent", $"aws-sdk-js/1.0.0 KiroIDE-{KiroVersion}-{machineId}");
+        request.Headers.TryAddWithoutValidation("user-agent",
+            $"aws-sdk-js/1.0.0 ua/2.1 os/{osName} lang/js md/dotnet#{runtimeVersion} api/codewhispererruntime#1.0.0 m/E KiroIDE-{KiroVersion}-{machineId}");
+        request.Headers.ConnectionClose = true;
+    }
+
+    private async Task RefreshCredentials(AIAccount account, KiroOAuthCredentialsDto credentials)
+    {
+        await kiroOAuthService.RefreshKiroOAuthTokenAsync(account);
+        var updated = account.GetKiroOauth();
+        if (updated != null)
+        {
+            credentials.AccessToken = updated.AccessToken;
+            credentials.RefreshToken = updated.RefreshToken;
+            credentials.ProfileArn = updated.ProfileArn;
+            credentials.ExpiresAt = updated.ExpiresAt;
+            credentials.AuthMethod = updated.AuthMethod;
+            credentials.ClientId = updated.ClientId;
+            credentials.ClientSecret = updated.ClientSecret;
+        }
+    }
+
+    private static (string OsName, string RuntimeVersion) GetSystemRuntimeInfo()
+    {
+        var osPlatform = Environment.OSVersion.Platform.ToString().ToLowerInvariant();
+        var osRelease = Environment.OSVersion.Version.ToString();
+        var osName = osPlatform switch
+        {
+            "win32nt" => $"windows#{osRelease}",
+            "unix" => $"linux#{osRelease}",
+            "macosx" => $"macos#{osRelease}",
+            _ => $"{osPlatform}#{osRelease}"
+        };
+
+        var runtimeVersion = Environment.Version.ToString();
+        return (osName, runtimeVersion);
+    }
+
+    private static string GenerateMachineId(KiroOAuthCredentialsDto credentials)
+    {
+        var uniqueKey = credentials.Uuid
+            ?? credentials.ProfileArn
+            ?? credentials.ClientId
+            ?? "KIRO_DEFAULT_MACHINE";
+
+        using var sha = SHA256.Create();
+        var hash = sha.ComputeHash(Encoding.UTF8.GetBytes(uniqueKey));
+        return Convert.ToHexString(hash).ToLowerInvariant();
+    }
+
+    private static bool IsExpiryDateNear(KiroOAuthCredentialsDto credentials)
+    {
+        var expiresAt = credentials.ExpiresAt;
+        if (string.IsNullOrWhiteSpace(expiresAt))
+        {
+            return true;
+        }
+
+        if (!DateTimeOffset.TryParse(expiresAt, out var expiry))
+        {
+            return true;
+        }
+
+        var nearMinutes = 10;
+        var threshold = DateTimeOffset.UtcNow.AddMinutes(nearMinutes);
+        return expiry <= threshold;
+    }
+
+    private static JsonObject BuildCodeWhispererRequest(
+        List<KiroMessage> messages,
+        string model,
+        JsonArray? toolsContext,
+        string? systemPrompt,
+        KiroOAuthCredentialsDto credentials)
+    {
+        if (messages.Count == 0)
+        {
+            throw new InvalidOperationException("No user messages found");
+        }
+
+        var processedMessages = messages
+            .Select(message => message.Clone())
+            .ToList();
+
+        if (processedMessages.Count > 0
+            && processedMessages[^1].Role == "assistant"
+            && processedMessages[^1].Parts.Count > 0
+            && processedMessages[^1].Parts[0].Type == "text"
+            && processedMessages[^1].Parts[0].Text == "{")
+        {
+            processedMessages.RemoveAt(processedMessages.Count - 1);
+        }
+
+        processedMessages = MergeAdjacentMessages(processedMessages);
+
+        var codewhispererModel = ResolveCodewhispererModel(model);
+        var history = new JsonArray();
+        var startIndex = 0;
+
+        if (!string.IsNullOrWhiteSpace(systemPrompt))
+        {
+            if (processedMessages.Count > 0 && processedMessages[0].Role == "user")
+            {
+                var firstContent = GetMessageText(processedMessages[0]);
+                var merged = string.IsNullOrWhiteSpace(firstContent)
+                    ? systemPrompt
+                    : $"{systemPrompt}\n\n{firstContent}";
+                history.Add(new JsonObject
+                {
+                    ["userInputMessage"] = BuildUserInputMessage(
+                        merged,
+                        codewhispererModel,
+                        OriginAiEditor,
+                        null,
+                        null,
+                        null)
+                });
+                startIndex = 1;
+            }
+            else
+            {
+                history.Add(new JsonObject
+                {
+                    ["userInputMessage"] = BuildUserInputMessage(
+                        systemPrompt,
+                        codewhispererModel,
+                        OriginAiEditor,
+                        null,
+                        null,
+                        null)
+                });
+            }
+        }
+
+        for (var i = startIndex; i < processedMessages.Count - 1; i++)
+        {
+            var message = processedMessages[i];
+            if (message.Role == "user")
+            {
+                var userMessage = BuildUserInputMessageFromParts(
+                    message,
+                    codewhispererModel,
+                    includeTools: false,
+                    toolsContext: null);
+                history.Add(new JsonObject { ["userInputMessage"] = userMessage });
+            }
+            else if (message.Role == "assistant")
+            {
+                var assistantMessage = BuildAssistantResponseMessage(message);
+                history.Add(new JsonObject { ["assistantResponseMessage"] = assistantMessage });
+            }
+        }
+
+        var currentMessage = processedMessages[^1];
+        var currentContent = string.Empty;
+        var currentToolResults = new List<JsonObject>();
+        var currentImages = new List<JsonObject>();
+
+        if (currentMessage.Role == "assistant")
+        {
+            var assistantMessage = BuildAssistantResponseMessage(currentMessage);
+            history.Add(new JsonObject { ["assistantResponseMessage"] = assistantMessage });
+            currentContent = "Continue";
+        }
+        else
+        {
+            if (history.Count > 0)
+            {
+                var lastHistory = history[^1] as JsonObject;
+                if (lastHistory != null && !lastHistory.ContainsKey("assistantResponseMessage"))
+                {
+                    history.Add(new JsonObject
+                    {
+                        ["assistantResponseMessage"] = new JsonObject
+                        {
+                            ["content"] = "Continue"
+                        }
+                    });
+                }
+            }
+
+            foreach (var part in currentMessage.Parts)
+            {
+                if (part.Type == "text")
+                {
+                    currentContent += part.Text;
+                }
+                else if (part.Type == "tool_result" && !string.IsNullOrWhiteSpace(part.ToolUseId))
+                {
+                    currentToolResults.Add(new JsonObject
+                    {
+                        ["content"] = new JsonArray
+                        {
+                            new JsonObject
+                            {
+                                ["text"] = part.Content ?? string.Empty
+                            }
+                        },
+                        ["status"] = "success",
+                        ["toolUseId"] = part.ToolUseId
+                    });
+                }
+                else if (part.Type == "image" && part.Source != null)
+                {
+                    currentImages.Add(new JsonObject
+                    {
+                        ["format"] = part.Source.MediaType?.Split('/').LastOrDefault(),
+                        ["source"] = new JsonObject
+                        {
+                            ["bytes"] = part.Source.Data ?? string.Empty
+                        }
+                    });
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(currentContent))
+            {
+                currentContent = currentToolResults.Count > 0 ? "Tool results provided." : "Continue";
+            }
+        }
+
+        var currentUserInput = BuildUserInputMessage(
+            currentContent,
+            codewhispererModel,
+            OriginAiEditor,
+            currentImages.Count > 0 ? currentImages : null,
+            currentToolResults.Count > 0 ? currentToolResults : null,
+            toolsContext);
+
+        var request = new JsonObject
+        {
+            ["conversationState"] = new JsonObject
+            {
+                ["chatTriggerType"] = ChatTriggerManual,
+                ["conversationId"] = Guid.NewGuid().ToString(),
+                ["currentMessage"] = new JsonObject
+                {
+                    ["userInputMessage"] = currentUserInput
+                }
+            }
+        };
+
+        if (history.Count > 0)
+        {
+            ((JsonObject)request["conversationState"]!)["history"] = history;
+        }
+
+        if (string.Equals(credentials.AuthMethod, AuthMethodSocial, StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(credentials.ProfileArn))
+        {
+            request["profileArn"] = credentials.ProfileArn;
+        }
+
+        return request;
+    }
+
+    private static JsonObject BuildUserInputMessage(
+        string content,
+        string modelId,
+        string origin,
+        List<JsonObject>? images,
+        List<JsonObject>? toolResults,
+        JsonArray? tools)
+    {
+        var userInputMessage = new JsonObject
+        {
+            ["content"] = content,
+            ["modelId"] = modelId,
+            ["origin"] = origin
+        };
+
+        if (images != null && images.Count > 0)
+        {
+            userInputMessage["images"] = new JsonArray(images.ToArray());
+        }
+
+        var context = new JsonObject();
+        if (toolResults != null && toolResults.Count > 0)
+        {
+            context["toolResults"] = new JsonArray(toolResults.ToArray());
+        }
+
+        if (tools != null && tools.Count > 0)
+        {
+            context["tools"] = tools;
+        }
+
+        if (context.Count > 0)
+        {
+            userInputMessage["userInputMessageContext"] = context;
+        }
+
+        return userInputMessage;
+    }
+
+    private static JsonObject BuildUserInputMessageFromParts(
+        KiroMessage message,
+        string modelId,
+        bool includeTools,
+        JsonArray? toolsContext)
+    {
+        var contentBuilder = new StringBuilder();
+        var toolResults = new List<JsonObject>();
+        var images = new List<JsonObject>();
+
+        foreach (var part in message.Parts)
+        {
+            if (part.Type == "text")
+            {
+                contentBuilder.Append(part.Text);
+            }
+            else if (part.Type == "tool_result" && !string.IsNullOrWhiteSpace(part.ToolUseId))
+            {
+                toolResults.Add(new JsonObject
+                {
+                    ["content"] = new JsonArray
+                    {
+                        new JsonObject
+                        {
+                            ["text"] = part.Content ?? string.Empty
+                        }
+                    },
+                    ["status"] = "success",
+                    ["toolUseId"] = part.ToolUseId
+                });
+            }
+            else if (part.Type == "image" && part.Source != null)
+            {
+                images.Add(new JsonObject
+                {
+                    ["format"] = part.Source.MediaType?.Split('/').LastOrDefault(),
+                    ["source"] = new JsonObject
+                    {
+                        ["bytes"] = part.Source.Data ?? string.Empty
+                    }
+                });
+            }
+        }
+
+        var content = contentBuilder.ToString();
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            content = toolResults.Count > 0 ? "Tool results provided." : "Continue";
+        }
+
+        return BuildUserInputMessage(
+            content,
+            modelId,
+            OriginAiEditor,
+            images.Count > 0 ? images : null,
+            toolResults.Count > 0 ? toolResults : null,
+            includeTools ? toolsContext : null);
+    }
+
+    private static JsonObject BuildAssistantResponseMessage(KiroMessage message)
+    {
+        var contentBuilder = new StringBuilder();
+        var toolUses = new List<JsonObject>();
+
+        foreach (var part in message.Parts)
+        {
+            if (part.Type == "text")
+            {
+                contentBuilder.Append(part.Text);
+            }
+            else if (part.Type == "tool_use" && !string.IsNullOrWhiteSpace(part.ToolUseId))
+            {
+                toolUses.Add(new JsonObject
+                {
+                    ["input"] = part.Input ?? new JsonObject(),
+                    ["name"] = part.Name ?? string.Empty,
+                    ["toolUseId"] = part.ToolUseId
+                });
+            }
+        }
+
+        var assistant = new JsonObject
+        {
+            ["content"] = contentBuilder.ToString()
+        };
+
+        if (toolUses.Count > 0)
+        {
+            assistant["toolUses"] = new JsonArray(toolUses.ToArray());
+        }
+
+        return assistant;
+    }
+
+    private static List<KiroMessage> MergeAdjacentMessages(List<KiroMessage> messages)
+    {
+        var merged = new List<KiroMessage>();
+        foreach (var message in messages)
+        {
+            if (merged.Count == 0)
+            {
+                merged.Add(message);
+                continue;
+            }
+
+            var last = merged[^1];
+            if (last.Role == message.Role)
+            {
+                last.Parts.AddRange(message.Parts);
+            }
+            else
+            {
+                merged.Add(message);
+            }
+        }
+
+        return merged;
+    }
+
+    private static string GetMessageText(KiroMessage message)
+    {
+        var builder = new StringBuilder();
+        foreach (var part in message.Parts)
+        {
+            if (part.Type == "text")
+            {
+                builder.Append(part.Text);
+            }
+        }
+
+        return builder.ToString();
+    }
+
+    private static JsonArray? BuildToolSpecificationsFromAnthropic(IList<AnthropicMessageTool>? tools)
+    {
+        if (tools == null || tools.Count == 0)
+        {
+            return null;
+        }
+
+        var array = new JsonArray();
+        foreach (var tool in tools)
+        {
+            if (string.IsNullOrWhiteSpace(tool.Name))
+            {
+                continue;
+            }
+
+            var schema = tool.InputSchema == null
+                ? new JsonObject()
+                : JsonSerializer.SerializeToNode(tool.InputSchema, JsonOptions.DefaultOptions) ?? new JsonObject();
+
+            array.Add(new JsonObject
+            {
+                ["toolSpecification"] = new JsonObject
+                {
+                    ["name"] = tool.Name,
+                    ["description"] = tool.Description ?? string.Empty,
+                    ["inputSchema"] = new JsonObject
+                    {
+                        ["json"] = schema
+                    }
+                }
+            });
+        }
+
+        return array.Count == 0 ? null : array;
+    }
+
+    private static JsonArray? BuildToolSpecificationsFromOpenAi(List<ThorToolDefinition>? tools)
+    {
+        if (tools == null || tools.Count == 0)
+        {
+            return null;
+        }
+
+        var array = new JsonArray();
+        foreach (var tool in tools)
+        {
+            var function = tool.Function;
+            if (function == null || string.IsNullOrWhiteSpace(function.Name))
+            {
+                continue;
+            }
+
+            var schema = function.Parameters == null
+                ? new JsonObject()
+                : JsonSerializer.SerializeToNode(function.Parameters, JsonOptions.DefaultOptions) ?? new JsonObject();
+
+            array.Add(new JsonObject
+            {
+                ["toolSpecification"] = new JsonObject
+                {
+                    ["name"] = function.Name,
+                    ["description"] = function.Description ?? string.Empty,
+                    ["inputSchema"] = new JsonObject
+                    {
+                        ["json"] = schema
+                    }
+                }
+            });
+        }
+
+        return array.Count == 0 ? null : array;
+    }
+
+    private static string? BuildAnthropicSystemPrompt(AnthropicInput input)
+    {
+        if (!string.IsNullOrWhiteSpace(input.System))
+        {
+            return input.System;
+        }
+
+        if (input.Systems == null || input.Systems.Count == 0)
+        {
+            return null;
+        }
+
+        var builder = new StringBuilder();
+        foreach (var item in input.Systems)
+        {
+            if (item.Type == "text" && !string.IsNullOrWhiteSpace(item.Text))
+            {
+                if (builder.Length > 0)
+                {
+                    builder.Append('\n');
+                }
+                builder.Append(item.Text);
+            }
+        }
+
+        return builder.Length == 0 ? null : builder.ToString();
+    }
+
+    private static List<KiroMessage> ConvertAnthropicMessages(AnthropicInput input)
+    {
+        var result = new List<KiroMessage>();
+
+        foreach (var message in input.Messages)
+        {
+            var parts = new List<KiroMessagePart>();
+
+            if (message.Contents != null)
+            {
+                foreach (var content in message.Contents)
+                {
+                    if (content.Type == "text")
+                    {
+                        parts.Add(new KiroMessagePart("text") { Text = content.Text ?? content.Content?.ToString() });
+                    }
+                    else if (content.Type == "tool_use")
+                    {
+                        var toolId = content.Id ?? content.ToolUseId;
+                        parts.Add(new KiroMessagePart("tool_use")
+                        {
+                            ToolUseId = toolId,
+                            Name = content.Name,
+                            Input = content.Input != null
+                                ? JsonSerializer.SerializeToNode(content.Input, JsonOptions.DefaultOptions)
+                                : new JsonObject()
+                        });
+                    }
+                    else if (content.Type == "tool_result")
+                    {
+                        parts.Add(new KiroMessagePart("tool_result")
+                        {
+                            ToolUseId = content.ToolUseId,
+                            Content = content.Content?.ToString() ?? content.Text
+                        });
+                    }
+                    else if (content.Type == "image" && content.Source != null)
+                    {
+                        parts.Add(new KiroMessagePart("image")
+                        {
+                            Source = new KiroImageSource(content.Source.MediaType, content.Source.Data)
+                        });
+                    }
+                }
+            }
+            else if (!string.IsNullOrWhiteSpace(message.Content))
+            {
+                parts.Add(new KiroMessagePart("text") { Text = message.Content });
+            }
+
+            result.Add(new KiroMessage(message.Role, parts));
+        }
+
+        return result;
+    }
+
+    private static (string? SystemPrompt, List<KiroMessage> Messages) ConvertOpenAiMessages(IList<ThorChatMessage> messages)
+    {
+        var systemBuilder = new StringBuilder();
+        var result = new List<KiroMessage>();
+
+        foreach (var message in messages)
+        {
+            if (message.Role == "system")
+            {
+                if (!string.IsNullOrWhiteSpace(message.Content))
+                {
+                    if (systemBuilder.Length > 0)
+                    {
+                        systemBuilder.Append("\n\n");
+                    }
+                    systemBuilder.Append(message.Content);
+                }
+                continue;
+            }
+
+            if (message.Role == "tool")
+            {
+                var toolResult = new KiroMessagePart("tool_result")
+                {
+                    ToolUseId = message.ToolCallId,
+                    Content = message.Content ?? string.Empty
+                };
+                result.Add(new KiroMessage("user", new List<KiroMessagePart> { toolResult }));
+                continue;
+            }
+
+            var parts = new List<KiroMessagePart>();
+            if (!string.IsNullOrWhiteSpace(message.Content))
+            {
+                parts.Add(new KiroMessagePart("text") { Text = message.Content });
+            }
+
+            if (message.Contents != null)
+            {
+                foreach (var content in message.Contents)
+                {
+                    if (content.Type == "text")
+                    {
+                        parts.Add(new KiroMessagePart("text") { Text = content.Text });
+                    }
+                    else if (content.Type == "image_url" && content.ImageUrl?.Url != null)
+                    {
+                        parts.Add(new KiroMessagePart("text")
+                        {
+                            Text = $"[image] {content.ImageUrl.Url}"
+                        });
+                    }
+                }
+            }
+
+            if (message.ToolCalls != null && message.ToolCalls.Count > 0)
+            {
+                foreach (var toolCall in message.ToolCalls)
+                {
+                    var arguments = toolCall.Function?.Arguments ?? "{}";
+                    JsonNode? input = null;
+                    try
+                    {
+                        input = JsonNode.Parse(arguments);
+                    }
+                    catch
+                    {
+                        input = new JsonObject { ["raw_arguments"] = arguments };
+                    }
+
+                    parts.Add(new KiroMessagePart("tool_use")
+                    {
+                        ToolUseId = toolCall.Id ?? Guid.NewGuid().ToString("N"),
+                        Name = toolCall.Function?.Name,
+                        Input = input
+                    });
+                }
+            }
+
+            result.Add(new KiroMessage(message.Role, parts));
+        }
+
+        return (systemBuilder.Length == 0 ? null : systemBuilder.ToString(), result);
+    }
+
+    private static int EstimateInputTokens(string? systemPrompt, List<KiroMessage> messages, JsonArray? tools)
+    {
+        var total = 0;
+        if (!string.IsNullOrWhiteSpace(systemPrompt))
+        {
+            total += CountTokens(systemPrompt);
+        }
+
+        foreach (var message in messages)
+        {
+            total += CountTokens(GetMessageText(message));
+            foreach (var part in message.Parts)
+            {
+                if (part.Type == "tool_use" && part.Input != null)
+                {
+                    total += CountTokens(part.Input.ToJsonString(JsonOptions.DefaultOptions));
+                }
+                else if (part.Type == "tool_result" && !string.IsNullOrWhiteSpace(part.Content))
+                {
+                    total += CountTokens(part.Content);
+                }
+            }
+        }
+
+        if (tools != null)
+        {
+            total += CountTokens(tools.ToJsonString(JsonOptions.DefaultOptions));
+        }
+
+        return total;
+    }
+
+    private static int CountTokens(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return 0;
+        }
+
+        return (int)Math.Ceiling(text.Length / 4.0);
+    }
+
+    private static (string Content, List<KiroToolCall> ToolCalls) ParseKiroResponse(string raw)
+    {
+        var contentBuilder = new StringBuilder();
+        var toolCalls = new List<KiroToolCall>();
+        ToolCallAccumulator? currentTool = null;
+
+        var (events, _) = ParseAwsEventStreamBuffer(raw);
+        foreach (var ev in events)
+        {
+            if (ev.Type == KiroStreamEventType.Content && !string.IsNullOrEmpty(ev.Content))
+            {
+                contentBuilder.Append(ev.Content);
+            }
+            else if (ev.Type == KiroStreamEventType.ToolUse && ev.ToolUse != null)
+            {
+                currentTool = new ToolCallAccumulator(ev.ToolUse.ToolUseId, ev.ToolUse.Name);
+                if (!string.IsNullOrEmpty(ev.ToolUse.Input))
+                {
+                    currentTool.Input.Append(ev.ToolUse.Input);
+                }
+
+                if (ev.ToolUse.Stop)
+                {
+                    toolCalls.Add(currentTool.ToToolCall());
+                    currentTool = null;
+                }
+            }
+            else if (ev.Type == KiroStreamEventType.ToolUseInput && currentTool != null)
+            {
+                currentTool.Input.Append(ev.ToolInput);
+            }
+            else if (ev.Type == KiroStreamEventType.ToolUseStop && currentTool != null)
+            {
+                toolCalls.Add(currentTool.ToToolCall());
+                currentTool = null;
+            }
+        }
+
+        if (currentTool != null)
+        {
+            toolCalls.Add(currentTool.ToToolCall());
+        }
+
+        var bracketToolCalls = ParseBracketToolCalls(raw);
+        if (bracketToolCalls.Count > 0)
+        {
+            toolCalls.AddRange(bracketToolCalls);
+        }
+
+        toolCalls = DeduplicateToolCalls(toolCalls);
+        var cleaned = RemoveBracketToolCalls(contentBuilder.ToString(), toolCalls);
+
+        return (cleaned, toolCalls);
+    }
+
+    private static List<KiroToolCall> ParseBracketToolCalls(string responseText)
+    {
+        if (string.IsNullOrWhiteSpace(responseText) || !responseText.Contains("[Called", StringComparison.Ordinal))
+        {
+            return new List<KiroToolCall>();
+        }
+
+        var toolCalls = new List<KiroToolCall>();
+        var callPositions = new List<int>();
+        var start = 0;
+
+        while (true)
+        {
+            var pos = responseText.IndexOf("[Called", start, StringComparison.Ordinal);
+            if (pos == -1)
+            {
+                break;
+            }
+            callPositions.Add(pos);
+            start = pos + 1;
+        }
+
+        for (var i = 0; i < callPositions.Count; i++)
+        {
+            var startPos = callPositions[i];
+            var endLimit = i + 1 < callPositions.Count ? callPositions[i + 1] : responseText.Length;
+            var segment = responseText.Substring(startPos, endLimit - startPos);
+            var bracketEnd = FindMatchingBracket(segment, 0);
+            if (bracketEnd == -1)
+            {
+                var lastBracket = segment.LastIndexOf(']');
+                if (lastBracket == -1)
+                {
+                    continue;
+                }
+                bracketEnd = lastBracket;
+            }
+
+            var toolCallText = segment.Substring(0, bracketEnd + 1);
+            var parsed = ParseSingleToolCall(toolCallText);
+            if (parsed != null)
+            {
+                toolCalls.Add(parsed);
+            }
+        }
+
+        return toolCalls;
+    }
+
+    private static int FindMatchingBracket(string text, int startPos)
+    {
+        if (string.IsNullOrEmpty(text) || startPos >= text.Length || text[startPos] != '[')
+        {
+            return -1;
+        }
+
+        var bracketCount = 1;
+        var inString = false;
+        var escapeNext = false;
+
+        for (var i = startPos + 1; i < text.Length; i++)
+        {
+            var ch = text[i];
+
+            if (escapeNext)
+            {
+                escapeNext = false;
+                continue;
+            }
+
+            if (ch == '\\' && inString)
+            {
+                escapeNext = true;
+                continue;
+            }
+
+            if (ch == '"')
+            {
+                inString = !inString;
+                continue;
+            }
+
+            if (!inString)
+            {
+                if (ch == '[')
+                {
+                    bracketCount++;
+                }
+                else if (ch == ']')
+                {
+                    bracketCount--;
+                    if (bracketCount == 0)
+                    {
+                        return i;
+                    }
+                }
+            }
+        }
+
+        return -1;
+    }
+
+    private static KiroToolCall? ParseSingleToolCall(string toolCallText)
+    {
+        var nameMatch = Regex.Match(toolCallText, "\\[Called\\s+(\\w+)\\s+with\\s+args:", RegexOptions.IgnoreCase);
+        if (!nameMatch.Success)
+        {
+            return null;
+        }
+
+        var functionName = nameMatch.Groups[1].Value.Trim();
+        var argsStart = toolCallText.IndexOf("with args:", StringComparison.OrdinalIgnoreCase);
+        if (argsStart < 0)
+        {
+            return null;
+        }
+
+        argsStart += "with args:".Length;
+        var argsEnd = toolCallText.LastIndexOf(']');
+        if (argsEnd <= argsStart)
+        {
+            return null;
+        }
+
+        var jsonCandidate = toolCallText.Substring(argsStart, argsEnd - argsStart).Trim();
+        try
+        {
+            var repaired = RepairJson(jsonCandidate);
+            using var doc = JsonDocument.Parse(repaired);
+            var toolCallId = $"call_{Guid.NewGuid():N}"[..16];
+            return new KiroToolCall(toolCallId, functionName, doc.RootElement.GetRawText());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string RepairJson(string json)
+    {
+        var repaired = Regex.Replace(json, ",\\s*([}\\]])", "$1");
+        repaired = Regex.Replace(repaired, "([{,]\\s*)([a-zA-Z0-9_]+?)\\s*:", "$1\"$2\":");
+        repaired = Regex.Replace(repaired, ":\\s*([a-zA-Z0-9_]+)(?=[,\\}\\]])", ":\"$1\"");
+        return repaired;
+    }
+
+    private static List<KiroToolCall> DeduplicateToolCalls(List<KiroToolCall> toolCalls)
+    {
+        var seen = new HashSet<string>();
+        var unique = new List<KiroToolCall>();
+        foreach (var call in toolCalls)
+        {
+            var key = $"{call.Name}-{call.Arguments}";
+            if (seen.Add(key))
+            {
+                unique.Add(call);
+            }
+        }
+
+        return unique;
+    }
+
+    private static string RemoveBracketToolCalls(string content, List<KiroToolCall> toolCalls)
+    {
+        var cleaned = content;
+        foreach (var toolCall in toolCalls)
+        {
+            if (string.IsNullOrWhiteSpace(toolCall.Name))
+            {
+                continue;
+            }
+
+            var escapedName = Regex.Escape(toolCall.Name);
+            var pattern = $"\\[Called\\s+{escapedName}\\s+with\\s+args:\\s*\\{{[^}}]*(?:\\{{[^}}]*\\}}[^}}]*)*\\}}\\]";
+            cleaned = Regex.Replace(cleaned, pattern, string.Empty, RegexOptions.Singleline);
+        }
+
+        return Regex.Replace(cleaned, "\\s+", " ").Trim();
+    }
+
+    private static JsonObject BuildAnthropicResponse(
+        string content,
+        List<KiroToolCall> toolCalls,
+        string model,
+        int inputTokens)
+    {
+        var messageId = Guid.NewGuid().ToString();
+        var contentArray = new JsonArray();
+        var outputTokens = 0;
+        var stopReason = "end_turn";
+
+        if (toolCalls.Count > 0)
+        {
+            foreach (var call in toolCalls)
+            {
+                var inputNode = BuildToolInputNode(call.Arguments);
+                contentArray.Add(new JsonObject
+                {
+                    ["type"] = "tool_use",
+                    ["id"] = call.Id,
+                    ["name"] = call.Name,
+                    ["input"] = inputNode
+                });
+                outputTokens += CountTokens(call.Arguments);
+            }
+            stopReason = "tool_use";
+        }
+        else
+        {
+            contentArray.Add(new JsonObject
+            {
+                ["type"] = "text",
+                ["text"] = content
+            });
+            outputTokens += CountTokens(content);
+        }
+
+        return new JsonObject
+        {
+            ["id"] = messageId,
+            ["type"] = "message",
+            ["role"] = "assistant",
+            ["model"] = model,
+            ["stop_reason"] = stopReason,
+            ["stop_sequence"] = null,
+            ["usage"] = new JsonObject
+            {
+                ["input_tokens"] = inputTokens,
+                ["cache_creation_input_tokens"] = 0,
+                ["cache_read_input_tokens"] = 0,
+                ["output_tokens"] = outputTokens
+            },
+            ["content"] = contentArray
+        };
+    }
+
+    private static JsonObject BuildOpenAiResponse(
+        string content,
+        List<KiroToolCall> toolCalls,
+        string model,
+        int inputTokens)
+    {
+        var choices = new JsonArray();
+        var message = new JsonObject
+        {
+            ["role"] = "assistant"
+        };
+
+        string? finishReason;
+        if (toolCalls.Count > 0)
+        {
+            message["tool_calls"] = BuildOpenAiToolCalls(toolCalls, includeIndex: false);
+            message["content"] = string.IsNullOrWhiteSpace(content) ? null : content;
+            finishReason = "tool_calls";
+        }
+        else
+        {
+            message["content"] = content;
+            finishReason = "stop";
+        }
+
+        choices.Add(new JsonObject
+        {
+            ["index"] = 0,
+            ["message"] = message,
+            ["finish_reason"] = finishReason
+        });
+
+        var outputTokens = CountTokens(content) + toolCalls.Sum(call => CountTokens(call.Arguments));
+        return new JsonObject
+        {
+            ["id"] = Guid.NewGuid().ToString(),
+            ["object"] = "chat.completion",
+            ["created"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+            ["model"] = model,
+            ["choices"] = choices,
+            ["usage"] = new JsonObject
+            {
+                ["prompt_tokens"] = inputTokens,
+                ["completion_tokens"] = outputTokens,
+                ["total_tokens"] = inputTokens + outputTokens
+            }
+        };
+    }
+
+    private static JsonArray BuildOpenAiToolCalls(List<KiroToolCall> toolCalls, bool includeIndex)
+    {
+        var array = new JsonArray();
+        for (var i = 0; i < toolCalls.Count; i++)
+        {
+            var call = toolCalls[i];
+            var toolCall = new JsonObject
+            {
+                ["id"] = call.Id,
+                ["type"] = "function",
+                ["function"] = new JsonObject
+                {
+                    ["name"] = call.Name,
+                    ["arguments"] = string.IsNullOrWhiteSpace(call.Arguments) ? "{}" : call.Arguments
+                }
+            };
+
+            if (includeIndex)
+            {
+                toolCall["index"] = i;
+            }
+
+            array.Add(toolCall);
+        }
+
+        return array;
+    }
+
+    private static JsonNode BuildToolInputNode(string? arguments)
+    {
+        if (string.IsNullOrWhiteSpace(arguments))
+        {
+            return new JsonObject();
+        }
+
+        try
+        {
+            return JsonNode.Parse(arguments) ?? new JsonObject();
+        }
+        catch
+        {
+            return new JsonObject { ["raw_arguments"] = arguments };
+        }
+    }
+
+    private static (List<KiroStreamEvent> Events, string Remaining) ParseAwsEventStreamBuffer(string buffer)
+    {
+        var events = new List<KiroStreamEvent>();
+        var remaining = buffer;
+        var searchStart = 0;
+
+        while (true)
+        {
+            var contentStart = remaining.IndexOf("{\"content\":", searchStart, StringComparison.Ordinal);
+            var nameStart = remaining.IndexOf("{\"name\":", searchStart, StringComparison.Ordinal);
+            var followupStart = remaining.IndexOf("{\"followupPrompt\":", searchStart, StringComparison.Ordinal);
+            var inputStart = remaining.IndexOf("{\"input\":", searchStart, StringComparison.Ordinal);
+            var stopStart = remaining.IndexOf("{\"stop\":", searchStart, StringComparison.Ordinal);
+
+            var candidates = new[] { contentStart, nameStart, followupStart, inputStart, stopStart }
+                .Where(pos => pos >= 0)
+                .ToList();
+
+            if (candidates.Count == 0)
+            {
+                break;
+            }
+
+            var jsonStart = candidates.Min();
+            if (jsonStart < 0)
+            {
+                break;
+            }
+
+            var braceCount = 0;
+            var jsonEnd = -1;
+            var inString = false;
+            var escapeNext = false;
+
+            for (var i = jsonStart; i < remaining.Length; i++)
+            {
+                var ch = remaining[i];
+
+                if (escapeNext)
+                {
+                    escapeNext = false;
+                    continue;
+                }
+
+                if (ch == '\\')
+                {
+                    escapeNext = true;
+                    continue;
+                }
+
+                if (ch == '"')
+                {
+                    inString = !inString;
+                    continue;
+                }
+
+                if (!inString)
+                {
+                    if (ch == '{')
+                    {
+                        braceCount++;
+                    }
+                    else if (ch == '}')
+                    {
+                        braceCount--;
+                        if (braceCount == 0)
+                        {
+                            jsonEnd = i;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (jsonEnd < 0)
+            {
+                remaining = remaining.Substring(jsonStart);
+                break;
+            }
+
+            var jsonStr = remaining.Substring(jsonStart, jsonEnd - jsonStart + 1);
+            try
+            {
+                using var doc = JsonDocument.Parse(jsonStr);
+                var root = doc.RootElement;
+
+                if (root.TryGetProperty("content", out var contentElement)
+                    && !root.TryGetProperty("followupPrompt", out _))
+                {
+                    events.Add(new KiroStreamEvent(KiroStreamEventType.Content)
+                    {
+                        Content = contentElement.GetString()
+                    });
+                }
+                else if (root.TryGetProperty("name", out var nameElement)
+                    && root.TryGetProperty("toolUseId", out var toolUseIdElement))
+                {
+                    events.Add(new KiroStreamEvent(KiroStreamEventType.ToolUse)
+                    {
+                        ToolUse = new KiroToolUseEvent(
+                            nameElement.GetString() ?? string.Empty,
+                            toolUseIdElement.GetString() ?? Guid.NewGuid().ToString("N"),
+                            root.TryGetProperty("input", out var inputElement) ? inputElement.GetString() : null,
+                            root.TryGetProperty("stop", out var stopElement) && stopElement.ValueKind == JsonValueKind.True)
+                    });
+                }
+                else if (root.TryGetProperty("input", out var inputOnlyElement)
+                    && !root.TryGetProperty("name", out _))
+                {
+                    events.Add(new KiroStreamEvent(KiroStreamEventType.ToolUseInput)
+                    {
+                        ToolInput = inputOnlyElement.GetString()
+                    });
+                }
+                else if (root.TryGetProperty("stop", out var stopOnlyElement))
+                {
+                    events.Add(new KiroStreamEvent(KiroStreamEventType.ToolUseStop)
+                    {
+                        ToolStop = stopOnlyElement.ValueKind == JsonValueKind.True
+                    });
+                }
+            }
+            catch
+            {
+                // ignore parse errors
+            }
+
+            searchStart = jsonEnd + 1;
+            if (searchStart >= remaining.Length)
+            {
+                remaining = string.Empty;
+                break;
+            }
+        }
+
+        if (searchStart > 0 && remaining.Length > 0)
+        {
+            remaining = remaining.Substring(searchStart);
+        }
+
+        return (events, remaining);
+    }
+
+    private static async Task WriteAnthropicError(HttpContext context, int statusCode, string message, string errorType)
+    {
+        context.Response.StatusCode = statusCode;
+        context.Response.ContentType = "application/json";
+        var payload = new Dictionary<string, object?>
+        {
+            ["type"] = "error",
+            ["error"] = new Dictionary<string, object?>
+            {
+                ["type"] = errorType,
+                ["message"] = message
+            }
+        };
+
+        await context.Response.WriteAsync(JsonSerializer.Serialize(payload));
+    }
+
+    private static async Task WriteOpenAIErrorResponse(HttpContext context, string message, int statusCode)
+    {
+        context.Response.ContentType = "application/json; charset=utf-8";
+        context.Response.StatusCode = statusCode;
+        var payload = new JsonObject
+        {
+            ["error"] = new JsonObject
+            {
+                ["message"] = message,
+                ["type"] = "api_error",
+                ["code"] = statusCode
+            }
+        };
+        await context.Response.WriteAsync(payload.ToJsonString(JsonOptions.DefaultOptions));
+    }
+
+    private static async Task WriteSseJsonAsync(HttpContext context, JsonObject json, CancellationToken ct)
+    {
+        await context.Response.WriteAsync("data: ", ct);
+        await context.Response.WriteAsync(json.ToJsonString(JsonOptions.DefaultOptions), ct);
+        await context.Response.WriteAsync("\n\n", ct);
+        await context.Response.Body.FlushAsync(ct);
+    }
+
+    private static async Task WriteSseDoneAsync(HttpContext context, CancellationToken ct)
+    {
+        await context.Response.WriteAsync("data: [DONE]\n\n", ct);
+        await context.Response.Body.FlushAsync(ct);
+    }
+
+    private sealed class KiroMessage(string role, List<KiroMessagePart> parts)
+    {
+        public string Role { get; } = role;
+        public List<KiroMessagePart> Parts { get; } = parts;
+
+        public KiroMessage Clone()
+        {
+            return new KiroMessage(Role, Parts.Select(part => part.Clone()).ToList());
+        }
+    }
+
+    private sealed class KiroMessagePart(string type)
+    {
+        public string Type { get; } = type;
+        public string? Text { get; init; }
+        public string? ToolUseId { get; init; }
+        public string? Name { get; init; }
+        public JsonNode? Input { get; init; }
+        public string? Content { get; init; }
+        public KiroImageSource? Source { get; init; }
+
+        public KiroMessagePart Clone()
+        {
+            return new KiroMessagePart(Type)
+            {
+                Text = Text,
+                ToolUseId = ToolUseId,
+                Name = Name,
+                Input = Input,
+                Content = Content,
+                Source = Source
+            };
+        }
+    }
+
+    private sealed class KiroImageSource(string? mediaType, string? data)
+    {
+        public string? MediaType { get; } = mediaType;
+        public string? Data { get; } = data;
+    }
+
+    private sealed record KiroToolCall(string Id, string Name, string Arguments);
+
+    private sealed class ToolCallAccumulator
+    {
+        public ToolCallAccumulator(string toolUseId, string name)
+        {
+            ToolUseId = string.IsNullOrWhiteSpace(toolUseId) ? Guid.NewGuid().ToString("N") : toolUseId;
+            Name = name;
+        }
+
+        public string ToolUseId { get; }
+        public string Name { get; }
+        public StringBuilder Input { get; } = new();
+
+        public KiroToolCall ToToolCall()
+        {
+            var args = Input.ToString();
+            return new KiroToolCall(ToolUseId, Name, string.IsNullOrWhiteSpace(args) ? "{}" : args);
+        }
+    }
+
+    private enum KiroStreamEventType
+    {
+        Content,
+        ToolUse,
+        ToolUseInput,
+        ToolUseStop
+    }
+
+    private sealed class KiroStreamEvent(KiroStreamEventType type)
+    {
+        public KiroStreamEventType Type { get; } = type;
+        public string? Content { get; init; }
+        public KiroToolUseEvent? ToolUse { get; init; }
+        public string? ToolInput { get; init; }
+        public bool? ToolStop { get; init; }
+    }
+
+    private sealed record KiroToolUseEvent(string Name, string ToolUseId, string? Input, bool Stop);
+}

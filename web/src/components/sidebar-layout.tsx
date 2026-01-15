@@ -1,7 +1,7 @@
 'use client';
 
 import { motion } from 'motion/react';
-import { LayoutDashboard, User, FileText, Settings } from 'lucide-react';
+import { LayoutDashboard, User, FileText, Settings, Sliders } from 'lucide-react';
 import { useState } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import {
@@ -44,6 +44,11 @@ const settingsItems = [
     icon: Settings,
     id: 'settings',
   },
+  {
+    label: '模型映射',
+    icon: Sliders,
+    id: 'model-mapping',
+  },
 ];
 
 export interface SidebarLayoutProps {
@@ -62,6 +67,7 @@ export function SidebarLayout({
     const path = location.pathname;
     if (path.includes('/accounts')) return 'account';
     if (path.includes('/logs')) return 'logs';
+    if (path.includes('/model-mapping')) return 'model-mapping';
     if (path.includes('/settings')) return 'settings';
     return 'home';
   };
@@ -82,6 +88,7 @@ export function SidebarLayout({
       'account': '/accounts',
       'logs': '/logs',
       'settings': '/settings',
+      'model-mapping': '/model-mapping',
     };
     const path = pathMap[menuId] || '/';
     navigate(path);

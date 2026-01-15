@@ -1,5 +1,13 @@
 import { get, del, post, patch } from './api'
-import type { AIAccountDto, GenerateOAuthUrlResponse, ExchangeOAuthCodeRequest, AccountQuotaStatus } from '@/types/account'
+import type {
+  AIAccountDto,
+  GenerateOAuthUrlResponse,
+  ExchangeOAuthCodeRequest,
+  AccountQuotaStatus,
+  GenerateFactoryDeviceCodeResponse,
+  ExchangeFactoryDeviceCodeRequest,
+  ImportKiroCredentialsRequest,
+} from '@/types/account'
 
 /**
  * AI 账户服务
@@ -46,6 +54,27 @@ export const accountService = {
   refreshAntigravityQuotaStatus(accountId: number): Promise<AccountQuotaStatus> {
     return post<AccountQuotaStatus>(`/accounts/${accountId}/refresh-antigravity-quota`, {})
   },
+
+  /**
+   * 刷新 Claude 账户配额状态
+   */
+  refreshClaudeQuotaStatus(accountId: number): Promise<AccountQuotaStatus> {
+    return post<AccountQuotaStatus>(`/accounts/${accountId}/refresh-claude-quota`, {})
+  },
+
+  /**
+   * 刷新 Factory 账户配额状态
+   */
+  refreshFactoryQuotaStatus(accountId: number): Promise<AccountQuotaStatus> {
+    return post<AccountQuotaStatus>(`/accounts/${accountId}/refresh-factory-quota`, {})
+  },
+
+  /**
+   * 获取 Gemini Antigravity 可用模型列表
+   */
+  getAntigravityModels(accountId: number): Promise<string[]> {
+    return get<string[]>(`/accounts/${accountId}/antigravity-models`)
+  },
 }
 
 /**
@@ -66,6 +95,48 @@ export const openaiOAuthService = {
    */
   exchangeOAuthCode(request: ExchangeOAuthCodeRequest): Promise<AIAccountDto> {
     return post<AIAccountDto>('/openai/oauth/callback', request)
+  },
+}
+
+/**
+ * Claude OAuth 服务
+ */
+export const claudeOAuthService = {
+  /**
+   * 生成 Claude OAuth 授权链接
+   */
+  generateOAuthUrl(proxy?: any): Promise<GenerateOAuthUrlResponse> {
+    return post<GenerateOAuthUrlResponse>('/claude/oauth/authorize', {
+      proxy: proxy || null
+    })
+  },
+
+  /**
+   * 交换授权码获取 Token 并创建账户
+   */
+  exchangeOAuthCode(request: ExchangeOAuthCodeRequest): Promise<AIAccountDto> {
+    return post<AIAccountDto>('/claude/oauth/callback', request)
+  },
+}
+
+/**
+ * Factory OAuth（WorkOS 设备码）服务
+ */
+export const factoryOAuthService = {
+  /**
+   * 生成 Factory OAuth Device Code
+   */
+  generateDeviceCode(proxy?: any): Promise<GenerateFactoryDeviceCodeResponse> {
+    return post<GenerateFactoryDeviceCodeResponse>('/factory/oauth/authorize', {
+      proxy: proxy || null,
+    })
+  },
+
+  /**
+   * 完成设备码授权并创建账户（服务端会轮询授权结果）
+   */
+  exchangeDeviceCode(request: ExchangeFactoryDeviceCodeRequest): Promise<AIAccountDto> {
+    return post<AIAccountDto>('/factory/oauth/callback', request, { timeout: 360000 })
   },
 }
 
@@ -108,5 +179,17 @@ export const geminiAntigravityOAuthService = {
    */
   exchangeOAuthCode(request: ExchangeOAuthCodeRequest): Promise<AIAccountDto> {
     return post<AIAccountDto>('/gemini/oauth/callback', request)
+  },
+}
+
+/**
+ * Kiro credentials import service
+ */
+export const kiroOAuthService = {
+  /**
+   * Import Kiro credentials and create account
+   */
+  importCredentials(request: ImportKiroCredentialsRequest): Promise<AIAccountDto> {
+    return post<AIAccountDto>('/kiro/oauth/import', request)
   },
 }

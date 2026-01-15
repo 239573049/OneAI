@@ -2,6 +2,10 @@
 
 public class AIPrompt
 {
+    public const string FactoryCLI = "You are Droid, an AI software engineering agent built by Factory.";
+    
+    public const string AnthropicCLI = "You are Claude Code, Anthropic's official CLI for Claude.";
+    
     public const string CodeXPrompt =
         """
         You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI. You are expected to be precise, safe, and helpful.

@@ -1,11 +1,21 @@
 using System.Net;
 using System.Text;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Net.Security;
+using System.Security.Authentication;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Linq;
+using System.Text.Json.Nodes;
+using ClaudeCodeProxy.Abstraction;
 using OneAI.Constants;
 using OneAI.Entities;
 using OneAI.Services.AI.Anthropic;
+using OneAI.Services.ClaudeCodeOAuth;
+using OneAI.Services.FactoryOAuth;
 using OneAI.Services.GeminiOAuth;
 using OneAI.Services.Logging;
 using Thor.Abstractions.Anthropic;
@@ -17,12 +27,17 @@ public class AnthropicService(
     AIRequestLogService requestLogService,
     ILogger<AnthropicService> logger,
     IConfiguration configuration,
-    GeminiAntigravityOAuthService geminiAntigravityOAuthService)
+    IModelMappingService modelMappingService,
+    ClaudeCodeOAuthService claudeCodeOAuthService,
+    GeminiAntigravityOAuthService geminiAntigravityOAuthService,
+    FactoryOAuthService factoryOAuthService)
 {
-    private static readonly HttpClient HttpClient = new()
-    {
-        Timeout = TimeSpan.FromMinutes(30)
-    };
+    private static readonly HttpClient HttpClient = CreateHttpClient();
+
+    private static readonly bool SkipTlsValidation =
+        Environment.GetEnvironmentVariable("ANTIGRAVITY_SKIP_TLS_VALIDATE")
+            ?.Equals("true", StringComparison.OrdinalIgnoreCase) == true;
+
     private const int MaxRetries = 15;
 
     private static readonly string[] ClientErrorKeywords =
@@ -30,6 +45,35 @@ public class AnthropicService(
         "invalid_request_error",
         "missing_required_parameter"
     ];
+
+    private static HttpClient CreateHttpClient()
+    {
+        var handler = new SocketsHttpHandler
+        {
+            AutomaticDecompression = DecompressionMethods.All,
+            PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+            AllowAutoRedirect = false,
+            SslOptions = new SslClientAuthenticationOptions
+            {
+                EnabledSslProtocols = SslProtocols.Tls12 | SslProtocols.Tls13,
+                RemoteCertificateValidationCallback = SkipTlsValidation
+                    ? new RemoteCertificateValidationCallback((_, _, _, _) => true)
+                    : null
+            }
+        };
+
+        var client = new HttpClient(handler)
+        {
+            Timeout = TimeSpan.FromMinutes(30),
+            DefaultRequestVersion = HttpVersion.Version20,
+            DefaultVersionPolicy = HttpVersionPolicy.RequestVersionOrLower
+        };
+
+        client.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("gzip"));
+        client.DefaultRequestHeaders.AcceptEncoding.Add(new StringWithQualityHeaderValue("deflate"));
+
+        return client;
+    }
 
     public async Task Execute(HttpContext context, AnthropicInput input, AIAccountService aiAccountService)
     {
@@ -43,18 +87,7 @@ public class AnthropicService(
             return;
         }
 
-        AIProviderAsyncLocal.AIProviderIds = new List<int>();
-        var components = ConvertAnthropicRequestToAntigravityComponents(input);
-        if (components.Contents.Count == 0)
-        {
-            await WriteAnthropicError(
-                context,
-                StatusCodes.Status400BadRequest,
-                "messages 不能为空；text 内容块必须包含非空白文本",
-                "invalid_request_error");
-            return;
-        }
-
+        AIProviderAsyncLocal.AIProviderIds = [];
         var (logId, stopwatch) = await requestLogService.CreateRequestLog(
             context,
             input.Model,
@@ -67,7 +100,9 @@ public class AnthropicService(
 
         var returnThoughts = configuration.GetValue("Antigravity:ReturnThoughts", true);
         var estimatedInputTokens = EstimateInputTokens(input);
-        var conversationId = GetConversationId(context);
+        var conversationId = BuildConversationStickyKey(input);
+        var isClaudeCodeRequest = IsClaudeCodeRequest(context);
+        var preferredProvider = isClaudeCodeRequest ? AIProviders.Claude : AIProviders.GeminiAntigravity;
 
         try
         {
@@ -84,29 +119,42 @@ public class AnthropicService(
                     return;
                 }
 
-                logger.LogDebug("尝试第 {Attempt}/{MaxRetries} 次获取 Antigravity 账户", attempt, MaxRetries);
+                logger.LogDebug(
+                    "尝试第 {Attempt}/{MaxRetries} 次获取账户 (首选: {PreferredProvider})",
+                    attempt,
+                    MaxRetries,
+                    preferredProvider);
 
-                AIAccount? account = null;
-                if (!string.IsNullOrEmpty(conversationId))
+                var account = await GetClaudeOrAntigravityAccount(
+                    conversationId,
+                    preferredProvider,
+                    aiAccountService);
+
+                if (account == null)
                 {
-                    var lastAccountId = quotaCache.GetConversationAccount(conversationId);
-                    if (lastAccountId.HasValue)
+                    if (!string.IsNullOrWhiteSpace(lastErrorMessage))
                     {
-                        account = await aiAccountService.TryGetAccountById(lastAccountId.Value);
-                        if (account == null || account.Provider != AIProviders.GeminiAntigravity)
-                        {
-                            account = null;
-                        }
+                        var statusCode = (int)(lastStatusCode ?? HttpStatusCode.ServiceUnavailable);
+                        logger.LogWarning(
+                            "账户池都无可用，返回上一次错误 (状态码: {StatusCode}): {ErrorMessage}",
+                            statusCode,
+                            lastErrorMessage);
+
+                        await requestLogService.RecordFailure(
+                            logId,
+                            stopwatch,
+                            statusCode,
+                            lastErrorMessage);
+
+                        await WriteAnthropicError(
+                            context,
+                            statusCode,
+                            lastErrorMessage,
+                            "api_error");
+
+                        return;
                     }
-                }
 
-                if (account == null)
-                {
-                    account = await aiAccountService.GetAIAccountByProvider(AIProviders.GeminiAntigravity);
-                }
-
-                if (account == null)
-                {
                     const string noAccountMessage = "账户池都无可用";
                     logger.LogWarning(noAccountMessage);
 
@@ -126,54 +174,15 @@ public class AnthropicService(
                 }
 
                 AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
+                await requestLogService.UpdateRetry(logId, attempt, account.Id);
 
-                var geminiOAuth = account.GetGeminiOauth();
-                if (geminiOAuth == null)
+                if (account.Provider == AIProviders.Claude)
                 {
-                    lastErrorMessage = $"账户 {account.Id} 没有有效的 Gemini OAuth 凭证";
-                    lastStatusCode = HttpStatusCode.Unauthorized;
-                    logger.LogWarning(lastErrorMessage);
+                    var claudeOauth = account.GetClaudeOauth();
 
-                    await aiAccountService.DisableAccount(account.Id);
-
-                    if (attempt < MaxRetries)
+                    if (claudeOauth == null || string.IsNullOrWhiteSpace(claudeOauth.AccessToken))
                     {
-                        continue;
-                    }
-
-                    break;
-                }
-
-                if (IsGeminiTokenExpired(geminiOAuth))
-                {
-                    try
-                    {
-                        await geminiAntigravityOAuthService.RefreshGeminiAntigravityOAuthTokenAsync(account);
-                    }
-                    catch (Exception ex)
-                    {
-                        logger.LogWarning(
-                            ex,
-                            "Gemini Antigravity 账户 {AccountId} Token 刷新失败，已禁用账户",
-                            account.Id);
-
-                        lastErrorMessage = $"账户 {account.Id} Token 刷新失败: {ex.Message}";
-                        lastStatusCode = HttpStatusCode.Unauthorized;
-
-                        await aiAccountService.DisableAccount(account.Id);
-
-                        if (attempt < MaxRetries)
-                        {
-                            continue;
-                        }
-
-                        break;
-                    }
-
-                    geminiOAuth = account.GetGeminiOauth();
-                    if (geminiOAuth == null || string.IsNullOrWhiteSpace(geminiOAuth.Token))
-                    {
-                        lastErrorMessage = $"账户 {account.Id} Gemini Token 刷新后仍无效";
+                        lastErrorMessage = $"账户 {account.Id} 没有有效的 Claude Oauth 凭证";
                         lastStatusCode = HttpStatusCode.Unauthorized;
                         logger.LogWarning(lastErrorMessage);
 
@@ -186,140 +195,782 @@ public class AnthropicService(
 
                         break;
                     }
-                }
 
-                var requestBody = BuildAntigravityRequestBody(
-                    components,
-                    geminiOAuth.ProjectId,
-                    sessionId: $"session-{Guid.NewGuid():N}");
-
-                var baseUrl = account.BaseUrl;
-                if (string.IsNullOrWhiteSpace(baseUrl))
-                {
-                    baseUrl = GeminiAntigravityOAuthConfig.AntigravityApiUrl;
-                }
-
-                using var response = await SendAntigravityRequest(
-                    baseUrl,
-                    requestBody,
-                    geminiOAuth.Token,
-                    input.Stream,
-                    context.RequestAborted);
-
-                await requestLogService.UpdateRetry(logId, attempt, account.Id);
-
-                if (response.StatusCode >= HttpStatusCode.BadRequest)
-                {
-                    var error = await response.Content.ReadAsStringAsync();
-                    lastErrorMessage = error;
-                    lastStatusCode = response.StatusCode;
-
-                    logger.LogError(
-                        "Antigravity 请求失败 (账户: {AccountId}, 状态码: {StatusCode}, 尝试: {Attempt}/{MaxRetries}): {Error}",
-                        account.Id,
-                        response.StatusCode,
-                        attempt,
-                        MaxRetries,
-                        error);
-
-                    if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                    if (IsClaudeTokenExpired(claudeOauth))
                     {
+                        try
+                        {
+                            await claudeCodeOAuthService.RefreshClaudeOAuthTokenAsync(account);
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogWarning(
+                                ex,
+                                "Claude 账户 {AccountId} Token 已过期且刷新失败，已禁用账户",
+                                account.Id);
+
+                            lastErrorMessage = $"账户 {account.Id} Token 刷新失败: {ex.Message}";
+                            lastStatusCode = HttpStatusCode.Unauthorized;
+
+                            await aiAccountService.DisableAccount(account.Id);
+
+                            if (attempt < MaxRetries)
+                            {
+                                continue;
+                            }
+
+                            break;
+                        }
+
+                        claudeOauth = account.GetClaudeOauth();
+                        if (claudeOauth == null || string.IsNullOrWhiteSpace(claudeOauth.AccessToken))
+                        {
+                            lastErrorMessage = $"账户 {account.Id} Claude Token 刷新后仍无效";
+                            lastStatusCode = HttpStatusCode.Unauthorized;
+                            logger.LogWarning(lastErrorMessage);
+
+                            await aiAccountService.DisableAccount(account.Id);
+
+                            if (attempt < MaxRetries)
+                            {
+                                continue;
+                            }
+
+                            break;
+                        }
+                    }
+
+                    var upstreamUrl = BuildClaudeMessagesUrl(account.BaseUrl);
+                    var upstreamUri = new Uri(upstreamUrl);
+                    var isAnthropicBase =
+                        string.Equals(upstreamUri.Scheme, "https", StringComparison.OrdinalIgnoreCase)
+                        && string.Equals(upstreamUri.Host, "api.anthropic.com", StringComparison.OrdinalIgnoreCase);
+                    var hasExplicitApiKey = !string.IsNullOrWhiteSpace(account.ApiKey);
+                    var defaultUseApiKeyHeader = isAnthropicBase && hasExplicitApiKey;
+
+                    var json = JsonSerializer.Serialize(input, JsonOptions.DefaultOptions);
+
+                    Dictionary<string, string> BuildClaudeHeaders(bool preferApiKeyHeader)
+                    {
+                        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                        {
+                            ["User-Agent"] = "claude-cli/2.0.76 (external, cli)",
+                            ["Connection"] = "keep-alive",
+                            ["Accept"] = input.Stream ? "text/event-stream" : "application/json",
+                            ["Accept-Encoding"] = "gzip, deflate, br, zstd",
+                            ["Accept-Language"] = "*",
+                            ["X-Stainless-Helper-Method"] = "stream",
+                            ["X-Stainless-Retry-Count"] = "0",
+                            ["x-Stainless-Timeout"] = "60",
+                            ["X-Stainless-Lang"] = "js",
+                            ["X-Stainless-Package-Version"] = "0.55.1",
+                            ["X-Stainless-OS"] = "Windows",
+                            ["X-Stainless-Arch"] = "x64",
+                            ["X-Stainless-Runtime"] = "node",
+                            ["X-Stainless-Runtime-Version"] = "v22.15.0",
+                            ["anthropic-dangerous-direct-browser-access"] = "true",
+                            ["x-app"] = "cli",
+                            ["sec-fetch-mode"] = "cors",
+                            ["sec-fetch-site"] = "cross-site",
+                            ["sec-fetch-dest"] = "empty",
+                            ["baggage"] =
+                                "sentry-environment=external,sentry-release=2.0.76,sentry-public_key=e531a1d9ec1de9064fae9d4affb0b0f4,sentry-trace_id=6c8c7aab3b7f42a880b5bb940626b121",
+                            ["anthropic-beta"] = preferApiKeyHeader
+                                ? "claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+                                : "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+                        };
+
+                        result.TryAdd("anthropic-version", "2023-06-01");
+
+                        var authToken = hasExplicitApiKey
+                            ? account.ApiKey!.Trim()
+                            : claudeOauth.AccessToken;
+
+                        // Follow upstream conventions:
+                        // - Official Anthropic API uses x-api-key
+                        // - Reverse/proxy channels typically accept Authorization: Bearer
+                        var useApiKeyHeader = preferApiKeyHeader && isAnthropicBase;
+                        if (useApiKeyHeader)
+                        {
+                            result.Remove("Authorization");
+                            result["x-api-key"] = authToken;
+                        }
+                        else
+                        {
+                            result.Remove("x-api-key");
+                            result["Authorization"] = "Bearer " + authToken;
+                        }
+
+                        result["host"] = "api.anthropic.com";
+                        return result;
+                    }
+
+                    async Task<HttpResponseMessage> SendClaudeAsync(Dictionary<string, string> headersToSend)
+                    {
+                        using var request = new HttpRequestMessage(HttpMethod.Post, upstreamUrl);
+                        foreach (var header in headersToSend)
+                        {
+                            request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                        }
+
+                        request.Content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                        return await HttpClient.SendAsync(
+                            request,
+                            input.Stream
+                                ? HttpCompletionOption.ResponseHeadersRead
+                                : HttpCompletionOption.ResponseContentRead,
+                            context.RequestAborted);
+                    }
+
+                    var useApiKeyHeader = defaultUseApiKeyHeader;
+
+                    HttpResponseMessage? response = null;
+                    string? error = null;
+
+                    try
+                    {
+                        response = await SendClaudeAsync(BuildClaudeHeaders(useApiKeyHeader));
+
+                        if (response.StatusCode >= HttpStatusCode.BadRequest)
+                        {
+                            error ??= await response.Content.ReadAsStringAsync(context.RequestAborted);
+                            lastErrorMessage = error;
+                            lastStatusCode = response.StatusCode;
+
+                            logger.LogError(
+                                "Claude 请求失败 (账户: {AccountId}, 状态码: {StatusCode}, 尝试: {Attempt}/{MaxRetries}): {Error}",
+                                account.Id,
+                                response.StatusCode,
+                                attempt,
+                                MaxRetries,
+                                error);
+
+                            if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                            {
+                                await aiAccountService.DisableAccount(account.Id);
+                            }
+
+                            var isClientError =
+                                response.StatusCode == HttpStatusCode.BadRequest
+                                || ClientErrorKeywords.Any(keyword =>
+                                    error.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+
+                            if (isClientError)
+                            {
+                                await requestLogService.RecordFailure(
+                                    logId,
+                                    stopwatch,
+                                    (int)response.StatusCode,
+                                    error);
+
+                                await WriteAnthropicError(
+                                    context,
+                                    (int)response.StatusCode,
+                                    error,
+                                    "invalid_request_error");
+
+                                return;
+                            }
+
+                            if (attempt < MaxRetries)
+                            {
+                                continue;
+                            }
+
+                            break;
+                        }
+
+                        if (!string.IsNullOrEmpty(conversationId))
+                        {
+                            quotaCache.SetConversationAccount(conversationId, account.Id);
+                        }
+
+                        // 提取 Claude (Anthropic) 限流信息（包含 Unified 5h/7d）
+                        var quotaInfo =
+                            AccountQuotaCacheService.ExtractFromAnthropicHeaders(account.Id, response.Headers);
+                        if (quotaInfo != null)
+                        {
+                            quotaCache.UpdateQuota(quotaInfo);
+                        }
+
+                        if (input.Stream)
+                        {
+                            await requestLogService.RecordSuccess(
+                                logId,
+                                stopwatch,
+                                (int)response.StatusCode,
+                                timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
+
+                            context.Response.StatusCode = (int)response.StatusCode;
+                            context.Response.ContentType = "text/event-stream;charset=utf-8";
+                            context.Response.Headers.TryAdd("Cache-Control", "no-cache");
+                            context.Response.Headers.TryAdd("Connection", "keep-alive");
+                            context.Response.Headers.TryAdd("X-Accel-Buffering", "no");
+
+                            await context.Response.Body.FlushAsync(context.RequestAborted);
+
+                            await using var stream = await response.Content.ReadAsStreamAsync(context.RequestAborted);
+                            using var reader = new StreamReader(stream, Encoding.UTF8);
+
+                            while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
+                            {
+                                await context.Response.WriteAsync(line.TrimEnd()).ConfigureAwait(false);
+                                if (line.StartsWith("data:"))
+                                {
+                                    await context.Response.Body.WriteAsync(OpenAIConstant.NewLine);
+                                }
+                                else
+                                {
+                                    await context.Response.Body.WriteAsync(OpenAIConstant.NewLine);
+                                }
+
+                                await context.Response.Body.FlushAsync(context.RequestAborted);
+                            }
+
+                            return;
+                        }
+
+                        var body = await response.Content.ReadAsStringAsync(context.RequestAborted);
+
+                        await requestLogService.RecordSuccess(
+                            logId,
+                            stopwatch,
+                            (int)response.StatusCode,
+                            timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
+
+                        context.Response.StatusCode = (int)response.StatusCode;
+                        context.Response.ContentType =
+                            response.Content.Headers.ContentType?.ToString() ?? "application/json";
+                        await context.Response.WriteAsync(body, Encoding.UTF8);
+                        return;
+                    }
+                    finally
+                    {
+                        response?.Dispose();
+                    }
+                }
+                else if (account.Provider == AIProviders.Factory)
+                {
+                    var factory = account.GetFactoryOauth();
+
+                    if (factory == null || string.IsNullOrWhiteSpace(factory.AccessToken))
+                    {
+                        lastErrorMessage = $"账户 {account.Id} 没有有效的 Factory Oauth 凭证";
+                        lastStatusCode = HttpStatusCode.Unauthorized;
+                        logger.LogWarning(lastErrorMessage);
+
                         await aiAccountService.DisableAccount(account.Id);
 
                         if (attempt < MaxRetries)
                         {
                             continue;
                         }
+
+                        break;
                     }
 
-                    var isClientError =
-                        response.StatusCode == HttpStatusCode.BadRequest
-                        || ClientErrorKeywords.Any(keyword => error.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+                    // Factory 会做 system prompt 校验：必须使用固定的 Droid system。
+                    // 为避免 403，这里不透传外部传入的 system，统一注入 Factory 需要的 system。
 
-                    if (isClientError)
+                    if (IsFactoryTokenExpired(factory))
                     {
-                        await requestLogService.RecordFailure(
+                        try
+                        {
+                            await factoryOAuthService.RefreshFactoryOAuthTokenAsync(account);
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogWarning(
+                                ex,
+                                "Factory 账户 {AccountId} Token 已过期且刷新失败，已禁用账户",
+                                account.Id);
+
+                            lastErrorMessage = $"账户 {account.Id} Token 刷新失败: {ex.Message}";
+                            lastStatusCode = HttpStatusCode.Unauthorized;
+
+                            await aiAccountService.DisableAccount(account.Id);
+
+                            if (attempt < MaxRetries)
+                            {
+                                continue;
+                            }
+
+                            break;
+                        }
+
+                        factory = account.GetFactoryOauth();
+                        if (factory == null || string.IsNullOrWhiteSpace(factory.AccessToken))
+                        {
+                            lastErrorMessage = $"账户 {account.Id} Factory Token 刷新后仍无效";
+                            lastStatusCode = HttpStatusCode.Unauthorized;
+                            logger.LogWarning(lastErrorMessage);
+
+                            await aiAccountService.DisableAccount(account.Id);
+
+                            if (attempt < MaxRetries)
+                            {
+                                continue;
+                            }
+
+                            break;
+                        }
+                    }
+
+                    // 准备请求头和代理配置
+                    var headers = new Dictionary<string, string>
+                    {
+                        { "Authorization", "Bearer " + factory.AccessToken },
+                    };
+
+                    headers["User-Agent"] = "factory-cli/0.41.0";
+                    headers["Accept-Encoding"] = "gzip, deflate, br";
+                    headers["Accept-Language"] = "*";
+                    headers["Accept"] = input.Stream ? "text/event-stream" : "application/json";
+                    headers["x-factory-client"] = "cli";
+                    headers["x-session-id"] = Guid.NewGuid().ToString();
+                    headers["x-assistant-message-id"] = Guid.NewGuid().ToString();
+                    headers["x-stainless-arch"] = "x64";
+                    headers["x-stainless-helper-method"] = "stream";
+                    headers["x-stainless-lang"] = "js";
+                    headers["x-stainless-os"] = "Windows";
+                    headers["x-stainless-package-version"] = "0.70.0";
+                    headers["x-stainless-retry-count"] = "0";
+                    headers["x-stainless-runtime"] = "node";
+                    headers["x-stainless-runtime-version"] = "v24.3.0";
+                    headers["anthropic-dangerous-direct-browser-access"] = "true";
+                    headers["anthropic-beta"] =
+                        "oauth-2025-04-20,claude-code-20250219,interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14";
+
+                    using var request =
+                        new HttpRequestMessage(HttpMethod.Post, "https://app.factory.ai/api/llm/a/v1/messages");
+                    foreach (var header in headers)
+                    {
+                        request.Headers.Add(header.Key, header.Value);
+                    }
+
+                    var systems = new List<AnthropicMessageContent>
+                    {
+                        new()
+                        {
+                            Type = "text",
+                            Text = AIPrompt.FactoryCLI
+                        },
+                        new()
+                        {
+                            Type = "text",
+                            Text =
+                                "You work within an interactive cli tool and you are focused on helping users with any software engineering tasks.\nGuidelines:\n- Use tools when necessary.\n- Don't stop until all user tasks are completed.\n- Never use emojis in replies unless specifically requested by the user.\n- Only add absolutely necessary comments to the code you generate.\n- Your replies should be concise and you should preserve users tokens.\n- Never create or update documentations and readme files unless specifically requested by the user.\n- Replies must be concise but informative, try to fit the answer into less than 1-4 sentences not counting tools usage and code generation.\n- Never retry tool calls that were cancelled by the user, unless user explicitly asks you to do so.\n- Use FetchUrl to fetch Factory docs (https://docs.factory.ai/factory-docs-map.md) when:\n  - Asks questions in the second person (eg. \"are you able...\", \"can you do...\")\n  - User asks about Droid capabilities or features\n  - User needs help with Droid commands, configuration, or settings\n  - User asks about skills, MCP, hooks, custom droids, BYOK, or other Factory specific features\nFocus on the task at hand, don't try to jump to related but not requested tasks.\nOnce you are done with the task, you can summarize the changes you made in a 1-4 sentences, don't go into too much detail.\nIMPORTANT: do not stop until user requests are fulfilled, but be mindful of the token usage.\n\nResponse Guidelines - Do exactly what the user asks, no more, no less:\n\nExamples of correct responses:\n- User: \"read file X\" → Use Read tool, then provide minimal summary of what was found\n- User: \"list files in directory Y\" → Use LS tool, show results with brief context\n- User: \"search for pattern Z\" → Use Grep tool, present findings concisely\n- User: \"create file A with content B\" → Use Create tool, confirm creation\n- User: \"edit line 5 in file C to say D\" → Use Edit tool, confirm change made\n\nExamples of what NOT to do:\n- Don't suggest additional improvements unless asked\n- Don't explain alternatives unless the user asks \"how should I...\"\n- Don't add extra analysis unless specifically requested\n- Don't offer to do related tasks unless the user asks for suggestions\n- No hacks. No unreasonable shortcuts.\n- Do not give up if you encounter unexpected problems. Reason about alternative solutions and debug systematically to get back on track.\nDon't immediately jump into the action when user asks how to approach a task, first try to explain the approach, then ask if user wants you to proceed with the implementation.\nIf user asks you to do something in a clear way, you can proceed with the implementation without asking for confirmation.\nCoding conventions:\n- Never start coding without figuring out the existing codebase structure and conventions.\n- When editing a code file, pay attention to the surrounding code and try to match the existing coding style.\n- Follow approaches and use already used libraries and patterns. Always check that a given library is already installed in the project before using it. Even most popular libraries can be missing in the project.\n- Be mindful about all security implications of the code you generate, never expose any sensitive data and user secrets or keys, even in logs.\n- Before ANY git commit or push operation:\n    - Run 'git diff --cached' to review ALL changes being committed\n    - Run 'git status' to confirm all files being included\n    - Examine the diff for secrets, credentials, API keys, or sensitive data (especially in config files, logs, environment files, and build outputs) \n    - if detected, STOP and warn the user\nTesting and verification:\nBefore completing the task, always verify that the code you generated works as expected. Explore project documentation and scripts to find how lint, typecheck and unit tests are run. Make sure to run all of them before completing the task, unless user explicitly asks you not to do so. Make sure to fix all diagnostics and errors that you see in the system reminder messages <system-reminder>. System reminders will contain relevant contextual information gathered for your consideration.",
+                        }
+                    };
+
+                    var v = JsonSerializer.Serialize(input);
+                    var obj = JsonSerializer.Deserialize<AnthropicInput>(v);
+
+                    if (input.Systems?.Any(x => x.Text != AIPrompt.FactoryCLI) == true && input.Systems?.Count == 2 &&
+                        input.Systems?.Any(x => x.Text == AIPrompt.AnthropicCLI) == true)
+                    {
+                        systems.AddRange(input.Systems.Where(x => x.Text != AIPrompt.AnthropicCLI));
+
+                        obj.Systems = new List<AnthropicMessageContent>(systems);
+                    }
+                    else if (input.Systems?.Any(x => x.Text != AIPrompt.FactoryCLI) == true)
+                    {
+                        if (!string.IsNullOrEmpty(input.System))
+                        {
+                            input.Systems = new List<AnthropicMessageContent>(systems)
+                            {
+                                new()
+                                {
+                                    Type = "text",
+                                    Text = input.System
+                                }
+                            };
+                        }
+                        else if (input.Systems?.Count > 0)
+                        {
+                            systems.AddRange(input.Systems);
+
+                            obj.Systems = new List<AnthropicMessageContent>(systems);
+                        }
+                    }
+
+
+                    foreach (var message in obj.Messages)
+                    {
+                        if (!(message.Contents?.Count > 0)) continue;
+                        foreach (var messageContent in message.Contents.Where(x =>
+                                     x.Type == "text"))
+                        {
+                            if (messageContent.Text?.StartsWith("<system-reminder>\nThis is a reminder") == true)
+                            {
+                                messageContent.Text = messageContent.Text.Replace(
+                                    "<system-reminder>\nThis is a reminder that your todo list is currently empty. DO NOT mention this to the user explicitly because they are already aware. If you are working on tasks that would benefit from a todo list please use the TodoWrite tool to create one. If not, please feel free to ignore. Again do not mention this message to the user.\n</system-reminder>",
+                                    "<system-reminder>\n这是一个提醒，您的待办事项列表目前为空。不要明确告诉用户这一点，因为他们已经知道。如果您正在处理的任务需要待办事项列表，请使用 TodoWrite 工具创建一个。如果不需要，请随意忽略。再次提醒，不要向用户提及此消息。\n</system-reminder>");
+                            }
+                            else if (messageContent.Text?.StartsWith(
+                                         "<system-reminder>\nCalled the Read tool with the following input:") ==
+                                     true)
+                            {
+                                messageContent.Text = messageContent.Text.Replace(
+                                    "<system-reminder>\nCalled the Read tool with the following input:",
+                                    "<system-reminder>\n使用以下输入调用了读取工具：");
+                            }
+                            else if (messageContent.Text?.StartsWith(
+                                         "<system-reminder>\nResult of calling the Read tool:") ==
+                                     true)
+                            {
+                                messageContent.Text = messageContent.Text.Replace(
+                                    "<system-reminder>\nResult of calling the Read tool:",
+                                    "<system-reminder>\n调用读取工具的结果：");
+                            }
+                            else if (messageContent.Text?.StartsWith(
+                                         "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# claudeMd\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\nContents of ") ==
+                                     true)
+                            {
+                                messageContent.Text = messageContent.Text.Replace(
+                                    "<system-reminder>\nAs you answer the user's questions, you can use the following context:\n# claudeMd\nCodebase and user instructions are shown below. Be sure to adhere to these instructions. IMPORTANT: These instructions OVERRIDE any default behavior and you MUST follow them exactly as written.\n\nContents of ",
+                                    "<system-reminder>\n在回答用户问题时，您可以使用以下上下文：\n# claudeMd\n代码库和用户说明如下。务必遵守这些说明。重要提示：这些说明优先于任何默认行为，您必须严格按照说明执行。\n\n内容如下");
+                            }
+                        }
+                    }
+
+                    request.Headers.Referrer = new Uri("https://app.factory.ai/");
+
+                    var json = JsonSerializer.Serialize(obj, new JsonSerializerOptions
+                    {
+                        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+                    });
+
+                    request.Content = new StringContent(json, Encoding.UTF8, "application/json");
+
+                    using var response = await HttpClient.SendAsync(
+                        request,
+                        input.Stream
+                            ? HttpCompletionOption.ResponseHeadersRead
+                            : HttpCompletionOption.ResponseContentRead,
+                        context.RequestAborted);
+
+                    if (response.StatusCode >= HttpStatusCode.BadRequest)
+                    {
+                        var error = await response.Content.ReadAsStringAsync(context.RequestAborted);
+                        lastErrorMessage = error;
+                        lastStatusCode = response.StatusCode;
+
+                        logger.LogError(
+                            "Factory 请求失败 (账户: {AccountId}, 状态码: {StatusCode}, 尝试: {Attempt}/{MaxRetries}): {Error}",
+                            account.Id,
+                            response.StatusCode,
+                            attempt,
+                            MaxRetries,
+                            error);
+
+                        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.PaymentRequired)
+                        {
+                            await aiAccountService.DisableAccount(account.Id);
+                        }
+
+                        var isClientError =
+                            response.StatusCode == HttpStatusCode.BadRequest
+                            || ClientErrorKeywords.Any(keyword =>
+                                error.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+
+                        if (isClientError)
+                        {
+                            await requestLogService.RecordFailure(
+                                logId,
+                                stopwatch,
+                                (int)response.StatusCode,
+                                error);
+
+                            await WriteAnthropicError(
+                                context,
+                                (int)response.StatusCode,
+                                error,
+                                "invalid_request_error");
+
+                            return;
+                        }
+
+                        if (attempt < MaxRetries)
+                        {
+                            continue;
+                        }
+
+                        break;
+                    }
+
+                    if (!string.IsNullOrEmpty(conversationId))
+                    {
+                        quotaCache.SetConversationAccount(conversationId, account.Id);
+                    }
+
+                    // 提取 Factory (Anthropic) 限流信息
+                    var quotaInfo = AccountQuotaCacheService.ExtractFromAnthropicHeaders(account.Id, response.Headers);
+                    if (quotaInfo != null)
+                    {
+                        quotaCache.UpdateQuota(quotaInfo);
+                    }
+
+                    if (input.Stream)
+                    {
+                        await requestLogService.RecordSuccess(
                             logId,
                             stopwatch,
                             (int)response.StatusCode,
-                            error);
+                            timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
 
-                        await WriteAnthropicError(
-                            context,
-                            (int)response.StatusCode,
-                            error,
-                            "invalid_request_error");
+                        context.Response.StatusCode = (int)response.StatusCode;
+                        context.Response.ContentType = "text/event-stream;charset=utf-8";
+                        context.Response.Headers.TryAdd("Cache-Control", "no-cache");
+                        context.Response.Headers.TryAdd("Connection", "keep-alive");
+                        context.Response.Headers.TryAdd("X-Accel-Buffering", "no");
+
+                        await context.Response.Body.FlushAsync(context.RequestAborted);
+
+                        await using var stream = await response.Content.ReadAsStreamAsync(context.RequestAborted);
+                        using var reader = new StreamReader(stream, Encoding.UTF8);
+
+                        while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
+                        {
+                            await context.Response.WriteAsync(line).ConfigureAwait(false);
+                            if (line.StartsWith("data:"))
+                            {
+                                await context.Response.Body.WriteAsync(OpenAIConstant.DoubleNewLine);
+                            }
+                            else
+                            {
+                                await context.Response.Body.WriteAsync(OpenAIConstant.NewLine);
+                            }
+
+                            await context.Response.Body.FlushAsync(context.RequestAborted);
+                        }
 
                         return;
                     }
 
-                    if (attempt < MaxRetries)
-                    {
-                        continue;
-                    }
+                    var body = await response.Content.ReadAsStringAsync(context.RequestAborted);
 
-                    await requestLogService.RecordFailure(
-                        logId,
-                        stopwatch,
-                        (int)response.StatusCode,
-                        error);
-                    break;
-                }
-
-                if (!string.IsNullOrEmpty(conversationId))
-                {
-                    quotaCache.SetConversationAccount(conversationId, account.Id);
-                }
-
-                if (input.Stream)
-                {
                     await requestLogService.RecordSuccess(
                         logId,
                         stopwatch,
                         (int)response.StatusCode,
                         timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
 
-                    await StreamAnthropicResponse(
-                        context,
-                        response,
-                        input.Model,
-                        estimatedInputTokens,
-                        returnThoughts);
-
+                    context.Response.StatusCode = (int)response.StatusCode;
+                    context.Response.ContentType =
+                        response.Content.Headers.ContentType?.ToString() ?? "application/json";
+                    await context.Response.WriteAsync(body, Encoding.UTF8);
                     return;
                 }
-
-                var responseValue = await response.Content.ReadFromJsonAsync<JsonDocument>();
-                if (responseValue == null)
+                else
                 {
-                    lastErrorMessage = "Antigravity 响应体为空";
-                    lastStatusCode = HttpStatusCode.BadGateway;
-                    break;
+                    var geminiOAuth = account.GetGeminiOauth();
+                    if (geminiOAuth == null)
+                    {
+                        lastErrorMessage = $"账户 {account.Id} 没有有效的 Gemini OAuth 凭证";
+                        lastStatusCode = HttpStatusCode.Unauthorized;
+                        logger.LogWarning(lastErrorMessage);
+
+                        await aiAccountService.DisableAccount(account.Id);
+
+                        if (attempt < MaxRetries)
+                        {
+                            continue;
+                        }
+
+                        break;
+                    }
+
+                    if (IsGeminiTokenExpired(geminiOAuth))
+                    {
+                        try
+                        {
+                            await geminiAntigravityOAuthService.RefreshGeminiAntigravityOAuthTokenAsync(account);
+                        }
+                        catch (Exception ex)
+                        {
+                            logger.LogWarning(
+                                ex,
+                                "Gemini Antigravity 账户 {AccountId} Token 刷新失败，已禁用账户",
+                                account.Id);
+
+                            lastErrorMessage = $"账户 {account.Id} Token 刷新失败: {ex.Message}";
+                            lastStatusCode = HttpStatusCode.Unauthorized;
+
+                            await aiAccountService.DisableAccount(account.Id);
+
+                            if (attempt < MaxRetries)
+                            {
+                                continue;
+                            }
+
+                            break;
+                        }
+
+                        geminiOAuth = account.GetGeminiOauth();
+                        if (geminiOAuth == null || string.IsNullOrWhiteSpace(geminiOAuth.Token))
+                        {
+                            lastErrorMessage = $"账户 {account.Id} Gemini Token 刷新后仍无效";
+                            lastStatusCode = HttpStatusCode.Unauthorized;
+                            logger.LogWarning(lastErrorMessage);
+
+                            await aiAccountService.DisableAccount(account.Id);
+
+                            if (attempt < MaxRetries)
+                            {
+                                continue;
+                            }
+
+                            break;
+                        }
+                    }
+
+                    var resolvedModel = await ResolveAnthropicModelAsync(input.Model);
+                    var components = ConvertAnthropicRequestToAntigravityComponents(input, resolvedModel);
+                    if (components.Contents.Count == 0)
+                    {
+                        await WriteAnthropicError(
+                            context,
+                            StatusCodes.Status400BadRequest,
+                            "messages 不能为空；text 内容块必须包含非空白文本",
+                            "invalid_request_error");
+                        return;
+                    }
+
+                    var requestBody = BuildAntigravityRequestBody(
+                        components,
+                        geminiOAuth.ProjectId,
+                        sessionId: $"session-{Guid.NewGuid():N}");
+
+                    var baseUrl = account.BaseUrl;
+                    if (string.IsNullOrWhiteSpace(baseUrl))
+                    {
+                        baseUrl = GeminiAntigravityOAuthConfig.AntigravityApiUrl;
+                    }
+
+                    using var response = await SendAntigravityRequest(
+                        baseUrl,
+                        requestBody,
+                        geminiOAuth.Token,
+                        input.Stream,
+                        context.RequestAborted);
+
+                    if (response.StatusCode >= HttpStatusCode.BadRequest)
+                    {
+                        var error = await response.Content.ReadAsStringAsync();
+                        lastErrorMessage = error;
+                        lastStatusCode = response.StatusCode;
+
+                        logger.LogError(
+                            "Antigravity 请求失败 (账户: {AccountId}, 状态码: {StatusCode}, 尝试: {Attempt}/{MaxRetries}): {Error}",
+                            account.Id,
+                            response.StatusCode,
+                            attempt,
+                            MaxRetries,
+                            error);
+
+                        if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+                        {
+                            await aiAccountService.DisableAccount(account.Id);
+
+                            if (attempt < MaxRetries)
+                            {
+                                continue;
+                            }
+                        }
+
+                        var isClientError =
+                            response.StatusCode == HttpStatusCode.BadRequest
+                            || ClientErrorKeywords.Any(keyword =>
+                                error.Contains(keyword, StringComparison.OrdinalIgnoreCase));
+
+                        if (isClientError)
+                        {
+                            await requestLogService.RecordFailure(
+                                logId,
+                                stopwatch,
+                                (int)response.StatusCode,
+                                error);
+
+                            await WriteAnthropicError(
+                                context,
+                                (int)response.StatusCode,
+                                error,
+                                "invalid_request_error");
+
+                            return;
+                        }
+
+                        if (attempt < MaxRetries)
+                        {
+                            continue;
+                        }
+
+                        await requestLogService.RecordFailure(
+                            logId,
+                            stopwatch,
+                            (int)response.StatusCode,
+                            error);
+                        break;
+                    }
+
+                    if (!string.IsNullOrEmpty(conversationId))
+                    {
+                        quotaCache.SetConversationAccount(conversationId, account.Id);
+                    }
+
+                    if (input.Stream)
+                    {
+                        await requestLogService.RecordSuccess(
+                            logId,
+                            stopwatch,
+                            (int)response.StatusCode,
+                            timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
+
+                        await StreamAnthropicResponse(
+                            context,
+                            response,
+                            input.Model,
+                            estimatedInputTokens,
+                            returnThoughts);
+
+                        return;
+                    }
+
+                    var responseValue = await response.Content.ReadFromJsonAsync<JsonDocument>();
+                    if (responseValue == null)
+                    {
+                        lastErrorMessage = "Antigravity 响应体为空";
+                        lastStatusCode = HttpStatusCode.BadGateway;
+                        break;
+                    }
+
+                    var messageId = $"msg_{Guid.NewGuid():N}";
+                    var anthropicResponse = ConvertAntigravityResponseToAnthropicMessage(
+                        responseValue.RootElement,
+                        input.Model,
+                        messageId,
+                        estimatedInputTokens,
+                        returnThoughts,
+                        out var promptTokens,
+                        out var completionTokens,
+                        out var totalTokens);
+
+                    await requestLogService.RecordSuccess(
+                        logId,
+                        stopwatch,
+                        (int)response.StatusCode,
+                        timeToFirstByteMs: stopwatch.ElapsedMilliseconds,
+                        promptTokens: promptTokens,
+                        completionTokens: completionTokens,
+                        totalTokens: totalTokens);
+
+                    context.Response.StatusCode = (int)response.StatusCode;
+                    context.Response.ContentType = "application/json";
+                    await context.Response.WriteAsync(JsonSerializer.Serialize(anthropicResponse));
                 }
 
-                var messageId = $"msg_{Guid.NewGuid():N}";
-                var anthropicResponse = ConvertAntigravityResponseToAnthropicMessage(
-                    responseValue.RootElement,
-                    input.Model,
-                    messageId,
-                    estimatedInputTokens,
-                    returnThoughts,
-                    out var promptTokens,
-                    out var completionTokens,
-                    out var totalTokens);
-
-                await requestLogService.RecordSuccess(
-                    logId,
-                    stopwatch,
-                    (int)response.StatusCode,
-                    timeToFirstByteMs: stopwatch.ElapsedMilliseconds,
-                    promptTokens: promptTokens,
-                    completionTokens: completionTokens,
-                    totalTokens: totalTokens);
-
-                context.Response.StatusCode = (int)response.StatusCode;
-                context.Response.ContentType = "application/json";
-                await context.Response.WriteAsync(JsonSerializer.Serialize(anthropicResponse));
                 return;
             }
 
@@ -357,6 +1008,117 @@ public class AnthropicService(
             }
         }
     }
+
+    /// <summary>
+    ///     判断当前请求是否 Claude Code 发起，用于选择 Claude 渠道 + 透传请求头
+    /// </summary>
+    /// <returns></returns>
+    private bool IsClaudeCodeRequest(HttpContext httpContext)
+    {
+        // 检查是否有特定的请求头或标识符来判断是否是Claude Code发起的请求
+        // 这里可以根据实际情况调整
+        return httpContext.Request.Headers.UserAgent.ToString()
+            .Contains("claude-cli", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task<AIAccount?> GetClaudeOrAntigravityAccount(
+        string? conversationId,
+        string preferredProvider,
+        AIAccountService aiAccountService)
+    {
+        AIAccount? account = null;
+
+        if (!string.IsNullOrEmpty(conversationId))
+        {
+            var lastAccountId = quotaCache.GetConversationAccount(conversationId);
+            if (lastAccountId.HasValue)
+            {
+                account = await aiAccountService.TryGetAccountById(lastAccountId.Value);
+                if (account is { Provider: AIProviders.Claude or AIProviders.GeminiAntigravity or AIProviders.Factory })
+                {
+                    if (!string.Equals(account.Provider, preferredProvider, StringComparison.Ordinal))
+                    {
+                        account = null;
+                    }
+                }
+                else
+                {
+                    account = null;
+                }
+            }
+        }
+
+        if (account != null)
+        {
+            return account;
+        }
+
+        if (string.Equals(preferredProvider, AIProviders.Claude, StringComparison.Ordinal))
+        {
+            account = await aiAccountService.GetAIAccountByProvider(AIProviders.Claude);
+            if (account == null)
+            {
+                account = await aiAccountService.GetAIAccountByProvider(AIProviders.GeminiAntigravity);
+                if (account != null)
+                {
+                    return account;
+                }
+            }
+        }
+
+        if (string.Equals(preferredProvider, AIProviders.GeminiAntigravity, StringComparison.Ordinal))
+        {
+            account = await aiAccountService.GetAIAccountByProvider(AIProviders.GeminiAntigravity);
+            if (account == null)
+            {
+                account = await aiAccountService.GetAIAccountByProvider(AIProviders.Claude);
+                if (account != null)
+                {
+                    return account;
+                }
+            }
+        }
+
+        account = await aiAccountService.GetAIAccountByProvider(AIProviders.Factory);
+        if (account == null)
+        {
+            account = await aiAccountService.GetAIAccountByProvider(AIProviders.Claude);
+            if (account != null)
+            {
+                return account;
+            }
+        }
+        else
+        {
+            return account;
+        }
+
+        return await aiAccountService.GetAIAccountByProvider(AIProviders.Claude, AIProviders.GeminiAntigravity);
+    }
+
+    private static string BuildClaudeMessagesUrl(string? baseUrl)
+    {
+        if (string.IsNullOrWhiteSpace(baseUrl))
+        {
+            return "https://api.anthropic.com/v1/messages?beta=true";
+        }
+
+        var trimmed = baseUrl.Trim();
+        if (trimmed.EndsWith("/v1/messages", StringComparison.OrdinalIgnoreCase))
+        {
+            return trimmed + "?beta=true";
+        }
+
+        trimmed = trimmed.TrimEnd('/');
+
+        if (trimmed.EndsWith("/v1", StringComparison.OrdinalIgnoreCase))
+        {
+            return trimmed + "/messages?beta=true";
+        }
+
+        return trimmed + "/v1/messages?beta=true";
+    }
+
 
     public async Task CountTokens(HttpContext context, AnthropicInput input)
     {
@@ -409,6 +1171,7 @@ public class AnthropicService(
             {
                 await WriteRaw(item);
             }
+
             pending.Clear();
         }
 
@@ -527,9 +1290,9 @@ public class AnthropicService(
                                 }
 
                                 var signature = part.TryGetProperty("thoughtSignature", out var sigProp)
-                                    && sigProp.ValueKind == JsonValueKind.String
-                                        ? sigProp.GetString()
-                                        : null;
+                                                && sigProp.ValueKind == JsonValueKind.String
+                                    ? sigProp.GetString()
+                                    : null;
 
                                 if (state.CurrentBlockType != StreamingBlockType.Thinking)
                                 {
@@ -543,9 +1306,9 @@ public class AnthropicService(
                                 }
 
                                 var thinkingText = part.TryGetProperty("text", out var textProp)
-                                    && textProp.ValueKind == JsonValueKind.String
-                                        ? textProp.GetString()
-                                        : string.Empty;
+                                                   && textProp.ValueKind == JsonValueKind.String
+                                    ? textProp.GetString()
+                                    : string.Empty;
 
                                 if (!string.IsNullOrEmpty(thinkingText))
                                 {
@@ -710,11 +1473,11 @@ public class AnthropicService(
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
         });
 
-        var request = new HttpRequestMessage(HttpMethod.Post, url)
-        {
-            Content = new StringContent(json, Encoding.UTF8, "application/json")
-        };
+        using var request = new HttpRequestMessage(HttpMethod.Post, url);
+        request.Content = new StringContent(json, Encoding.UTF8, "application/json");
 
+        request.Version = HttpVersion.Version11;
+        request.VersionPolicy = HttpVersionPolicy.RequestVersionOrLower;
         request.Headers.Add("Authorization", $"Bearer {accessToken}");
         request.Headers.Add("User-Agent", GeminiAntigravityOAuthConfig.UserAgent);
 
@@ -724,19 +1487,283 @@ public class AnthropicService(
             cancellationToken);
     }
 
-    private static string? GetConversationId(HttpContext context)
+    private static string BuildConversationStickyKey(AnthropicInput input)
     {
-        if (context.Request.Headers.TryGetValue("conversation_id", out var conversationId))
+        var seed = BuildConversationStickySeed(input);
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(seed));
+        return "anthropic_" + Convert.ToHexString(bytes).ToLowerInvariant();
+    }
+
+    private static string BuildConversationStickySeed(AnthropicInput input)
+    {
+        var builder = new StringBuilder(2048);
+        builder.Append("anthropic_sticky_v1|");
+
+        var userId = TryGetMetadataString(input.Metadata, "user_id", "userId", "user");
+        if (!string.IsNullOrWhiteSpace(userId))
         {
-            return conversationId.ToString();
+            builder.Append("u=");
+            builder.Append(NormalizeAndTruncate(userId, 128));
+            builder.Append('|');
         }
 
-        if (context.Request.Headers.TryGetValue("session_id", out var sessionId))
+        // If the client provides an explicit conversation/thread id in metadata, use it as a strong signal.
+        var explicitConversationId = TryGetMetadataString(
+            input.Metadata,
+            "conversation_id",
+            "conversationId",
+            "session_id",
+            "sessionId",
+            "thread_id",
+            "threadId");
+        if (!string.IsNullOrWhiteSpace(explicitConversationId))
         {
-            return sessionId.ToString();
+            builder.Append("t=");
+            builder.Append(NormalizeAndTruncate(explicitConversationId, 128));
+            builder.Append('|');
+        }
+
+        // Include stable, early context. Messages grow over time, so we deliberately anchor on the earliest user message.
+        var systemText = GetSystemTextForStickiness(input);
+        if (!string.IsNullOrWhiteSpace(systemText))
+        {
+            builder.Append("s=");
+            builder.Append(NormalizeAndTruncate(systemText, 512));
+            builder.Append('|');
+        }
+
+        var toolSignature = GetToolsSignatureForStickiness(input.Tools);
+        if (!string.IsNullOrWhiteSpace(toolSignature))
+        {
+            builder.Append("tools=");
+            builder.Append(toolSignature);
+            builder.Append('|');
+        }
+
+        var firstUserMessage = GetFirstUserMessageTextForStickiness(input.Messages);
+        builder.Append("m=");
+        builder.Append(NormalizeAndTruncate(firstUserMessage, 1024));
+
+        return builder.ToString();
+    }
+
+    private static string GetSystemTextForStickiness(AnthropicInput input)
+    {
+        if (!string.IsNullOrWhiteSpace(input.System))
+        {
+            return input.System!;
+        }
+
+        if (input.Systems == null || input.Systems.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder();
+        foreach (var system in input.Systems)
+        {
+            if (system == null)
+            {
+                continue;
+            }
+
+            if (string.Equals(system.Type, "text", StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(system.Text))
+            {
+                if (builder.Length > 0)
+                {
+                    builder.Append('\n');
+                }
+
+                builder.Append(system.Text);
+            }
+        }
+
+        return builder.ToString();
+    }
+
+    private static string GetToolsSignatureForStickiness(IList<AnthropicMessageTool>? tools)
+    {
+        if (tools == null || tools.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var names = new List<string>();
+        foreach (var tool in tools)
+        {
+            var name = tool?.Name?.Trim();
+            if (!string.IsNullOrWhiteSpace(name))
+            {
+                names.Add(name);
+            }
+        }
+
+        if (names.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        names.Sort(StringComparer.Ordinal);
+        return NormalizeAndTruncate(string.Join(",", names), 256);
+    }
+
+    private static string GetFirstUserMessageTextForStickiness(IList<AnthropicMessageInput> messages)
+    {
+        if (messages == null || messages.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        // Prefer the earliest user message, since Anthropic messages are typically appended over time.
+        foreach (var message in messages)
+        {
+            if (message == null)
+            {
+                continue;
+            }
+
+            if (!string.Equals(message.Role, "user", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var text = ExtractMessageTextForStickiness(message);
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                return text;
+            }
+        }
+
+        // Fallback: first non-empty message (handles edge cases where roles are missing/malformed)
+        foreach (var message in messages)
+        {
+            if (message == null)
+            {
+                continue;
+            }
+
+            var text = ExtractMessageTextForStickiness(message);
+            if (!string.IsNullOrWhiteSpace(text))
+            {
+                return text;
+            }
+        }
+
+        return string.Empty;
+    }
+
+    private static string ExtractMessageTextForStickiness(AnthropicMessageInput message)
+    {
+        if (!string.IsNullOrWhiteSpace(message.Content))
+        {
+            return message.Content!;
+        }
+
+        if (message.Contents == null || message.Contents.Count == 0)
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder();
+        foreach (var content in message.Contents)
+        {
+            if (content == null)
+            {
+                continue;
+            }
+
+            if (string.Equals(content.Type, "text", StringComparison.OrdinalIgnoreCase)
+                && !string.IsNullOrWhiteSpace(content.Text))
+            {
+                if (builder.Length > 0)
+                {
+                    builder.Append('\n');
+                }
+
+                builder.Append(content.Text);
+            }
+            else if (string.Equals(content.Type, "image", StringComparison.OrdinalIgnoreCase))
+            {
+                // Do not hash raw base64 image data; just include a small marker.
+                if (builder.Length > 0)
+                {
+                    builder.Append('\n');
+                }
+
+                builder.Append("[image]");
+            }
+        }
+
+        return builder.ToString();
+    }
+
+    private static string? TryGetMetadataString(Dictionary<string, object>? metadata, params string[] keys)
+    {
+        if (metadata == null || metadata.Count == 0 || keys.Length == 0)
+        {
+            return null;
+        }
+
+        foreach (var key in keys)
+        {
+            if (string.IsNullOrWhiteSpace(key))
+            {
+                continue;
+            }
+
+            object? value = null;
+
+            if (metadata.TryGetValue(key, out var direct))
+            {
+                value = direct;
+            }
+            else
+            {
+                var match = metadata.FirstOrDefault(kvp =>
+                    string.Equals(kvp.Key, key, StringComparison.OrdinalIgnoreCase));
+                value = match.Value;
+            }
+
+            if (value == null)
+            {
+                continue;
+            }
+
+            if (value is string str)
+            {
+                return str;
+            }
+
+            if (value is JsonElement element)
+            {
+                return element.ValueKind == JsonValueKind.String
+                    ? element.GetString()
+                    : element.ToString();
+            }
+
+            return value.ToString();
         }
 
         return null;
+    }
+
+    private static string NormalizeAndTruncate(string? value, int maxChars)
+    {
+        if (string.IsNullOrEmpty(value) || maxChars <= 0)
+        {
+            return string.Empty;
+        }
+
+        var normalized = value
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace("\r", "\n", StringComparison.Ordinal)
+            .Replace("\0", string.Empty, StringComparison.Ordinal)
+            .Trim();
+
+        return normalized.Length <= maxChars
+            ? normalized
+            : normalized[..maxChars];
     }
 
     private static async Task WriteAnthropicError(
@@ -808,9 +1835,32 @@ public class AnthropicService(
         };
     }
 
-    private static AntigravityComponents ConvertAnthropicRequestToAntigravityComponents(AnthropicInput input)
+    private async Task<string> ResolveAnthropicModelAsync(string model)
     {
-        var model = MapClaudeModelToGemini(input.Model);
+        var mapping = await modelMappingService.ResolveAnthropicAsync(model);
+        if (mapping == null)
+        {
+            return MapClaudeModelToGemini(model);
+        }
+
+        if (!string.IsNullOrWhiteSpace(mapping.TargetProvider)
+            && !string.Equals(mapping.TargetProvider, AIProviders.GeminiAntigravity, StringComparison.Ordinal))
+        {
+            logger.LogWarning(
+                "Anthropic 模型映射指定的提供商不是 Gemini-Antigravity，将忽略 provider={Provider}",
+                mapping.TargetProvider);
+        }
+
+        return mapping.TargetModel;
+    }
+
+    private static AntigravityComponents ConvertAnthropicRequestToAntigravityComponents(
+        AnthropicInput input,
+        string resolvedModel)
+    {
+        var model = string.IsNullOrWhiteSpace(resolvedModel)
+            ? MapClaudeModelToGemini(input.Model)
+            : resolvedModel;
         var contents = ConvertMessagesToContents(input.Messages);
         contents = ReorganizeToolMessages(contents);
 
@@ -1029,7 +2079,8 @@ public class AnthropicService(
         var toolResults = new Dictionary<string, Dictionary<string, object?>>();
         foreach (var message in contents)
         {
-            if (!message.TryGetValue("parts", out var partsObj) || partsObj is not List<Dictionary<string, object?>> parts)
+            if (!message.TryGetValue("parts", out var partsObj) ||
+                partsObj is not List<Dictionary<string, object?>> parts)
             {
                 continue;
             }
@@ -1055,7 +2106,8 @@ public class AnthropicService(
                 continue;
             }
 
-            if (!message.TryGetValue("parts", out var partsObj) || partsObj is not List<Dictionary<string, object?>> parts)
+            if (!message.TryGetValue("parts", out var partsObj) ||
+                partsObj is not List<Dictionary<string, object?>> parts)
             {
                 continue;
             }
@@ -1073,8 +2125,9 @@ public class AnthropicService(
         var reordered = new List<Dictionary<string, object?>>();
         foreach (var message in flattened)
         {
-            if (!message.TryGetValue("parts", out var partsObj) || partsObj is not List<Dictionary<string, object?>> parts
-                || parts.Count == 0)
+            if (!message.TryGetValue("parts", out var partsObj) || partsObj is not List<Dictionary<string, object?>>
+                                                                    parts
+                                                                || parts.Count == 0)
             {
                 continue;
             }
@@ -1348,7 +2401,8 @@ public class AnthropicService(
                     var block = new Dictionary<string, object?>
                     {
                         ["type"] = "thinking",
-                        ["thinking"] = part.TryGetProperty("text", out var textProp) && textProp.ValueKind == JsonValueKind.String
+                        ["thinking"] = part.TryGetProperty("text", out var textProp) &&
+                                       textProp.ValueKind == JsonValueKind.String
                             ? textProp.GetString()
                             : string.Empty
                     };
@@ -1365,7 +2419,9 @@ public class AnthropicService(
 
                 if (part.TryGetProperty("text", out var textValue))
                 {
-                    var text = textValue.ValueKind == JsonValueKind.String ? textValue.GetString() : textValue.ToString();
+                    var text = textValue.ValueKind == JsonValueKind.String
+                        ? textValue.GetString()
+                        : textValue.ToString();
                     text ??= string.Empty;
                     parts.Add(new Dictionary<string, object?>
                     {
@@ -1382,12 +2438,12 @@ public class AnthropicService(
                     {
                         ["type"] = "tool_use",
                         ["id"] = functionCall.TryGetProperty("id", out var idProp)
-                            && idProp.ValueKind == JsonValueKind.String
-                                ? idProp.GetString() ?? $"toolu_{Guid.NewGuid():N}"
+                                 && idProp.ValueKind == JsonValueKind.String
+                            ? idProp.GetString() ?? $"toolu_{Guid.NewGuid():N}"
                             : $"toolu_{Guid.NewGuid():N}",
                         ["name"] = functionCall.TryGetProperty("name", out var nameProp)
-                            && nameProp.ValueKind == JsonValueKind.String
-                                ? nameProp.GetString() ?? string.Empty
+                                   && nameProp.ValueKind == JsonValueKind.String
+                            ? nameProp.GetString() ?? string.Empty
                             : string.Empty,
                         ["input"] = functionCall.TryGetProperty("args", out var argsProp)
                             ? RemoveNulls(argsProp) ?? new Dictionary<string, object?>()
@@ -1406,12 +2462,12 @@ public class AnthropicService(
                         {
                             ["type"] = "base64",
                             ["media_type"] = inlineData.TryGetProperty("mimeType", out var mimeProp)
-                                && mimeProp.ValueKind == JsonValueKind.String
-                                    ? mimeProp.GetString()
+                                             && mimeProp.ValueKind == JsonValueKind.String
+                                ? mimeProp.GetString()
                                 : "image/png",
                             ["data"] = inlineData.TryGetProperty("data", out var dataProp)
-                                && dataProp.ValueKind == JsonValueKind.String
-                                    ? dataProp.GetString()
+                                       && dataProp.ValueKind == JsonValueKind.String
+                                ? dataProp.GetString()
                                 : string.Empty
                         }
                     });
@@ -1462,7 +2518,8 @@ public class AnthropicService(
         out UsageInfo usage)
     {
         usage = default;
-        if (!TryGetUsageMetadata(response, candidate, out var promptTokens, out var completionTokens, out var totalTokens))
+        if (!TryGetUsageMetadata(response, candidate, out var promptTokens, out var completionTokens,
+                out var totalTokens))
         {
             return false;
         }
@@ -1624,8 +2681,35 @@ public class AnthropicService(
         }
 
         return DateTime.TryParse(geminiOAuth.Expiry, out var expiryUtc)
-            && expiryUtc.ToUniversalTime() <= DateTime.UtcNow;
+               && expiryUtc.ToUniversalTime() <= DateTime.UtcNow;
     }
+
+    private static bool IsClaudeTokenExpired(ClaudeAiOAuth claudeOauth)
+    {
+        if (claudeOauth.ExpiresAt <= 0)
+        {
+            return false;
+        }
+
+        // 提前一点刷新，避免临界点卡住（尤其是流式请求）
+        const int expirySkewSeconds = 60;
+        var nowUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        return claudeOauth.ExpiresAt <= nowUnixSeconds + expirySkewSeconds;
+    }
+
+    private static bool IsFactoryTokenExpired(FactoryOauth factoryOauth)
+    {
+        if (factoryOauth.ExpiresAt <= 0)
+        {
+            return false;
+        }
+
+        // 提前一点刷新，避免临界点卡住（尤其是流式请求）
+        const int expirySkewSeconds = 60;
+        var nowUnixSeconds = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        return factoryOauth.ExpiresAt <= nowUnixSeconds + expirySkewSeconds;
+    }
+
 
     private static void UpdateUsageFromResponse(StreamingState state, JsonElement response, JsonElement candidate)
     {

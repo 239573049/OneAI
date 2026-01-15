@@ -73,6 +73,14 @@ export const router = createBrowserRouter([
     ),
   },
   {
+    path: '/model-mapping',
+    element: (
+      <ProtectedRoute>
+        <Home />
+      </ProtectedRoute>
+    ),
+  },
+  {
     path: '*',
     element: <Navigate to="/" replace />,
   },
