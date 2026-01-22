@@ -36,6 +36,12 @@ public class KiroBatchAccountItem
 
     [JsonPropertyName("usageLimit")]
     public KiroBatchUsageLimit? UsageLimit { get; set; }
+
+    [JsonPropertyName("clientId")]
+    public string? ClientId { get; set; }
+    
+    [JsonPropertyName("clientSecret")]
+    public string? ClientSecret { get; set; }
 }
 
 /// <summary>

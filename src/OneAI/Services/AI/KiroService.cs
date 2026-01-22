@@ -459,6 +459,19 @@ public sealed class KiroService(
                     ? BuildAmazonQUrl(region)
                     : BuildBaseUrl(region);
 
+                if (credentials == null)
+                {
+                    lastErrorMessage = $"账户 {account.Id} 缺少有效凭证";
+                    lastStatusCode = HttpStatusCode.Unauthorized;
+                    await aiAccountService.DisableAccount(account.Id);
+                    if (attempt < MaxRetries)
+                    {
+                        continue;
+                    }
+
+                    break;
+                }
+
                 HttpResponseMessage response;
                 try
                 {
@@ -735,6 +748,17 @@ public sealed class KiroService(
         if (string.IsNullOrWhiteSpace(credentials.RefreshToken))
         {
             return (false, "缺少 refresh token");
+        }
+
+        var authMethod = string.IsNullOrWhiteSpace(credentials.AuthMethod)
+            ? AuthMethodSocial
+            : credentials.AuthMethod.Trim();
+
+        if (!string.Equals(authMethod, AuthMethodSocial, StringComparison.OrdinalIgnoreCase)
+            && (string.IsNullOrWhiteSpace(credentials.ClientId)
+                || string.IsNullOrWhiteSpace(credentials.ClientSecret)))
+        {
+            return (false, "缺少 clientId 或 clientSecret");
         }
 
         try
@@ -1447,14 +1471,14 @@ public sealed class KiroService(
             return true;
         }
 
-        if (!DateTimeOffset.TryParse(expiresAt, out var expiry))
+        if (!DateTime.TryParse(expiresAt, out var expiry))
         {
             return true;
         }
 
         // Increase buffer to 15 minutes to ensure token is refreshed well before expiry
         var nearMinutes = 15;
-        var threshold = DateTimeOffset.UtcNow.AddMinutes(nearMinutes);
+        var threshold = DateTime.Now.AddMinutes(nearMinutes);
         return expiry <= threshold;
     }
 
