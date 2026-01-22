@@ -19,7 +19,14 @@ export interface AIAccountDto {
 /**
  * 账户类型
  */
-export type AccountType = 'openai' | 'claude' | 'gemini' | 'gemini-antigravity' | 'factory' | 'kiro'
+export type AccountType =
+  | 'openai'
+  | 'claude'
+  | 'gemini'
+  | 'gemini-antigravity'
+  | 'gemini-business'
+  | 'factory'
+  | 'kiro'
 
 export interface AntigravityModelQuota {
   model: string
@@ -121,6 +128,46 @@ export interface ImportKiroCredentialsRequest {
   email?: string
 }
 
+export interface ImportGeminiBusinessCredentialsRequest {
+  credentials: string
+  accountName?: string
+  email?: string
+}
+
+/**
+ * Gemini Business批量导入单个账户的数据结构
+ */
+export interface GeminiBusinessBatchAccountItem {
+  secure_c_ses?: string
+  host_c_oses?: string
+  csesidx?: string
+  config_id?: string
+  expires_at?: string
+  disabled?: boolean
+  email?: string
+  id?: string
+}
+
+/**
+ * Gemini Business批量导入请求
+ */
+export interface ImportGeminiBusinessBatchRequest {
+  accounts: GeminiBusinessBatchAccountItem[]
+  skipExisting?: boolean
+  accountNamePrefix?: string
+}
+
+/**
+ * Gemini Business批量导入结果
+ */
+export interface ImportGeminiBusinessBatchResult {
+  successCount: number
+  failCount: number
+  skippedCount: number
+  successItems: ImportSuccessItem[]
+  failItems: ImportFailItem[]
+}
+
 /**
  * Kiro批量导入单个账户的数据结构
  */
@@ -215,4 +262,14 @@ export interface AccountQuotaStatus {
   antigravityModelQuotas?: AntigravityModelQuota[]
   kiroUsageBreakdownList?: KiroUsageBreakdown[]
   kiroFreeTrialInfo?: KiroFreeTrialInfo
+}
+
+/**
+ * 批量操作结果
+ */
+export interface BatchOperationResult {
+  successCount: number
+  failedCount: number
+  totalCount: number
+  failedIds: number[]
 }

@@ -66,7 +66,53 @@ public class AIAccountDto
     public int UsageCount { get; set; }
 
     /// <summary>
+    /// 累计请求Token数量
+    /// </summary>
+    public long PromptTokens { get; set; }
+
+    /// <summary>
+    /// 累计完成Token数量
+    /// </summary>
+    public long CompletionTokens { get; set; }
+
+    /// <summary>
+    /// 累计缓存Token数量
+    /// </summary>
+    public long CacheTokens { get; set; }
+
+    /// <summary>
+    /// 累计创建缓存Token数量
+    /// </summary>
+    public long CreateCacheTokens { get; set; }
+
+    /// <summary>
     /// Gemini 项目 ID（仅当提供商为 Gemini 时）
     /// </summary>
     public string? ProjectId { get; set; }
+}
+
+/// <summary>
+/// 批量操作结果
+/// </summary>
+public class BatchOperationResult
+{
+    /// <summary>
+    /// 成功数量
+    /// </summary>
+    public int SuccessCount { get; set; }
+
+    /// <summary>
+    /// 失败数量
+    /// </summary>
+    public int FailedCount { get; set; }
+
+    /// <summary>
+    /// 总数量
+    /// </summary>
+    public int TotalCount { get; set; }
+
+    /// <summary>
+    /// 失败的账户ID列表
+    /// </summary>
+    public List<int> FailedIds { get; set; } = new();
 }

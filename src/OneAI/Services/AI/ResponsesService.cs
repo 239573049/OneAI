@@ -1,4 +1,5 @@
 ﻿using System.Net;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.AspNetCore.Authorization;
@@ -65,7 +66,7 @@ public class ResponsesService
             AIProviderAsyncLocal.AIProviderIds = new List<int>(maxRetries);
 
             for (int attempt = 1; attempt <= maxRetries; attempt++)
-            {
+            {   
                 // 检查响应是否已经开始写入（一旦开始写入Body就不能重试）
                 if (context.Response.HasStarted)
                 {
@@ -316,6 +317,7 @@ public class ResponsesService
                         {
                             case HttpStatusCode.Unauthorized:
                             case HttpStatusCode.Forbidden:
+                                var value = await response.Content.ReadFromJsonAsync<CodexError>();
                                 _logger.LogError("账户 {AccountId} 认证失败 (401)，正在禁用该账户", account.Id);
                                 await aiAccountService.DisableAccount(account.Id);
 
@@ -444,13 +446,13 @@ public class ResponsesService
                             _quotaCache.SetConversationAccount(conversationId, account.Id);
                         }
 
-                        // 📊 记录成功（在开始流式传输前记录）
-                        await _requestLogService.RecordSuccess(
-                            logId,
-                            stopwatch,
-                            (int)response.StatusCode,
-                            timeToFirstByteMs: stopwatch.ElapsedMilliseconds, // 首字节时间
-                            quotaInfo: System.Text.Json.JsonSerializer.Serialize(quotaInfo));
+                        var timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
+                        int? promptTokens = null;
+                        int? completionTokens = null;
+                        int? totalTokens = null;
+                        int? cacheTokens = null;
+                        int? createCacheTokens = null;
+                        var quotaInfoJson = System.Text.Json.JsonSerializer.Serialize(quotaInfo);
 
                         // 开始写入响应Body（此后不能重试）
                         try
@@ -467,27 +469,54 @@ public class ResponsesService
                             // 立即刷新响应头，确保客户端收到 SSE 连接确认
                             await context.Response.Body.FlushAsync(context.RequestAborted);
 
-                            // 逐块读取和写入数据（使用 ArrayPool 避免重复分配）
-                            var bufferSize = 8192; // 8KB 缓冲区
-                            var buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(bufferSize);
-                            try
+                            using var reader = new StreamReader(stream, Encoding.UTF8);
+                            while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
                             {
-                                int bytesRead;
-                                while ((bytesRead = await stream.ReadAsync(buffer.AsMemory(0, bufferSize))) > 0)
+                                await context.Response.WriteAsync(line).ConfigureAwait(false);
+                                await context.Response.Body.WriteAsync(OpenAIConstant.NewLine).ConfigureAwait(false);
+                                await context.Response.Body.FlushAsync(context.RequestAborted).ConfigureAwait(false);
+
+                                if (!line.StartsWith(OpenAIConstant.Data, StringComparison.Ordinal))
                                 {
-                                    await context.Response.Body.WriteAsync(buffer.AsMemory(0, bytesRead));
-                                    await context.Response.Body.FlushAsync();
+                                    continue;
                                 }
-                            }
-                            finally
-                            {
-                                System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+
+                                var data = line[OpenAIConstant.Data.Length..].TrimStart();
+                                if (string.Equals(data, OpenAIConstant.Done, StringComparison.Ordinal))
+                                {
+                                    continue;
+                                }
+
+                                UpdateUsageFromResponsesPayload(
+                                    data,
+                                    ref promptTokens,
+                                    ref completionTokens,
+                                    ref totalTokens,
+                                    ref cacheTokens,
+                                    ref createCacheTokens);
                             }
                         }
                         catch (OperationCanceledException)
                         {
                             // 客户端取消请求（正常情况）
                             _logger.LogInformation("客户端取消请求 (账户: {AccountId})", account.Id);
+                            await _requestLogService.RecordSuccess(
+                                logId,
+                                stopwatch,
+                                (int)response.StatusCode,
+                                timeToFirstByteMs: timeToFirstByteMs,
+                                quotaInfo: quotaInfoJson,
+                                promptTokens: promptTokens,
+                                completionTokens: completionTokens,
+                                totalTokens: totalTokens,
+                                cacheTokens: cacheTokens,
+                                createCacheTokens: createCacheTokens);
+                            await aiAccountService.RecordTokenUsage(
+                                account.Id,
+                                promptTokens,
+                                completionTokens,
+                                cacheTokens,
+                                createCacheTokens);
                             return;
                         }
                         catch (Exception streamEx)
@@ -500,8 +529,43 @@ public class ResponsesService
                             // 注意：此时日志已经记录为"成功"，因为响应头已发送
                             // 流式传输中断通常是客户端断开，不需要更新日志状态
                             // 如果需要记录传输失败，可以在这里添加额外的日志
+                            await _requestLogService.RecordSuccess(
+                                logId,
+                                stopwatch,
+                                (int)response.StatusCode,
+                                timeToFirstByteMs: timeToFirstByteMs,
+                                quotaInfo: quotaInfoJson,
+                                promptTokens: promptTokens,
+                                completionTokens: completionTokens,
+                                totalTokens: totalTokens,
+                                cacheTokens: cacheTokens,
+                                createCacheTokens: createCacheTokens);
+                            await aiAccountService.RecordTokenUsage(
+                                account.Id,
+                                promptTokens,
+                                completionTokens,
+                                cacheTokens,
+                                createCacheTokens);
                             return;
                         }
+
+                        await _requestLogService.RecordSuccess(
+                            logId,
+                            stopwatch,
+                            (int)response.StatusCode,
+                            timeToFirstByteMs: timeToFirstByteMs,
+                            quotaInfo: quotaInfoJson,
+                            promptTokens: promptTokens,
+                            completionTokens: completionTokens,
+                            totalTokens: totalTokens,
+                            cacheTokens: cacheTokens,
+                            createCacheTokens: createCacheTokens);
+                        await aiAccountService.RecordTokenUsage(
+                            account.Id,
+                            promptTokens,
+                            completionTokens,
+                            cacheTokens,
+                            createCacheTokens);
 
                         // 成功返回
                         return;
@@ -691,21 +755,45 @@ public class ResponsesService
                             _quotaCache.SetConversationAccount(conversationId, account.Id);
                         }
 
-                        // 📊 记录成功（在开始流式传输前记录）
+                        var timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
+                        var responseBody = await response.Content.ReadAsStringAsync(context.RequestAborted);
+                        int? promptTokens = null;
+                        int? completionTokens = null;
+                        int? totalTokens = null;
+                        int? cacheTokens = null;
+                        int? createCacheTokens = null;
+
+                        UpdateUsageFromResponsesPayload(
+                            responseBody,
+                            ref promptTokens,
+                            ref completionTokens,
+                            ref totalTokens,
+                            ref cacheTokens,
+                            ref createCacheTokens);
+
                         await _requestLogService.RecordSuccess(
                             logId,
                             stopwatch,
                             (int)response.StatusCode,
-                            timeToFirstByteMs: stopwatch.ElapsedMilliseconds, // 首字节时间
-                            quotaInfo: System.Text.Json.JsonSerializer.Serialize(quotaInfo));
+                            timeToFirstByteMs: timeToFirstByteMs, // 首字节时间
+                            quotaInfo: System.Text.Json.JsonSerializer.Serialize(quotaInfo),
+                            promptTokens: promptTokens,
+                            completionTokens: completionTokens,
+                            totalTokens: totalTokens,
+                            cacheTokens: cacheTokens,
+                            createCacheTokens: createCacheTokens);
+                        await aiAccountService.RecordTokenUsage(
+                            account.Id,
+                            promptTokens,
+                            completionTokens,
+                            cacheTokens,
+                            createCacheTokens);
 
                         // 开始写入响应Body（此后不能重试）
                         try
                         {
-                            await using var stream = await response.Content.ReadAsStreamAsync(context.RequestAborted);
-
-                            await stream.CopyToAsync(context.Response.Body, context.RequestAborted);
-                            await context.Response.Body.FlushAsync();
+                            await context.Response.WriteAsync(responseBody, context.RequestAborted);
+                            await context.Response.Body.FlushAsync(context.RequestAborted);
                         }
                         catch (OperationCanceledException)
                         {
@@ -792,6 +880,139 @@ public class ResponsesService
 
             // 确保每次请求结束后清理 AsyncLocal，避免污染后续异步链路
             AIProviderAsyncLocal.AIProviderIds.Clear();
+        }
+    }
+
+    private static void UpdateUsageFromResponsesPayload(
+        string payload,
+        ref int? promptTokens,
+        ref int? completionTokens,
+        ref int? totalTokens,
+        ref int? cacheTokens,
+        ref int? createCacheTokens)
+    {
+        if (string.IsNullOrWhiteSpace(payload))
+        {
+            return;
+        }
+
+        if (!TryParseJson(payload, out var doc))
+        {
+            return;
+        }
+
+        using (doc)
+        {
+            var root = doc.RootElement;
+
+            if (TryGetUsageElement(root, out var usage))
+            {
+                ApplyResponsesUsage(usage, ref promptTokens, ref completionTokens, ref totalTokens, ref cacheTokens,
+                    ref createCacheTokens);
+            }
+
+            if (root.TryGetProperty("response", out var response) && response.ValueKind == JsonValueKind.Object)
+            {
+                if (TryGetUsageElement(response, out var responseUsage))
+                {
+                    ApplyResponsesUsage(responseUsage, ref promptTokens, ref completionTokens, ref totalTokens,
+                        ref cacheTokens, ref createCacheTokens);
+                }
+            }
+        }
+    }
+
+    private static bool TryGetUsageElement(JsonElement element, out JsonElement usage)
+    {
+        usage = default;
+        if (element.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        if (!element.TryGetProperty("usage", out var usageElement)
+            || usageElement.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        usage = usageElement;
+        return true;
+    }
+
+    private static void ApplyResponsesUsage(
+        JsonElement usage,
+        ref int? promptTokens,
+        ref int? completionTokens,
+        ref int? totalTokens,
+        ref int? cacheTokens,
+        ref int? createCacheTokens)
+    {
+        if (TryGetInt(usage, "input_tokens", out var inputTokens)
+            || TryGetInt(usage, "prompt_tokens", out inputTokens))
+        {
+            promptTokens = inputTokens;
+        }
+
+        if (TryGetInt(usage, "output_tokens", out var outputTokens)
+            || TryGetInt(usage, "completion_tokens", out outputTokens))
+        {
+            completionTokens = outputTokens;
+        }
+
+        if (TryGetInt(usage, "total_tokens", out var total))
+        {
+            totalTokens = total;
+        }
+
+        if (usage.TryGetProperty("input_tokens_details", out var inputDetails)
+            && inputDetails.ValueKind == JsonValueKind.Object)
+        {
+            if (TryGetInt(inputDetails, "cached_tokens", out var cached))
+            {
+                cacheTokens = cached;
+            }
+
+            if (TryGetInt(inputDetails, "cache_creation_tokens", out var cacheCreation)
+                || TryGetInt(inputDetails, "cache_creation_input_tokens", out cacheCreation))
+            {
+                createCacheTokens = cacheCreation;
+            }
+        }
+
+        if (!totalTokens.HasValue && promptTokens.HasValue && completionTokens.HasValue)
+        {
+            totalTokens = promptTokens.Value + completionTokens.Value;
+        }
+    }
+
+    private static bool TryGetInt(JsonElement element, string propertyName, out int value)
+    {
+        value = default;
+        if (!element.TryGetProperty(propertyName, out var prop))
+        {
+            return false;
+        }
+
+        if (prop.ValueKind != JsonValueKind.Number)
+        {
+            return false;
+        }
+
+        return prop.TryGetInt32(out value);
+    }
+
+    private static bool TryParseJson(string payload, out JsonDocument doc)
+    {
+        try
+        {
+            doc = JsonDocument.Parse(payload);
+            return true;
+        }
+        catch (JsonException)
+        {
+            doc = null!;
+            return false;
         }
     }
 
@@ -926,4 +1147,18 @@ public class ResponsesService
 
         await context.Response.WriteAsync(payload.ToJsonString());
     }
+}
+
+public class CodexError
+{
+    public Error error { get; set; }
+    public int status { get; set; }
+}
+
+public class Error
+{
+    public string message { get; set; }
+    public string type { get; set; }
+    public string code { get; set; }
+    public object param { get; set; }
 }

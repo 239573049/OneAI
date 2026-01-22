@@ -91,11 +91,7 @@ public class AIRequestLogService
             AccountId = account?.Id,
             Provider = account?.Provider,
             Model = model,
-            Instructions = null,
             IsStreaming = isStreaming,
-            RequestParams = null,
-            MessageSummary = string.Empty,
-
             // 初始状态
             IsSuccess = false,
             RetryCount = 0,
@@ -179,7 +175,9 @@ public class AIRequestLogService
         string? quotaInfo = null,
         int? promptTokens = null,
         int? completionTokens = null,
-        int? totalTokens = null)
+        int? totalTokens = null,
+        int? cacheTokens = null,
+        int? createCacheTokens = null)
     {
         stopwatch.Stop();
         var now = DateTime.Now;
@@ -199,6 +197,8 @@ public class AIRequestLogService
                 { "PromptTokens", promptTokens },
                 { "CompletionTokens", completionTokens },
                 { "TotalTokens", totalTokens },
+                { "CacheTokens", cacheTokens },
+                { "CreateCacheTokens", createCacheTokens },
                 { "UpdatedAt", now }
             }
         };

@@ -1,50 +1,50 @@
 using OneAI.Data;
 using OneAI.Models;
-using OneAI.Services.KiroOAuth;
+using OneAI.Services.GeminiBusinessOAuth;
 
 namespace OneAI.Endpoints;
 
 /// <summary>
-/// Kiro OAuth/Reverse credentials endpoints
+/// Gemini Business credentials endpoints
 /// </summary>
-public static class KiroOAuthEndpoints
+public static class GeminiBusinessOAuthEndpoints
 {
     /// <summary>
-    /// Map Kiro OAuth endpoints
+    /// Map Gemini Business credentials endpoints
     /// </summary>
-    public static void MapKiroOAuthEndpoints(this IEndpointRouteBuilder endpoints)
+    public static void MapGeminiBusinessOAuthEndpoints(this IEndpointRouteBuilder endpoints)
     {
-        var group = endpoints.MapGroup("/api/kiro/oauth")
-            .WithTags("Kiro OAuth")
+        var group = endpoints.MapGroup("/api/gemini-business/oauth")
+            .WithTags("Gemini Business OAuth")
             .RequireAuthorization();
 
-        group.MapPost("/import", ImportKiroCredentials)
-            .WithName("ImportKiroCredentials")
-            .WithSummary("导入 Kiro 凭证")
-            .WithDescription("导入 Kiro 逆向凭证并创建账户")
+        group.MapPost("/import", ImportGeminiBusinessCredentials)
+            .WithName("ImportGeminiBusinessCredentials")
+            .WithSummary("导入 Gemini Business 凭证")
+            .WithDescription("导入 Gemini Business 逆向凭证并创建账户")
             .Produces<ApiResponse<AIAccountDto>>(200)
             .Produces<ApiResponse>(400)
             .Produces<ApiResponse>(401)
             .Produces<ApiResponse>(500);
 
-        group.MapPost("/import/batch", ImportKiroBatch)
-            .WithName("ImportKiroBatch")
-            .WithSummary("批量导入 Kiro 凭证")
-            .WithDescription("批量导入多个 Kiro 逆向凭证并创建账户")
-            .Produces<ApiResponse<ImportKiroBatchResult>>(200)
+        group.MapPost("/import/batch", ImportGeminiBusinessBatch)
+            .WithName("ImportGeminiBusinessBatch")
+            .WithSummary("批量导入 Gemini Business 凭证")
+            .WithDescription("批量导入多个 Gemini Business 逆向凭证并创建账户")
+            .Produces<ApiResponse<ImportGeminiBusinessBatchResult>>(200)
             .Produces<ApiResponse>(400)
             .Produces<ApiResponse>(401)
             .Produces<ApiResponse>(500);
     }
 
-    private static async Task<IResult> ImportKiroCredentials(
-        ImportKiroCredentialsRequest request,
-        KiroOAuthService kiroOAuthService,
+    private static async Task<IResult> ImportGeminiBusinessCredentials(
+        ImportGeminiBusinessCredentialsRequest request,
+        GeminiBusinessOAuthService geminiBusinessOAuthService,
         AppDbContext dbContext)
     {
         try
         {
-            var account = await kiroOAuthService.ImportKiroCredentialsAsync(dbContext, request);
+            var account = await geminiBusinessOAuthService.ImportGeminiBusinessCredentialsAsync(dbContext, request);
 
             return Results.Json(ApiResponse<AIAccountDto>.Success(new AIAccountDto
             {
@@ -64,7 +64,7 @@ public static class KiroOAuthEndpoints
                 CompletionTokens = account.CompletionTokens,
                 CacheTokens = account.CacheTokens,
                 CreateCacheTokens = account.CreateCacheTokens
-            }, "Kiro 凭证导入成功，账户已创建"));
+            }, "Gemini Business 凭证导入成功，账户已创建"));
         }
         catch (ArgumentException ex)
         {
@@ -76,15 +76,15 @@ public static class KiroOAuthEndpoints
         catch (Exception ex)
         {
             return Results.Json(
-                ApiResponse.Fail($"导入 Kiro 凭证失败: {ex.Message}", 500),
+                ApiResponse.Fail($"导入 Gemini Business 凭证失败: {ex.Message}", 500),
                 statusCode: 500
             );
         }
     }
 
-    private static async Task<IResult> ImportKiroBatch(
-        ImportKiroBatchRequest request,
-        KiroOAuthService kiroOAuthService,
+    private static async Task<IResult> ImportGeminiBusinessBatch(
+        ImportGeminiBusinessBatchRequest request,
+        GeminiBusinessOAuthService geminiBusinessOAuthService,
         AppDbContext dbContext)
     {
         try
@@ -97,9 +97,9 @@ public static class KiroOAuthEndpoints
                 );
             }
 
-            var result = await kiroOAuthService.ImportKiroBatchAsync(dbContext, request);
+            var result = await geminiBusinessOAuthService.ImportGeminiBusinessBatchAsync(dbContext, request);
 
-            return Results.Json(ApiResponse<ImportKiroBatchResult>.Success(result,
+            return Results.Json(ApiResponse<ImportGeminiBusinessBatchResult>.Success(result,
                 $"批量导入完成：成功 {result.SuccessCount} 个，失败 {result.FailCount} 个，跳过 {result.SkippedCount} 个"));
         }
         catch (ArgumentException ex)
@@ -112,7 +112,7 @@ public static class KiroOAuthEndpoints
         catch (Exception ex)
         {
             return Results.Json(
-                ApiResponse.Fail($"批量导入 Kiro 凭证失败: {ex.Message}", 500),
+                ApiResponse.Fail($"批量导入 Gemini Business 凭证失败: {ex.Message}", 500),
                 statusCode: 500
             );
         }

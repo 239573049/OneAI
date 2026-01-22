@@ -92,7 +92,7 @@ npm run dev
 ### 核心功能
 
 #### AI 账户管理
-- ✅ **多服务商支持**：OpenAI、Claude、Gemini、Gemini-Antigravity、Factory
+- ✅ **多服务商支持**：OpenAI、Claude、Gemini、Gemini-Antigravity、Gemini-Business、Factory、Kiro
 - ✅ **多种认证方式**：
   - API Key 认证
   - OAuth 2.0 认证（Authorization Code + PKCE）
@@ -136,12 +136,12 @@ npm run dev
 
 ### 待实现
 
-- [ ] AI 账户前端页面（CRUD UI）
+- [x] ~~AI 账户前端页面（CRUD UI）~~ - 已完成
 - [ ] 账户测试功能
 - [ ] 使用统计可视化
 - [ ] 多用户支持
 - [ ] 账户分组
-- [ ] 导入/导出功能
+- [x] ~~导入/导出功能~~ - 已完成（Kiro 批量导入、Gemini-Business 批量导入）
 - [ ] OAuth Token 刷新机制
 
 ## API 接口
@@ -378,7 +378,9 @@ src/OneAI/
   - `OpenAiOAuthHelper` - Authorization Code + PKCE
   - `ClaudeCodeOAuthHelper` - Authorization Code + PKCE
   - `GeminiAntigravityOAuthHelper` / `GeminiOAuthHelper` - Authorization Code + PKCE
+  - `GeminiBusinessOAuthService` - Authorization Code + PKCE（business.gemini.google）
   - `FactoryOAuthService` - Device Authorization Flow（RFC 8628，通过 WorkOS）
+  - `KiroOAuthService` - Amazon CodeWhisperer via Kiro OAuth
 - OAuth Token 以 JSON 格式存储在 `AIAccount.OAuthToken` 字段
 - Factory 使用设备授权流程：用户通过设备码授权，应用轮询 Token 端点
 
@@ -439,12 +441,14 @@ web/src/
 - 支持 `ApiKey` 和 `OAuthToken`（JSON 字段）两种认证方式
 - `IsEnabled` - 软删除/禁用标记
 - `IsRateLimited` - 配额超限标记
-- `Provider` - 服务商名称（OpenAI, Claude, Factory, Gemini, Gemini-Antigravity）
+- `Provider` - 服务商名称（OpenAI, Claude, Factory, Gemini, Gemini-Antigravity, Gemini-Business, Kiro）
 - OAuth 序列化扩展方法：
+  - `GetOpenAiOauth()` / `SetOpenAIOAuth()`
   - `GetClaudeOauth()` / `SetClaudeOAuth()`
-  - `GetFactoryOAuth()` / `SetFactoryOAuth()`
-  - `GetGeminiOAuth()` / `SetGeminiOAuth()`
-  - `GetOpenAIOAuth()` / `SetOpenAIOAuth()`
+  - `GetGeminiOauth()` / `SetGeminiOAuth()`
+  - `GetGeminiBusinessOauth()` / `SetGeminiBusinessOAuth()`
+  - `GetFactoryOauth()` / `SetFactoryOAuth()`
+  - `GetKiroOauth()` / `SetKiroOAuth()`
 
 **AIRequestLog**（请求日志）：
 - 通过 `AccountId` 关联到 `AIAccount`

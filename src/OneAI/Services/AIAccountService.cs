@@ -402,6 +402,42 @@ public class AIAccountService
     }
 
     /// <summary>
+    /// 记录账户的 Token 使用量（原子更新）
+    /// </summary>
+    public async Task RecordTokenUsage(
+        int accountId,
+        int? promptTokens,
+        int? completionTokens,
+        int? cacheTokens,
+        int? createCacheTokens)
+    {
+        if (accountId <= 0)
+        {
+            return;
+        }
+
+        if (!promptTokens.HasValue && !completionTokens.HasValue && !cacheTokens.HasValue && !createCacheTokens.HasValue)
+        {
+            return;
+        }
+
+        var promptDelta = Math.Max(0, promptTokens ?? 0);
+        var completionDelta = Math.Max(0, completionTokens ?? 0);
+        var cacheDelta = Math.Max(0, cacheTokens ?? 0);
+        var createCacheDelta = Math.Max(0, createCacheTokens ?? 0);
+        var now = DateTime.UtcNow;
+
+        await _appDbContext.AIAccounts
+            .Where(x => x.Id == accountId)
+            .ExecuteUpdateAsync(setters => setters
+                .SetProperty(a => a.PromptTokens, a => a.PromptTokens + promptDelta)
+                .SetProperty(a => a.CompletionTokens, a => a.CompletionTokens + completionDelta)
+                .SetProperty(a => a.CacheTokens, a => a.CacheTokens + cacheDelta)
+                .SetProperty(a => a.CreateCacheTokens, a => a.CreateCacheTokens + createCacheDelta)
+                .SetProperty(a => a.UpdatedAt, now));
+    }
+
+    /// <summary>
     /// 禁用账户（用于401等认证失败的情况，使用原子更新）
     /// </summary>
     /// <param name="accountId">账户ID</param>
@@ -446,7 +482,11 @@ public class AIAccountService
                 CreatedAt = a.CreatedAt,
                 UpdatedAt = a.UpdatedAt,
                 LastUsedAt = a.LastUsedAt,
-                UsageCount = a.UsageCount
+                UsageCount = a.UsageCount,
+                PromptTokens = a.PromptTokens,
+                CompletionTokens = a.CompletionTokens,
+                CacheTokens = a.CacheTokens,
+                CreateCacheTokens = a.CreateCacheTokens
             })
             .ToListAsync();
 
@@ -595,7 +635,11 @@ public class AIAccountService
             CreatedAt = account.CreatedAt,
             UpdatedAt = account.UpdatedAt,
             LastUsedAt = account.LastUsedAt,
-            UsageCount = account.UsageCount
+            UsageCount = account.UsageCount,
+            PromptTokens = account.PromptTokens,
+            CompletionTokens = account.CompletionTokens,
+            CacheTokens = account.CacheTokens,
+            CreateCacheTokens = account.CreateCacheTokens
         };
     }
 
@@ -1389,7 +1433,7 @@ public class AIAccountService
 
             // 构建状态描述
             var statusDescription = $"{creditsItem.DisplayName ?? "Credits"} 使用: {usedPercent}%";
-            if (resetAfterSeconds.HasValue && resetAfterSeconds > 0)
+            if (resetAfterSeconds is > 0)
             {
                 var hours = resetAfterSeconds.Value / 3600;
                 var minutes = (resetAfterSeconds.Value % 3600) / 60;
@@ -1678,5 +1722,114 @@ public class AIAccountService
         }
 
         return trimmed + "/v1/messages?beta=true";
+    }
+
+    /// <summary>
+    /// 批量删除 AI 账户
+    /// </summary>
+    /// <param name="accountIds">账户 ID 列表</param>
+    /// <returns>批量操作结果</returns>
+    public async Task<BatchOperationResult> BatchDeleteAccountsAsync(List<int> accountIds)
+    {
+        var result = new BatchOperationResult
+        {
+            TotalCount = accountIds.Count
+        };
+
+        if (accountIds.Count == 0)
+        {
+            return result;
+        }
+
+        foreach (var id in accountIds)
+        {
+            try
+            {
+                var deleted = await DeleteAccountAsync(id);
+                if (deleted)
+                {
+                    result.SuccessCount++;
+                }
+                else
+                {
+                    result.FailedCount++;
+                    result.FailedIds.Add(id);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "批量删除账户 {AccountId} 失败", id);
+                result.FailedCount++;
+                result.FailedIds.Add(id);
+            }
+        }
+
+        _logger.LogInformation(
+            "批量删除账户完成: 成功 {SuccessCount}, 失败 {FailedCount}",
+            result.SuccessCount,
+            result.FailedCount);
+
+        return result;
+    }
+
+    /// <summary>
+    /// 批量设置 AI 账户状态
+    /// </summary>
+    /// <param name="accountIds">账户 ID 列表</param>
+    /// <param name="isEnabled">是否启用</param>
+    /// <returns>批量操作结果</returns>
+    public async Task<BatchOperationResult> BatchSetAccountStatusAsync(List<int> accountIds, bool isEnabled)
+    {
+        var result = new BatchOperationResult
+        {
+            TotalCount = accountIds.Count
+        };
+
+        if (accountIds.Count == 0)
+        {
+            return result;
+        }
+
+        var updateTime = DateTime.UtcNow;
+
+        try
+        {
+            var affectedRows = await _appDbContext.AIAccounts
+                .Where(x => accountIds.Contains(x.Id))
+                .ExecuteUpdateAsync(setters => setters
+                    .SetProperty(a => a.IsEnabled, isEnabled)
+                    .SetProperty(a => a.UpdatedAt, updateTime));
+
+            result.SuccessCount = affectedRows;
+            result.FailedCount = accountIds.Count - affectedRows;
+
+            // 找出未更新的账户（可能不存在）
+            if (result.FailedCount > 0)
+            {
+                var existingIds = await _appDbContext.AIAccounts
+                    .Where(x => accountIds.Contains(x.Id))
+                    .Select(x => x.Id)
+                    .ToListAsync();
+
+                result.FailedIds = accountIds.Except(existingIds).ToList();
+            }
+
+            // 清除账户列表缓存
+            _quotaCache.ClearAccountsCache();
+
+            _logger.LogInformation(
+                "批量{Action}账户完成: 成功 {SuccessCount}, 失败 {FailedCount}",
+                isEnabled ? "启用" : "禁用",
+                result.SuccessCount,
+                result.FailedCount);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "批量{Action}账户失败", isEnabled ? "启用" : "禁用");
+            result.FailedCount = accountIds.Count;
+            result.FailedIds = accountIds;
+        }
+
+        return result;
     }
 }

@@ -47,12 +47,7 @@ public class LogDbContext : DbContext
             entity.Property(e => e.SessionId).HasMaxLength(100);
             entity.Property(e => e.Provider).HasMaxLength(50);
             entity.Property(e => e.Model).HasMaxLength(100).IsRequired();
-            entity.Property(e => e.Instructions).HasMaxLength(2000);
-            entity.Property(e => e.RequestParams).HasMaxLength(2000);
-            entity.Property(e => e.MessageSummary).HasMaxLength(500);
-            entity.Property(e => e.RequestBody); // 无长度限制（TEXT）
             entity.Property(e => e.ErrorMessage).HasMaxLength(5000);
-            entity.Property(e => e.ResponseSummary); // 无长度限制（TEXT）
             entity.Property(e => e.QuotaInfo).HasMaxLength(2000);
             entity.Property(e => e.ClientIp).HasMaxLength(50);
             entity.Property(e => e.UserAgent).HasMaxLength(500);

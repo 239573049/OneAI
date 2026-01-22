@@ -33,4 +33,10 @@ public class KiroOAuthCredentialsDto
 
     [JsonPropertyName("uuid")]
     public string? Uuid { get; set; }
+
+    [JsonPropertyName("machineId")]
+    public string? MachineId { get; set; }
+
+    [JsonPropertyName("email")]
+    public string? Email { get; set; }
 }

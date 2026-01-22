@@ -318,6 +318,12 @@ public class GeminiAPIService(
                                 promptTokens: promptTokens,
                                 completionTokens: completionTokens,
                                 totalTokens: totalTokens);
+                            await aiAccountService.RecordTokenUsage(
+                                account.Id,
+                                promptTokens,
+                                completionTokens,
+                                cacheTokens: null,
+                                createCacheTokens: null);
 
                             context.Response.ContentType = "application/json";
                             context.Response.StatusCode = (int)response.StatusCode;
@@ -558,17 +564,17 @@ public class GeminiAPIService(
                         quotaCache.SetConversationAccount(conversationId, account.Id);
                     }
 
-                    await requestLogService.RecordSuccess(
-                        logId,
-                        stopwatch,
-                        (int)response.StatusCode,
-                        timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
-
                     // 流式传输响应
                     context.Response.ContentType = "text/event-stream;charset=utf-8";
                     context.Response.Headers.TryAdd("Cache-Control", "no-cache");
                     context.Response.Headers.TryAdd("Connection", "keep-alive");
                     context.Response.StatusCode = (int)response.StatusCode;
+
+                    int? promptTokens = null;
+                    int? completionTokens = null;
+                    int? totalTokens = null;
+                    long? timeToFirstByteMs = null;
+                    var wroteAnyData = false;
 
                     try
                     {
@@ -587,12 +593,22 @@ public class GeminiAPIService(
 
                             if (!TryParseSseDataLine(line, out var prefix, out var data))
                             {
+                                if (!wroteAnyData)
+                                {
+                                    timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
+                                    wroteAnyData = true;
+                                }
                                 await WriteSseLineAsync(context, line, context.RequestAborted);
                                 continue;
                             }
 
                             if (string.Equals(data, "[DONE]", StringComparison.OrdinalIgnoreCase))
                             {
+                                if (!wroteAnyData)
+                                {
+                                    timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
+                                    wroteAnyData = true;
+                                }
                                 await WriteSseLineAsync(context, line, context.RequestAborted);
                                 await WriteSseLineAsync(context, string.Empty, context.RequestAborted);
                                 break;
@@ -600,14 +616,47 @@ public class GeminiAPIService(
 
                             if (string.IsNullOrWhiteSpace(data) || !TryParseJson(data, out var doc))
                             {
+                                if (!wroteAnyData)
+                                {
+                                    timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
+                                    wroteAnyData = true;
+                                }
                                 await WriteSseLineAsync(context, line, context.RequestAborted);
                                 continue;
                             }
 
                             using (doc)
                             {
-                                if (TryGetResponseAndCandidate(doc.RootElement, out var responseElement, out _))
+                                if (TryGetResponseAndCandidate(doc.RootElement, out var responseElement, out var candidate))
                                 {
+                                    if (TryGetUsageMetadata(
+                                            responseElement,
+                                            candidate,
+                                            out var chunkPromptTokens,
+                                            out var chunkCompletionTokens,
+                                            out var chunkTotalTokens))
+                                    {
+                                        if (chunkPromptTokens.HasValue)
+                                        {
+                                            promptTokens = chunkPromptTokens;
+                                        }
+
+                                        if (chunkCompletionTokens.HasValue)
+                                        {
+                                            completionTokens = chunkCompletionTokens;
+                                        }
+
+                                        if (chunkTotalTokens.HasValue)
+                                        {
+                                            totalTokens = chunkTotalTokens;
+                                        }
+                                    }
+
+                                    if (!wroteAnyData)
+                                    {
+                                        timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
+                                        wroteAnyData = true;
+                                    }
                                     await WriteSseLineAsync(
                                         context,
                                         prefix + responseElement.GetRawText(),
@@ -615,6 +664,11 @@ public class GeminiAPIService(
                                 }
                                 else
                                 {
+                                    if (!wroteAnyData)
+                                    {
+                                        timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
+                                        wroteAnyData = true;
+                                    }
                                     await WriteSseLineAsync(context, line, context.RequestAborted);
                                 }
                             }
@@ -631,6 +685,24 @@ public class GeminiAPIService(
                             "Gemini 流式传输过程中发生异常 (账户: {AccountId})",
                             account.Id);
                         return;
+                    }
+                    finally
+                    {
+                        await requestLogService.RecordSuccess(
+                            logId,
+                            stopwatch,
+                            (int)response.StatusCode,
+                            timeToFirstByteMs: timeToFirstByteMs ?? stopwatch.ElapsedMilliseconds,
+                            promptTokens: promptTokens,
+                            completionTokens: completionTokens,
+                            totalTokens: totalTokens);
+
+                        await aiAccountService.RecordTokenUsage(
+                            account.Id,
+                            promptTokens,
+                            completionTokens,
+                            cacheTokens: null,
+                            createCacheTokens: null);
                     }
 
                     return;

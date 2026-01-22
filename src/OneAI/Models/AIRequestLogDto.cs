@@ -60,15 +60,12 @@ public class AIRequestLogDto
     // 请求信息
     public string Model { get; set; } = string.Empty;
     public bool IsStreaming { get; set; }
-    public string? MessageSummary { get; set; }
-
     // 响应信息
     public int? StatusCode { get; set; }
     public bool IsSuccess { get; set; }
     public string? ErrorMessage { get; set; }
     public int RetryCount { get; set; }
     public int TotalAttempts { get; set; }
-    public string? ResponseSummary { get; set; }
 
     // Token使用
     public int? PromptTokens { get; set; }

@@ -43,31 +43,9 @@ public class AIRequestLog
     public string Model { get; set; } = string.Empty;
 
     /// <summary>
-    /// 系统提示词/指令
-    /// </summary>
-    public string? Instructions { get; set; }
-
-    /// <summary>
     /// 是否为流式传输
     /// </summary>
     public bool IsStreaming { get; set; }
-
-    /// <summary>
-    /// 请求参数（JSON格式）
-    /// </summary>
-    public string? RequestParams { get; set; }
-
-    /// <summary>
-    /// 消息内容摘要（前500字符）
-    /// </summary>
-    public string? MessageSummary { get; set; }
-
-    /// <summary>
-    /// 完整请求体（仅调试模式记录）
-    /// </summary>
-    public string? RequestBody { get; set; }
-
-    // ==================== 响应信息 ====================
 
     /// <summary>
     /// HTTP状态码
@@ -95,16 +73,19 @@ public class AIRequestLog
     public int TotalAttempts { get; set; }
 
     /// <summary>
-    /// 响应内容摘要（前1000字符）
-    /// </summary>
-    public string? ResponseSummary { get; set; }
-
-    // ==================== Token使用情况 ====================
-
-    /// <summary>
     /// 提示Token数量
     /// </summary>
     public int? PromptTokens { get; set; }
+
+    /// <summary>
+    /// 使用换成Token数量
+    /// </summary>
+    public int? CacheTokens { get; set; }
+
+    /// <summary>
+    /// 创建缓存tokens
+    /// </summary>
+    public int? CreateCacheTokens { get; set; }
 
     /// <summary>
     /// 完成Token数量
@@ -191,8 +172,6 @@ public class AIRequestLog
     /// 扩展信息（JSON格式，用于存储额外的自定义数据）
     /// </summary>
     public string? ExtensionData { get; set; }
-
-    // ==================== 导航属性 ====================
 
     /// <summary>
     /// 关联的AI账户

@@ -4,8 +4,8 @@ import { AlertCircle, Loader, ExternalLink, Copy, Check } from 'lucide-react'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from '@/components/animate-ui/components/radix/dialog'
 import { Button } from '@/components/animate-ui/components/buttons/button'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/animate-ui/components/card'
-import { openaiOAuthService, claudeOAuthService, factoryOAuthService, geminiOAuthService, geminiAntigravityOAuthService, kiroOAuthService } from '@/services/account'
-import type { AccountType, GenerateFactoryDeviceCodeResponse, GenerateOAuthUrlResponse, AIAccountDto } from '@/types/account'
+import { openaiOAuthService, claudeOAuthService, factoryOAuthService, geminiOAuthService, geminiAntigravityOAuthService, kiroOAuthService, geminiBusinessOAuthService } from '@/services/account'
+import type { AccountType, GenerateFactoryDeviceCodeResponse, AIAccountDto } from '@/types/account'
 
 interface AddAccountDialogProps {
   open: boolean
@@ -28,6 +28,9 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
   const [kiroCredentials, setKiroCredentials] = useState('')
   const [kiroAccountName, setKiroAccountName] = useState('')
   const [kiroEmail, setKiroEmail] = useState('')
+  const [geminiBusinessCredentials, setGeminiBusinessCredentials] = useState('')
+  const [geminiBusinessAccountName, setGeminiBusinessAccountName] = useState('')
+  const [geminiBusinessEmail, setGeminiBusinessEmail] = useState('')
   const [proxyEnabled, setProxyEnabled] = useState(false)
   const [proxyType, setProxyType] = useState<'http' | 'https' | 'socks5'>('http')
   const [proxyHost, setProxyHost] = useState('')
@@ -212,6 +215,34 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
     }
   }
 
+  const handleImportGeminiBusinessCredentials = async () => {
+    if (!geminiBusinessCredentials.trim()) {
+      setError('请粘贴 Gemini Business 凭证内容')
+      return
+    }
+
+    try {
+      setProcessingCode(true)
+      setError(null)
+
+      const account = await geminiBusinessOAuthService.importCredentials({
+        credentials: geminiBusinessCredentials.trim(),
+        accountName: geminiBusinessAccountName.trim() || undefined,
+        email: geminiBusinessEmail.trim() || undefined,
+      })
+
+      onAccountAdded?.(account)
+      resetForm()
+      onOpenChange(false)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '导入 Gemini Business 凭证失败'
+      setError(message)
+      console.error('Failed to import Gemini Business credentials:', err)
+    } finally {
+      setProcessingCode(false)
+    }
+  }
+
   const handleCompleteFactoryDeviceCode = async () => {
     if (!sessionId) {
       setError('请先生成 Device Code')
@@ -292,6 +323,9 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
     setKiroCredentials('')
     setKiroAccountName('')
     setKiroEmail('')
+    setGeminiBusinessCredentials('')
+    setGeminiBusinessAccountName('')
+    setGeminiBusinessEmail('')
     setProxyEnabled(false)
   }
 
@@ -379,6 +413,19 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
               }`}
             >
               Gemini-Antigravity
+            </button>
+            <button
+              onClick={() => {
+                setAccountType('gemini-business')
+                resetForm()
+              }}
+              className={`px-4 py-2 font-medium border-b-2 transition-colors ${
+                accountType === 'gemini-business'
+                  ? 'border-primary text-primary'
+                  : 'border-transparent text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              Gemini-Business
             </button>
             <button
               onClick={() => {
@@ -1058,6 +1105,61 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
             </motion.div>
           )}
 
+          {/* Gemini Business Reverse Flow */}
+          {accountType === 'gemini-business' && (
+            <motion.div
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              className="space-y-4"
+            >
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base">Gemini Business 凭证导入</CardTitle>
+                  <CardDescription>
+                    粘贴 Gemini Business 凭证 JSON 或 Base64 内容（需包含 secure_c_ses / csesidx / config_id）
+                  </CardDescription>
+                </CardHeader>
+                <CardContent className="space-y-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">账户名称（可选）</label>
+                      <input
+                        type="text"
+                        placeholder="例如: GeminiBiz-主账号"
+                        value={geminiBusinessAccountName}
+                        onChange={(e) => setGeminiBusinessAccountName(e.target.value)}
+                        className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-medium">邮箱（可选）</label>
+                      <input
+                        type="email"
+                        placeholder="账号邮箱"
+                        value={geminiBusinessEmail}
+                        onChange={(e) => setGeminiBusinessEmail(e.target.value)}
+                        className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                      />
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm font-medium">Gemini Business 凭证内容</label>
+                    <textarea
+                      rows={6}
+                      placeholder="粘贴单个账户 JSON（或 Base64）"
+                      value={geminiBusinessCredentials}
+                      onChange={(e) => setGeminiBusinessCredentials(e.target.value)}
+                      className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      支持 JSON / Base64，两种格式任选其一。
+                    </p>
+                  </div>
+                </CardContent>
+              </Card>
+            </motion.div>
+          )}
+
           {/* Kiro Reverse Flow */}
           {accountType === 'kiro' && (
             <motion.div
@@ -1124,7 +1226,7 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
             </Button>
             {(accountType === 'factory'
               ? !!factoryDeviceCode
-              : accountType === 'kiro'
+              : accountType === 'kiro' || accountType === 'gemini-business'
               ? true
               : !!authUrl) && (
               <Button
@@ -1132,11 +1234,15 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
                   ? handleCompleteFactoryDeviceCode
                   : accountType === 'kiro'
                   ? handleImportKiroCredentials
+                  : accountType === 'gemini-business'
+                  ? handleImportGeminiBusinessCredentials
                   : handleExchangeCode}
                 disabled={accountType === 'factory'
                   ? processingCode
                   : accountType === 'kiro'
                   ? (!kiroCredentials.trim() || processingCode)
+                  : accountType === 'gemini-business'
+                  ? (!geminiBusinessCredentials.trim() || processingCode)
                   : (!authCode.trim() || processingCode)}
                 className="gap-2"
               >
@@ -1146,7 +1252,7 @@ export function AddAccountDialog({ open, onOpenChange, onAccountAdded }: AddAcco
                     处理中...
                   </>
                 ) : (
-                  accountType === 'kiro' ? '保存凭证' : '完成授权'
+                  accountType === 'kiro' || accountType === 'gemini-business' ? '保存凭证' : '完成授权'
                 )}
               </Button>
             )}

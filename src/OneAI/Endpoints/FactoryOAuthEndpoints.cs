@@ -81,7 +81,11 @@ public static class FactoryOAuthEndpoints
                 CreatedAt = account.CreatedAt,
                 UpdatedAt = account.UpdatedAt,
                 LastUsedAt = account.LastUsedAt,
-                UsageCount = account.UsageCount
+                UsageCount = account.UsageCount,
+                PromptTokens = account.PromptTokens,
+                CompletionTokens = account.CompletionTokens,
+                CacheTokens = account.CacheTokens,
+                CreateCacheTokens = account.CreateCacheTokens
             }, "OAuth 认证成功，账户已创建"));
         }
         catch (ArgumentException ex)
@@ -100,4 +104,3 @@ public static class FactoryOAuthEndpoints
         }
     }
 }
-

@@ -9,6 +9,7 @@ using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Net.Http.Headers;
 using System.Runtime.CompilerServices;
+using ClaudeCodeProxy.Abstraction;
 using OneAI.Constants;
 using OneAI.Entities;
 using OneAI.Extensions;
@@ -154,46 +155,16 @@ public sealed class KiroService(
                 AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
                 await requestLogService.UpdateRetry(logId, attempt, account.Id);
 
-                var credentials = account.GetKiroOauth();
-                if (credentials == null)
+                // Use helper method to ensure valid token
+                var (tokenValid, credentials, tokenError) = await EnsureValidTokenAsync(account, aiAccountService);
+                if (!tokenValid)
                 {
-                    lastErrorMessage = $"账户 {account.Id} 缺少有效凭证";
+                    lastErrorMessage = tokenError;
                     lastStatusCode = HttpStatusCode.Unauthorized;
-                    await aiAccountService.DisableAccount(account.Id);
                     if (attempt < MaxRetries)
                     {
                         continue;
                     }
-
-                    break;
-                }
-
-                if (IsExpiryDateNear(credentials))
-                {
-                    var (refreshed, refreshError) = await TryRefreshKiroTokenAsync(account, credentials);
-                    if (refreshed)
-                    {
-                        credentials = account.GetKiroOauth();
-                    }
-                    else if (!string.IsNullOrWhiteSpace(refreshError))
-                    {
-                        logger.LogWarning(
-                            "Kiro Token 预刷新失败 (账户: {AccountId}): {Error}",
-                            account.Id,
-                            refreshError);
-                    }
-                }
-
-                if (string.IsNullOrWhiteSpace(credentials?.AccessToken))
-                {
-                    lastErrorMessage = $"账户 {account.Id} 缺少访问令牌";
-                    lastStatusCode = HttpStatusCode.Unauthorized;
-                    await aiAccountService.DisableAccount(account.Id);
-                    if (attempt < MaxRetries)
-                    {
-                        continue;
-                    }
-
                     break;
                 }
 
@@ -343,6 +314,12 @@ public sealed class KiroService(
                         promptTokens: inputTokens,
                         completionTokens: streamOutputTokens,
                         totalTokens: inputTokens + streamOutputTokens);
+                    await aiAccountService.RecordTokenUsage(
+                        account.Id,
+                        inputTokens,
+                        streamOutputTokens,
+                        cacheTokens: null,
+                        createCacheTokens: null);
                     return;
                 }
 
@@ -361,6 +338,12 @@ public sealed class KiroService(
                     promptTokens: inputTokens,
                     completionTokens: outputTokens,
                     totalTokens: inputTokens + outputTokens);
+                await aiAccountService.RecordTokenUsage(
+                    account.Id,
+                    inputTokens,
+                    outputTokens,
+                    cacheTokens: null,
+                    createCacheTokens: null);
 
                 var responsePayload = BuildAnthropicResponse(content, toolCalls, input.Model, inputTokens);
                 context.Response.ContentType = "application/json";
@@ -457,46 +440,16 @@ public sealed class KiroService(
                 AIProviderAsyncLocal.AIProviderIds.Add(account.Id);
                 await requestLogService.UpdateRetry(logId, attempt, account.Id);
 
-                var credentials = account.GetKiroOauth();
-                if (credentials == null)
+                // Use helper method to ensure valid token
+                var (tokenValid, credentials, tokenError) = await EnsureValidTokenAsync(account, aiAccountService);
+                if (!tokenValid)
                 {
-                    lastErrorMessage = $"账户 {account.Id} 缺少有效凭证";
+                    lastErrorMessage = tokenError;
                     lastStatusCode = HttpStatusCode.Unauthorized;
-                    await aiAccountService.DisableAccount(account.Id);
                     if (attempt < MaxRetries)
                     {
                         continue;
                     }
-
-                    break;
-                }
-
-                if (IsExpiryDateNear(credentials))
-                {
-                    var (refreshed, refreshError) = await TryRefreshKiroTokenAsync(account, credentials);
-                    if (refreshed)
-                    {
-                        credentials = account.GetKiroOauth();
-                    }
-                    else if (!string.IsNullOrWhiteSpace(refreshError))
-                    {
-                        logger.LogWarning(
-                            "Kiro Token 预刷新失败 (账户: {AccountId}): {Error}",
-                            account.Id,
-                            refreshError);
-                    }
-                }
-
-                if (string.IsNullOrWhiteSpace(credentials?.AccessToken))
-                {
-                    lastErrorMessage = $"账户 {account.Id} 缺少访问令牌";
-                    lastStatusCode = HttpStatusCode.Unauthorized;
-                    await aiAccountService.DisableAccount(account.Id);
-                    if (attempt < MaxRetries)
-                    {
-                        continue;
-                    }
-
                     break;
                 }
 
@@ -784,17 +737,6 @@ public sealed class KiroService(
             return (false, "缺少 refresh token");
         }
 
-        var authMethod = string.IsNullOrWhiteSpace(credentials.AuthMethod)
-            ? AuthMethodSocial
-            : credentials.AuthMethod.Trim();
-
-        if (!string.Equals(authMethod, AuthMethodSocial, StringComparison.OrdinalIgnoreCase)
-            && (string.IsNullOrWhiteSpace(credentials.ClientId)
-                || string.IsNullOrWhiteSpace(credentials.ClientSecret)))
-        {
-            return (false, "缺少 clientId 或 clientSecret");
-        }
-
         try
         {
             await kiroOAuthService.RefreshKiroOAuthTokenAsync(account);
@@ -816,6 +758,9 @@ public sealed class KiroService(
     {
         var responseStarted = false;
 
+        var contentBlockOpen = false;
+        ResponseEventType? currentBlockType = null;
+        
         async Task EnsureStreamStartedAsync()
         {
             if (responseStarted)
@@ -864,6 +809,8 @@ public sealed class KiroService(
             };
 
             await WriteSseJsonAsync(context, contentBlockStart, context.RequestAborted);
+            contentBlockOpen = true;
+            currentBlockType = ResponseEventType.Content;
         }
 
         var toolCalls = new List<KiroToolCall>();
@@ -871,10 +818,14 @@ public sealed class KiroService(
         var totalOutputTokens = 0;
         long? timeToFirstByteMs = null;
         string? lastContent = null;
+        int index = 0;
+
 
         using (response)
         {
             await using var stream = await response.Content.ReadAsStreamAsync(context.RequestAborted);
+
+            await EnsureStreamStartedAsync();
 
             await foreach (var ev in ReadKiroEventsAsync(stream, context.RequestAborted))
             {
@@ -887,13 +838,15 @@ public sealed class KiroService(
                         continue;
                     }
 
+                    currentBlockType = ResponseEventType.Content;
+
                     lastContent = ev.Content;
                     totalOutputTokens += CountTokens(ev.Content);
 
                     var delta = new JsonObject
                     {
                         ["type"] = "content_block_delta",
-                        ["index"] = 0,
+                        ["index"] = index,
                         ["delta"] = new JsonObject
                         {
                             ["type"] = "text_delta",
@@ -903,28 +856,80 @@ public sealed class KiroService(
 
                     await WriteSseJsonAsync(context, delta, context.RequestAborted);
                 }
-                else if (ev.Type == KiroStreamEventType.ToolUse && ev.ToolUse != null)
+                else if (ev is { Type: KiroStreamEventType.ToolUse, ToolUse: not null, ToolUse.Stop: false } &&
+                         string.IsNullOrEmpty(ev.ToolUse.Input))
                 {
-                    currentTool = new ToolCallAccumulator(ev.ToolUse.ToolUseId, ev.ToolUse.Name);
-                    if (!string.IsNullOrEmpty(ev.ToolUse.Input))
+                    if (contentBlockOpen && currentBlockType == ResponseEventType.Content)
                     {
-                        currentTool.Input.Append(ev.ToolUse.Input);
+                        await WriteSseJsonAsync(context, new JsonObject
+                        {
+                            ["type"] = "content_block_stop",
+                            ["index"] = index
+                        }, context.RequestAborted);
+                        contentBlockOpen = false;
                     }
 
-                    if (ev.ToolUse.Stop)
+                    currentBlockType = ResponseEventType.ToolUse;
+                    currentTool = new ToolCallAccumulator(ev.ToolUse.ToolUseId, ev.ToolUse.Name);
+                    if (!string.IsNullOrEmpty(ev.ToolInput ?? ev.ToolUse?.Input))
                     {
-                        toolCalls.Add(currentTool.ToToolCall());
-                        currentTool = null;
+                        currentTool.Input.Append(ev.ToolInput ?? ev.ToolUse?.Input);
+                        totalOutputTokens += CountTokens(ev.ToolInput ?? ev.ToolUse?.Input);
                     }
+
+                    await WriteSseJsonAsync(context, new JsonObject
+                    {
+                        ["type"] = "content_block_start",
+                        ["index"] = index = index + 1,
+                        ["content_block"] = new JsonObject
+                        {
+                            ["type"] = "tool_use",
+                            ["id"] = ev.ToolUse?.ToolUseId,
+                            ["name"] = ev.ToolUse?.Name,
+                            ["input"] = new JsonObject()
+                        }
+                    }, context.RequestAborted);
+                    contentBlockOpen = true;
                 }
-                else if (ev.Type == KiroStreamEventType.ToolUseInput && currentTool != null)
+                else if (ev is { Type: KiroStreamEventType.ToolUse, ToolUse.Stop: false })
                 {
-                    currentTool.Input.Append(ev.ToolInput);
+                    await WriteSseJsonAsync(context, new JsonObject
+                    {
+                        ["type"] = "content_block_delta",
+                        ["index"] = index,
+                        ["delta"] = new JsonObject
+                        {
+                            ["type"] = "input_json_delta",
+                            ["partial_json"] = ev.ToolInput ?? ev.ToolUse?.Input
+                        }
+                    }, context.RequestAborted);
+                    totalOutputTokens += CountTokens(ev.ToolInput ?? ev.ToolUse?.Input);
                 }
-                else if (ev.Type == KiroStreamEventType.ToolUseStop && currentTool != null)
+                else if (ev is { Type: KiroStreamEventType.ToolUse, ToolUse.Stop: true })
                 {
-                    toolCalls.Add(currentTool.ToToolCall());
-                    currentTool = null;
+                    // toolCalls.Add(currentTool.ToToolCall());
+                    // currentTool = null;
+                    if (!string.IsNullOrEmpty(ev.ToolUse.Input))
+                    {
+                        await WriteSseJsonAsync(context, new JsonObject
+                        {
+                            ["type"] = "content_block_delta",
+                            ["index"] = index,
+                            ["delta"] = new JsonObject
+                            {
+                                ["type"] = "input_json_delta",
+                                ["partial_json"] = ev.ToolInput ?? ev.ToolUse?.Input
+                            }
+                        }, context.RequestAborted);
+                        totalOutputTokens += CountTokens(ev.ToolInput ?? ev.ToolUse?.Input);
+                    }
+
+                    await WriteSseJsonAsync(context, new JsonObject
+                    {
+                        ["type"] = "content_block_stop",
+                        ["index"] = index
+                    }, context.RequestAborted);
+                    contentBlockOpen = false;
                 }
             }
         }
@@ -934,52 +939,56 @@ public sealed class KiroService(
             toolCalls.Add(currentTool.ToToolCall());
         }
 
-        await EnsureStreamStartedAsync();
-        await WriteSseJsonAsync(context, new JsonObject
-        {
-            ["type"] = "content_block_stop",
-            ["index"] = 0
-        }, context.RequestAborted);
 
-        if (toolCalls.Count > 0)
+        // if (toolCalls.Count > 0)
+        // {
+        //     for (var i = 0; i < toolCalls.Count; i++)
+        //     {
+        //         var toolCall = toolCalls[i];
+        //         var inputJson = BuildToolInputNode(toolCall.Arguments);
+        //         // await WriteSseJsonAsync(context, new JsonObject
+        //         // {
+        //         //     ["type"] = "content_block_start",
+        //         //     ["index"] = i + 1,
+        //         //     ["content_block"] = new JsonObject
+        //         //     {
+        //         //         ["type"] = "tool_use",
+        //         //         ["id"] = toolCall.Id,
+        //         //         ["name"] = toolCall.Name,
+        //         //         ["input"] = new JsonObject()
+        //         //     }
+        //         // }, context.RequestAborted);
+        //
+        //         var partialJson = inputJson.ToJsonString(JsonOptions.DefaultOptions);
+        //
+        //         await WriteSseJsonAsync(context, new JsonObject
+        //         {
+        //             ["type"] = "content_block_delta",
+        //             ["index"] = i + 1,
+        //             ["delta"] = new JsonObject
+        //             {
+        //                 ["type"] = "input_json_delta",
+        //                 ["partial_json"] = partialJson
+        //             }
+        //         }, context.RequestAborted);
+        //
+        //         totalOutputTokens += CountTokens(partialJson);
+        //         await WriteSseJsonAsync(context, new JsonObject
+        //         {
+        //             ["type"] = "content_block_stop",
+        //             ["index"] = i + 1
+        //         }, context.RequestAborted);
+        //     }
+        // }
+
+        if (contentBlockOpen)
         {
-            for (var i = 0; i < toolCalls.Count; i++)
+            await WriteSseJsonAsync(context, new JsonObject
             {
-                var toolCall = toolCalls[i];
-                var inputJson = BuildToolInputNode(toolCall.Arguments);
-                await WriteSseJsonAsync(context, new JsonObject
-                {
-                    ["type"] = "content_block_start",
-                    ["index"] = i + 1,
-                    ["content_block"] = new JsonObject
-                    {
-                        ["type"] = "tool_use",
-                        ["id"] = toolCall.Id,
-                        ["name"] = toolCall.Name,
-                        ["input"] = new JsonObject()
-                    }
-                }, context.RequestAborted);
-
-                var partialJson = inputJson.ToJsonString(JsonOptions.DefaultOptions);
-
-                await WriteSseJsonAsync(context, new JsonObject
-                {
-                    ["type"] = "content_block_delta",
-                    ["index"] = i + 1,
-                    ["delta"] = new JsonObject
-                    {
-                        ["type"] = "input_json_delta",
-                        ["partial_json"] = partialJson
-                    }
-                }, context.RequestAborted);
-
-                totalOutputTokens += CountTokens(partialJson);
-                await WriteSseJsonAsync(context, new JsonObject
-                {
-                    ["type"] = "content_block_stop",
-                    ["index"] = i + 1
-                }, context.RequestAborted);
-            }
+                ["type"] = "content_block_stop",
+                ["index"] = index
+            }, context.RequestAborted);
+            contentBlockOpen = false;
         }
 
         var stopReason = toolCalls.Count > 0 ? "tool_use" : "end_turn";
@@ -997,7 +1006,7 @@ public sealed class KiroService(
                     ["output_tokens"] = totalOutputTokens
                 }
             },
-            ["usage"] =  new JsonObject
+            ["usage"] = new JsonObject
             {
                 ["input_tokens"] = inputTokens,
                 ["cache_creation_input_tokens"] = 0,
@@ -1214,6 +1223,11 @@ public sealed class KiroService(
 
     public async Task<KiroUsageLimitsResponse?> GetUsageLimitsAsync(AIAccount account)
     {
+        return await GetUsageLimitsInternalAsync(account, allowRetry: true);
+    }
+
+    private async Task<KiroUsageLimitsResponse?> GetUsageLimitsInternalAsync(AIAccount account, bool allowRetry)
+    {
         var credentials = account.GetKiroOauth();
         if (credentials == null)
         {
@@ -1254,7 +1268,14 @@ public sealed class KiroService(
         using var request = new HttpRequestMessage(HttpMethod.Get, requestUrl);
 
         request.Headers.Add("Authorization", $"Bearer {credentials.AccessToken}");
-        request.Headers.Add("User-Agent", $"OneAI/{KiroVersion}");
+        if (string.IsNullOrEmpty(credentials.MachineId))
+        {
+            request.Headers.TryAddWithoutValidation("User-Agent", $"KiroIDE-{KiroVersion}");
+        }
+        else
+        {
+            request.Headers.TryAddWithoutValidation("User-Agent", $"KiroIDE-{KiroVersion}-{credentials.MachineId}");
+        }
         request.Headers.Add("amz-sdk-invocation-id", Guid.NewGuid().ToString());
         request.Headers.Add("Origin", "https://app.kiro.dev");
         request.Headers.Add("Referer", "https://app.kiro.dev/");
@@ -1262,6 +1283,22 @@ public sealed class KiroService(
         try
         {
             var response = await HttpClient.SendAsync(request);
+
+            // Handle 401 Unauthorized - try to refresh token and retry once
+            if (response.StatusCode == HttpStatusCode.Unauthorized && allowRetry)
+            {
+                logger.LogWarning("Kiro usage limits request returned 401, attempting to refresh token and retry");
+                try
+                {
+                    await kiroOAuthService.RefreshKiroOAuthTokenAsync(account);
+                    return await GetUsageLimitsInternalAsync(account, allowRetry: false);
+                }
+                catch (Exception refreshEx)
+                {
+                    logger.LogError(refreshEx, "Failed to refresh Kiro token after 401");
+                    return null;
+                }
+            }
 
             if (!response.IsSuccessStatusCode)
             {
@@ -1362,6 +1399,46 @@ public sealed class KiroService(
         return Convert.ToHexString(hash).ToLowerInvariant();
     }
 
+    private async Task<(bool Success, KiroOAuthCredentialsDto? Credentials, string? ErrorMessage)> EnsureValidTokenAsync(
+        AIAccount account,
+        AIAccountService aiAccountService)
+    {
+        var credentials = account.GetKiroOauth();
+        if (credentials == null)
+        {
+            return (false, null, $"账户 {account.Id} 缺少有效凭证");
+        }
+
+        if (string.IsNullOrWhiteSpace(credentials.AccessToken))
+        {
+            return (false, null, $"账户 {account.Id} 缺少访问令牌");
+        }
+
+        // Check if token needs refresh
+        if (IsExpiryDateNear(credentials))
+        {
+            var (refreshed, refreshError) = await TryRefreshKiroTokenAsync(account, credentials);
+            if (!refreshed)
+            {
+                var error = string.IsNullOrWhiteSpace(refreshError)
+                    ? $"账户 {account.Id} Token 刷新失败"
+                    : $"账户 {account.Id} Token 刷新失败: {refreshError}";
+                await aiAccountService.DisableAccount(account.Id);
+                return (false, null, error);
+            }
+
+            // Get refreshed credentials
+            credentials = account.GetKiroOauth();
+            if (credentials == null || string.IsNullOrWhiteSpace(credentials.AccessToken))
+            {
+                await aiAccountService.DisableAccount(account.Id);
+                return (false, null, $"账户 {account.Id} Token 刷新后仍无效");
+            }
+        }
+
+        return (true, credentials, null);
+    }
+
     private static bool IsExpiryDateNear(KiroOAuthCredentialsDto credentials)
     {
         var expiresAt = credentials.ExpiresAt;
@@ -1375,7 +1452,8 @@ public sealed class KiroService(
             return true;
         }
 
-        var nearMinutes = 10;
+        // Increase buffer to 15 minutes to ensure token is refreshed well before expiry
+        var nearMinutes = 15;
         var threshold = DateTimeOffset.UtcNow.AddMinutes(nearMinutes);
         return expiry <= threshold;
     }
@@ -1599,7 +1677,7 @@ public sealed class KiroService(
 
         if (cachePoint != null)
         {
-            userInputMessage["cachePoint"] = cachePoint;
+            userInputMessage["cachePoint"] = cachePoint.DeepClone();
         }
 
         if (images is { Count: > 0 })
@@ -1615,7 +1693,7 @@ public sealed class KiroService(
 
         if (tools is { Count: > 0 })
         {
-            context["tools"] = tools;
+            context["tools"] = tools.DeepClone();
         }
 
         if (context.Count > 0)
@@ -2622,6 +2700,13 @@ public sealed class KiroService(
 
     private static async Task WriteSseJsonAsync(HttpContext context, JsonObject json, CancellationToken ct)
     {
+        // Extract event type from JSON
+        var eventType = json["type"]?.ToString() ?? "message";
+
+        // Write event line
+        await context.Response.WriteAsync($"event: {eventType}\n", ct);
+
+        // Write data line
         await context.Response.WriteAsync("data: ", ct);
         await context.Response.WriteAsync(json.ToJsonString(JsonOptions.DefaultOptions), ct);
         await context.Response.WriteAsync("\n\n", ct);
@@ -2673,10 +2758,10 @@ public sealed class KiroService(
                 Text = Text,
                 ToolUseId = ToolUseId,
                 Name = Name,
-                Input = Input,
+                Input = Input?.DeepClone(),
                 Content = Content,
                 Source = Source,
-                CachePoint = CachePoint
+                CachePoint = CachePoint == null ? null : new KiroCachePoint { Type = CachePoint.Type }
             };
         }
     }
@@ -2719,6 +2804,12 @@ public sealed class KiroService(
         ToolUse,
         ToolUseInput,
         ToolUseStop
+    }
+
+    public enum ResponseEventType
+    {
+        Content,
+        ToolUse,
     }
 
     private sealed class KiroStreamEvent(KiroStreamEventType type)

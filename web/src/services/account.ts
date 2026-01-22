@@ -9,6 +9,10 @@ import type {
   ImportKiroCredentialsRequest,
   ImportKiroBatchRequest,
   ImportKiroBatchResult,
+  ImportGeminiBusinessCredentialsRequest,
+  ImportGeminiBusinessBatchRequest,
+  ImportGeminiBusinessBatchResult,
+  BatchOperationResult,
 } from '@/types/account'
 
 /**
@@ -83,6 +87,27 @@ export const accountService = {
    */
   refreshKiroQuotaStatus(accountId: number): Promise<AccountQuotaStatus> {
     return post<AccountQuotaStatus>(`/accounts/${accountId}/refresh-kiro-quota`, {})
+  },
+
+  /**
+   * 批量删除账户
+   */
+  batchDeleteAccounts(accountIds: number[]): Promise<BatchOperationResult> {
+    return post<BatchOperationResult>('/accounts/batch-delete', accountIds)
+  },
+
+  /**
+   * 批量启用账户
+   */
+  batchEnableAccounts(accountIds: number[]): Promise<BatchOperationResult> {
+    return post<BatchOperationResult>('/accounts/batch-enable', accountIds)
+  },
+
+  /**
+   * 批量禁用账户
+   */
+  batchDisableAccounts(accountIds: number[]): Promise<BatchOperationResult> {
+    return post<BatchOperationResult>('/accounts/batch-disable', accountIds)
   },
 }
 
@@ -207,5 +232,24 @@ export const kiroOAuthService = {
    */
   importBatchCredentials(request: ImportKiroBatchRequest): Promise<ImportKiroBatchResult> {
     return post<ImportKiroBatchResult>('/kiro/oauth/import/batch', request)
+  },
+}
+
+/**
+ * Gemini Business credentials import service
+ */
+export const geminiBusinessOAuthService = {
+  /**
+   * Import Gemini Business credentials and create account
+   */
+  importCredentials(request: ImportGeminiBusinessCredentialsRequest): Promise<AIAccountDto> {
+    return post<AIAccountDto>('/gemini-business/oauth/import', request)
+  },
+
+  /**
+   * Batch import Gemini Business credentials and create accounts
+   */
+  importBatchCredentials(request: ImportGeminiBusinessBatchRequest): Promise<ImportGeminiBusinessBatchResult> {
+    return post<ImportGeminiBusinessBatchResult>('/gemini-business/oauth/import/batch', request)
   },
 }

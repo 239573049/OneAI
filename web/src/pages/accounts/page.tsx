@@ -11,22 +11,20 @@ import {
   XCircle,
   RefreshCw,
   Eye,
-  Settings2,
   Users,
   Activity,
   ShieldCheck,
   ZapOff,
+  CheckSquare,
+  Square,
+  MinusSquare,
 } from 'lucide-react'
 import { Button } from '@/components/animate-ui/components/buttons/button'
 import {
   Card,
   CardContent,
-  CardHeader,
-  CardTitle,
-  CardDescription,
 } from '@/components/animate-ui/components/card'
 import { Input } from '@/components/animate-ui/components/input'
-import { Label } from '@/components/animate-ui/components/label'
 import {
   Dialog,
   DialogContent,
@@ -46,11 +44,11 @@ import {
   ToggleGroup,
   ToggleGroupItem,
 } from '@/components/animate-ui/components/radix/toggle-group'
-import { Checkbox } from '@/components/animate-ui/components/radix/checkbox'
 import { AddAccountDialog } from '@/components/add-account-dialog'
 import { BatchImportKiroDialog } from '@/components/batch-import-kiro-dialog'
+import { BatchImportGeminiBusinessDialog } from '@/components/batch-import-gemini-business-dialog'
 import { accountService } from '@/services/account'
-import type { AIAccountDto, AccountQuotaStatus, ImportKiroBatchResult } from '@/types/account'
+import type { AIAccountDto, AccountQuotaStatus, ImportKiroBatchResult, ImportGeminiBusinessBatchResult, BatchOperationResult } from '@/types/account'
 import { cn } from '@/lib/utils'
 import { Skeleton } from '@/components/ui/skeleton'
 import { FileJson } from 'lucide-react'
@@ -122,6 +120,7 @@ export default function AccountManagementView() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all')
   const [addDialogOpen, setAddDialogOpen] = useState(false)
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false)
+  const [batchImportGeminiBusinessDialogOpen, setBatchImportGeminiBusinessDialogOpen] = useState(false)
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false)
   const [deleteConfirmAccountId, setDeleteConfirmAccountId] = useState<number | null>(null)
   const [togglingId, setTogglingId] = useState<number | null>(null)
@@ -132,6 +131,10 @@ export default function AccountManagementView() {
   const [modelsError, setModelsError] = useState<string | null>(null)
   const [models, setModels] = useState<string[]>([])
   const [modelsAccountLabel, setModelsAccountLabel] = useState<string>('')
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
+  const [batchOperating, setBatchOperating] = useState(false)
+  const [batchDeleteConfirmOpen, setBatchDeleteConfirmOpen] = useState(false)
+  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; message: string } | null>(null)
 
   useEffect(() => {
     fetchAccounts()
@@ -187,6 +190,15 @@ export default function AccountManagementView() {
   }
 
   const handleBatchImportCompleted = async (result: ImportKiroBatchResult) => {
+    void result
+    // 延迟一下让结果页面显示，然后刷新列表
+    setTimeout(async () => {
+      await fetchAccounts()
+    }, 1000)
+  }
+
+  const handleBatchImportGeminiBusinessCompleted = async (result: ImportGeminiBusinessBatchResult) => {
+    void result
     // 延迟一下让结果页面显示，然后刷新列表
     setTimeout(async () => {
       await fetchAccounts()
@@ -262,6 +274,166 @@ export default function AccountManagementView() {
     }
   }
 
+  const handleSelectAccount = (id: number, selected: boolean) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (selected) {
+        next.add(id)
+      } else {
+        next.delete(id)
+      }
+      return next
+    })
+  }
+
+  const handleSelectAll = () => {
+    if (selectedIds.size === filteredAccounts.length) {
+      setSelectedIds(new Set())
+    } else {
+      setSelectedIds(new Set(filteredAccounts.map(a => a.id)))
+    }
+  }
+
+  const handleBatchEnable = async () => {
+    if (selectedIds.size === 0) return
+    try {
+      setBatchOperating(true)
+      const result = await accountService.batchEnableAccounts(Array.from(selectedIds))
+      await fetchAccounts()
+      setSelectedIds(new Set())
+      if (result.failedCount > 0) {
+        setError(`批量启用完成: 成功 ${result.successCount}, 失败 ${result.failedCount}`)
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '批量启用失败'
+      setError(message)
+    } finally {
+      setBatchOperating(false)
+    }
+  }
+
+  const handleBatchDisable = async () => {
+    if (selectedIds.size === 0) return
+    try {
+      setBatchOperating(true)
+      const result = await accountService.batchDisableAccounts(Array.from(selectedIds))
+      await fetchAccounts()
+      setSelectedIds(new Set())
+      if (result.failedCount > 0) {
+        setError(`批量禁用完成: 成功 ${result.successCount}, 失败 ${result.failedCount}`)
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '批量禁用失败'
+      setError(message)
+    } finally {
+      setBatchOperating(false)
+    }
+  }
+
+  const handleBatchDeleteConfirm = async () => {
+    if (selectedIds.size === 0) return
+    try {
+      setBatchOperating(true)
+      setBatchProgress({ current: 0, total: selectedIds.size, message: '正在删除账户...' })
+      const result = await accountService.batchDeleteAccounts(Array.from(selectedIds))
+      setBatchProgress({ current: selectedIds.size, total: selectedIds.size, message: '删除完成' })
+      await fetchAccounts()
+      setSelectedIds(new Set())
+      setBatchDeleteConfirmOpen(false)
+      if (result.failedCount > 0) {
+        setError(`批量删除完成: 成功 ${result.successCount}, 失败 ${result.failedCount}`)
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '批量删除失败'
+      setError(message)
+    } finally {
+      setBatchOperating(false)
+      setBatchProgress(null)
+    }
+  }
+
+  const handleBatchRefreshQuota = async () => {
+    if (selectedIds.size === 0) return
+
+    // 获取选中账户的信息
+    const selectedAccounts = accounts.filter(a => selectedIds.has(a.id))
+    const supportedProviders = ['openai', 'claude', 'factory', 'gemini-antigravity', 'kiro']
+    const refreshableAccounts = selectedAccounts.filter(a =>
+      supportedProviders.includes(normalizeProviderKey(a.provider))
+    )
+
+    if (refreshableAccounts.length === 0) {
+      setError('选中的账户都不支持配额刷新')
+      return
+    }
+
+    try {
+      setBatchOperating(true)
+      let successCount = 0
+      let failedCount = 0
+      const newQuotaStatuses = { ...quotaStatuses }
+
+      for (let i = 0; i < refreshableAccounts.length; i++) {
+        const account = refreshableAccounts[i]
+        setBatchProgress({
+          current: i + 1,
+          total: refreshableAccounts.length,
+          message: `正在刷新 ${account.name || account.email || account.provider} (${i + 1}/${refreshableAccounts.length})`
+        })
+
+        const providerKey = normalizeProviderKey(account.provider)
+        try {
+          let status: AccountQuotaStatus | null = null
+
+          switch (providerKey) {
+            case 'openai':
+              status = await accountService.refreshOpenAIQuotaStatus(account.id)
+              break
+            case 'claude':
+              status = await accountService.refreshClaudeQuotaStatus(account.id)
+              break
+            case 'factory':
+              status = await accountService.refreshFactoryQuotaStatus(account.id)
+              break
+            case 'gemini-antigravity':
+              status = await accountService.refreshAntigravityQuotaStatus(account.id)
+              break
+            case 'kiro':
+              status = await accountService.refreshKiroQuotaStatus(account.id)
+              break
+          }
+
+          if (status) {
+            newQuotaStatuses[account.id] = status
+            successCount++
+          } else {
+            failedCount++
+          }
+        } catch {
+          failedCount++
+        }
+      }
+
+      setQuotaStatuses(newQuotaStatuses)
+      const updatedAccounts = await accountService.getAccounts()
+      setAccounts(updatedAccounts)
+
+      const skippedCount = selectedIds.size - refreshableAccounts.length
+      let resultMessage = `批量刷新完成: 成功 ${successCount}`
+      if (failedCount > 0) resultMessage += `, 失败 ${failedCount}`
+      if (skippedCount > 0) resultMessage += `, 跳过 ${skippedCount} (不支持)`
+      if (failedCount > 0 || skippedCount > 0) {
+        setError(resultMessage)
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '批量刷新失败'
+      setError(message)
+    } finally {
+      setBatchOperating(false)
+      setBatchProgress(null)
+    }
+  }
+
   const stats = useMemo(() => {
     const active = accounts.filter(a => a.isEnabled).length
     const limited = accounts.filter(a => a.isRateLimited).length
@@ -287,6 +459,7 @@ export default function AccountManagementView() {
       factory: 3,
       gemini: 4,
       'gemini-antigravity': 5,
+      'gemini-business': 6,
     }
 
     return Array.from(providers.entries())
@@ -332,6 +505,14 @@ export default function AccountManagementView() {
             批量导入 Kiro
           </Button>
           <Button
+            onClick={() => setBatchImportGeminiBusinessDialogOpen(true)}
+            variant="outline"
+            className="gap-2"
+          >
+            <FileJson className="h-4 w-4" />
+            批量导入 Gemini Business
+          </Button>
+          <Button
             onClick={() => setAddDialogOpen(true)}
             className="shadow-lg shadow-primary/20 hover:shadow-primary/30 transition-all gap-2"
           >
@@ -375,7 +556,7 @@ export default function AccountManagementView() {
               className="pl-10 bg-background border-none focus-visible:ring-1"
             />
           </div>
-          
+
           <div className="flex flex-wrap items-center gap-4">
             <div className="flex items-center gap-2">
               <span className="text-xs font-medium text-muted-foreground whitespace-nowrap">类型:</span>
@@ -412,6 +593,100 @@ export default function AccountManagementView() {
           </div>
         </CardContent>
       </Card>
+
+      {/* Batch Actions Toolbar */}
+      {filteredAccounts.length > 0 && (
+        <Card className="border-none bg-muted/30 shadow-none">
+          <CardContent className="p-3 space-y-3">
+            <div className="flex items-center gap-4">
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={handleSelectAll}
+                className="gap-2"
+              >
+                {selectedIds.size === 0 ? (
+                  <Square className="h-4 w-4" />
+                ) : selectedIds.size === filteredAccounts.length ? (
+                  <CheckSquare className="h-4 w-4" />
+                ) : (
+                  <MinusSquare className="h-4 w-4" />
+                )}
+                {selectedIds.size === 0 ? '全选' : selectedIds.size === filteredAccounts.length ? '取消全选' : `已选 ${selectedIds.size}`}
+              </Button>
+
+              {selectedIds.size > 0 && (
+                <>
+                  <div className="h-4 w-px bg-border" />
+                  <span className="text-sm text-muted-foreground">
+                    已选择 {selectedIds.size} 个账户
+                  </span>
+                  <div className="flex-1" />
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleBatchRefreshQuota}
+                      disabled={batchOperating}
+                      className="gap-2"
+                    >
+                      {batchOperating && batchProgress?.message.includes('刷新') ? <Loader className="h-4 w-4 animate-spin" /> : <RefreshCw className="h-4 w-4 text-blue-500" />}
+                      批量刷新配额
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleBatchEnable}
+                      disabled={batchOperating}
+                      className="gap-2"
+                    >
+                      {batchOperating && !batchProgress ? <Loader className="h-4 w-4 animate-spin" /> : <CheckCircle className="h-4 w-4 text-emerald-500" />}
+                      批量启用
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={handleBatchDisable}
+                      disabled={batchOperating}
+                      className="gap-2"
+                    >
+                      {batchOperating && !batchProgress ? <Loader className="h-4 w-4 animate-spin" /> : <ZapOff className="h-4 w-4 text-orange-500" />}
+                      批量禁用
+                    </Button>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => setBatchDeleteConfirmOpen(true)}
+                      disabled={batchOperating}
+                      className="gap-2 text-destructive hover:text-destructive"
+                    >
+                      {batchOperating && batchProgress?.message.includes('删除') ? <Loader className="h-4 w-4 animate-spin" /> : <Trash2 className="h-4 w-4" />}
+                      批量删除
+                    </Button>
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* Progress Bar */}
+            {batchProgress && (
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-xs text-muted-foreground">
+                  <span>{batchProgress.message}</span>
+                  <span>{batchProgress.current}/{batchProgress.total}</span>
+                </div>
+                <div className="h-2 w-full bg-muted rounded-full overflow-hidden">
+                  <motion.div
+                    initial={{ width: 0 }}
+                    animate={{ width: `${(batchProgress.current / batchProgress.total) * 100}%` }}
+                    className="h-full bg-primary transition-all duration-300"
+                  />
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
       {/* Account Cards Grid */}
       {loading ? (
@@ -462,6 +737,8 @@ export default function AccountManagementView() {
                 isRefreshing={refreshingQuotaId === account.id}
                 isToggling={togglingId === account.id}
                 isDeleting={deletingId === account.id}
+                isSelected={selectedIds.has(account.id)}
+                onSelect={(selected) => handleSelectAccount(account.id, selected)}
                 onRefresh={() => handleRefreshQuota(account.id, account.provider)}
                 onToggle={() => handleToggleStatus(account.id)}
                 onDelete={() => handleDeleteClick(account.id)}
@@ -485,6 +762,12 @@ export default function AccountManagementView() {
         onImportCompleted={handleBatchImportCompleted}
       />
 
+      <BatchImportGeminiBusinessDialog
+        open={batchImportGeminiBusinessDialogOpen}
+        onOpenChange={setBatchImportGeminiBusinessDialogOpen}
+        onImportCompleted={handleBatchImportGeminiBusinessCompleted}
+      />
+
       <AntigravityModelsDialog
         open={modelsDialogOpen}
         onOpenChange={setModelsDialogOpen}
@@ -499,6 +782,14 @@ export default function AccountManagementView() {
         onOpenChange={setDeleteConfirmOpen}
         onConfirm={handleDeleteConfirm}
         isDeleting={deletingId === deleteConfirmAccountId}
+      />
+
+      <BatchDeleteConfirmDialog
+        open={batchDeleteConfirmOpen}
+        onOpenChange={setBatchDeleteConfirmOpen}
+        onConfirm={handleBatchDeleteConfirm}
+        isDeleting={batchOperating}
+        count={selectedIds.size}
       />
       
       {error && (
@@ -519,24 +810,28 @@ export default function AccountManagementView() {
   )
 }
 
-function AccountCard({ 
-  account, 
-  quota, 
-  index, 
-  isRefreshing, 
-  isToggling, 
-  isDeleting, 
-  onRefresh, 
-  onToggle, 
-  onDelete, 
-  onViewModels 
-}: { 
-  account: AIAccountDto, 
+function AccountCard({
+  account,
+  quota,
+  index,
+  isRefreshing,
+  isToggling,
+  isDeleting,
+  isSelected,
+  onSelect,
+  onRefresh,
+  onToggle,
+  onDelete,
+  onViewModels
+}: {
+  account: AIAccountDto,
   quota?: AccountQuotaStatus,
   index: number,
   isRefreshing: boolean,
   isToggling: boolean,
   isDeleting: boolean,
+  isSelected: boolean,
+  onSelect: (selected: boolean) => void,
   onRefresh: () => void,
   onToggle: () => void,
   onDelete: () => void,
@@ -553,26 +848,47 @@ function AccountCard({
       exit={{ opacity: 0, scale: 0.95 }}
       transition={{ delay: index * 0.05 }}
     >
-      <Card variant="default" hoverable className="group relative h-full flex flex-col border border-border/50 overflow-hidden bg-card/50 backdrop-blur-sm">
+      <Card variant="default" hoverable className={cn(
+        "group relative h-full flex flex-col border overflow-hidden bg-card/50 backdrop-blur-sm",
+        isSelected ? "border-primary ring-1 ring-primary/20" : "border-border/50"
+      )}>
         <CardContent className="p-5 flex-1 flex flex-col">
           {/* Top Row */}
           <div className="flex items-start justify-between mb-4">
-            <div className="flex flex-col gap-2">
-              <div className="flex items-center gap-2">
-                 <span className={cn(
-                    "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-tighter",
-                    providerKey === 'openai' ? "bg-emerald-500/10 text-emerald-600" :
-                    providerKey === 'claude' ? "bg-orange-500/10 text-orange-600" :
-                    providerKey === 'kiro' ? "bg-slate-500/10 text-slate-600" :
-                    providerKey === 'factory' ? "bg-purple-500/10 text-purple-600" :
-                    "bg-blue-500/10 text-blue-600"
-                 )}>
-                    {account.provider}
-                 </span>
-                 <div className={cn(
-                    "h-2 w-2 rounded-full ring-4 ring-background",
-                    account.isEnabled ? "bg-emerald-500 animate-pulse" : "bg-muted-foreground/30"
-                 )} />
+            <div className="flex items-center gap-3">
+              <button
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onSelect(!isSelected)
+                }}
+                className={cn(
+                  "flex-shrink-0 p-0.5 rounded transition-colors",
+                  isSelected ? "text-primary" : "text-muted-foreground/50 hover:text-muted-foreground"
+                )}
+              >
+                {isSelected ? (
+                  <CheckSquare className="h-5 w-5" />
+                ) : (
+                  <Square className="h-5 w-5" />
+                )}
+              </button>
+              <div className="flex flex-col gap-2">
+                <div className="flex items-center gap-2">
+                   <span className={cn(
+                      "px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-tighter",
+                      providerKey === 'openai' ? "bg-emerald-500/10 text-emerald-600" :
+                      providerKey === 'claude' ? "bg-orange-500/10 text-orange-600" :
+                      providerKey === 'kiro' ? "bg-slate-500/10 text-slate-600" :
+                      providerKey === 'factory' ? "bg-purple-500/10 text-purple-600" :
+                      "bg-blue-500/10 text-blue-600"
+                   )}>
+                      {account.provider}
+                   </span>
+                   <div className={cn(
+                      "h-2 w-2 rounded-full ring-4 ring-background",
+                      account.isEnabled ? "bg-emerald-500 animate-pulse" : "bg-muted-foreground/30"
+                   )} />
+                </div>
               </div>
             </div>
 
@@ -808,6 +1124,36 @@ function DeleteConfirmDialog({ open, onOpenChange, onConfirm, isDeleting }: any)
           <Button variant="destructive" onClick={onConfirm} disabled={isDeleting} className="gap-2">
             {isDeleting && <Loader className="h-4 w-4 animate-spin" />}
             确认删除
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function BatchDeleteConfirmDialog({ open, onOpenChange, onConfirm, isDeleting, count }: {
+  open: boolean,
+  onOpenChange: (open: boolean) => void,
+  onConfirm: () => void,
+  isDeleting: boolean,
+  count: number
+}) {
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>确认批量删除？</DialogTitle>
+          <DialogDescription>
+            此操作将永久移除选中的 {count} 个账户及其所有的配额统计记录，且无法恢复。
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter className="gap-3 mt-4">
+          <Button variant="outline" onClick={() => onOpenChange(false)} disabled={isDeleting}>
+            取消
+          </Button>
+          <Button variant="destructive" onClick={onConfirm} disabled={isDeleting} className="gap-2">
+            {isDeleting && <Loader className="h-4 w-4 animate-spin" />}
+            确认删除 {count} 个账户
           </Button>
         </DialogFooter>
       </DialogContent>

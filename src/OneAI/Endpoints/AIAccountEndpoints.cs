@@ -114,6 +114,33 @@ public static class AIAccountEndpoints
             .Produces<ApiResponse>(401)
             .Produces<ApiResponse>(404)
             .Produces<ApiResponse>(500);
+
+        // 批量删除 AI 账户
+        group.MapPost("/batch-delete", BatchDeleteAccounts)
+            .WithName("BatchDeleteAccounts")
+            .WithSummary("批量删除AI账户")
+            .WithDescription("根据ID列表批量删除AI账户")
+            .Produces<ApiResponse<BatchOperationResult>>(200)
+            .Produces<ApiResponse>(401)
+            .Produces<ApiResponse>(500);
+
+        // 批量启用 AI 账户
+        group.MapPost("/batch-enable", BatchEnableAccounts)
+            .WithName("BatchEnableAccounts")
+            .WithSummary("批量启用AI账户")
+            .WithDescription("根据ID列表批量启用AI账户")
+            .Produces<ApiResponse<BatchOperationResult>>(200)
+            .Produces<ApiResponse>(401)
+            .Produces<ApiResponse>(500);
+
+        // 批量禁用 AI 账户
+        group.MapPost("/batch-disable", BatchDisableAccounts)
+            .WithName("BatchDisableAccounts")
+            .WithSummary("批量禁用AI账户")
+            .WithDescription("根据ID列表批量禁用AI账户")
+            .Produces<ApiResponse<BatchOperationResult>>(200)
+            .Produces<ApiResponse>(401)
+            .Produces<ApiResponse>(500);
     }
 
     /// <summary>
@@ -327,6 +354,60 @@ public static class AIAccountEndpoints
         catch (Exception ex)
         {
             return ApiResponse<List<string>>.Fail($"获取模型列表失败: {ex.Message}", 500);
+        }
+    }
+
+    /// <summary>
+    /// 批量删除 AI 账户
+    /// </summary>
+    private static async Task<ApiResponse<BatchOperationResult>> BatchDeleteAccounts(
+        List<int> accountIds,
+        AIAccountService accountService)
+    {
+        try
+        {
+            var result = await accountService.BatchDeleteAccountsAsync(accountIds);
+            return ApiResponse<BatchOperationResult>.Success(result, "批量删除完成");
+        }
+        catch (Exception ex)
+        {
+            return ApiResponse<BatchOperationResult>.Fail($"批量删除失败: {ex.Message}", 500);
+        }
+    }
+
+    /// <summary>
+    /// 批量启用 AI 账户
+    /// </summary>
+    private static async Task<ApiResponse<BatchOperationResult>> BatchEnableAccounts(
+        List<int> accountIds,
+        AIAccountService accountService)
+    {
+        try
+        {
+            var result = await accountService.BatchSetAccountStatusAsync(accountIds, true);
+            return ApiResponse<BatchOperationResult>.Success(result, "批量启用完成");
+        }
+        catch (Exception ex)
+        {
+            return ApiResponse<BatchOperationResult>.Fail($"批量启用失败: {ex.Message}", 500);
+        }
+    }
+
+    /// <summary>
+    /// 批量禁用 AI 账户
+    /// </summary>
+    private static async Task<ApiResponse<BatchOperationResult>> BatchDisableAccounts(
+        List<int> accountIds,
+        AIAccountService accountService)
+    {
+        try
+        {
+            var result = await accountService.BatchSetAccountStatusAsync(accountIds, false);
+            return ApiResponse<BatchOperationResult>.Success(result, "批量禁用完成");
+        }
+        catch (Exception ex)
+        {
+            return ApiResponse<BatchOperationResult>.Fail($"批量禁用失败: {ex.Message}", 500);
         }
     }
 }

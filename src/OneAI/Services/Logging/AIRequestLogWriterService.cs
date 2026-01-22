@@ -274,6 +274,8 @@ public class AIRequestLogWriterService : BackgroundService
             var promptTokens = (int?)data.GetValueOrDefault("PromptTokens");
             var completionTokens = (int?)data.GetValueOrDefault("CompletionTokens");
             var totalTokens = (int?)data.GetValueOrDefault("TotalTokens");
+            var cacheTokens = (int?)data.GetValueOrDefault("CacheTokens");
+            var createCacheTokens = (int?)data.GetValueOrDefault("CreateCacheTokens");
             var updatedAt = (DateTime?)data.GetValueOrDefault("UpdatedAt") ?? DateTime.UtcNow;
 
             await dbContext.AIRequestLogs
@@ -288,6 +290,8 @@ public class AIRequestLogWriterService : BackgroundService
                     .SetProperty(x => x.PromptTokens, promptTokens)
                     .SetProperty(x => x.CompletionTokens, completionTokens)
                     .SetProperty(x => x.TotalTokens, totalTokens)
+                    .SetProperty(x => x.CacheTokens, cacheTokens)
+                    .SetProperty(x => x.CreateCacheTokens, createCacheTokens)
                     .SetProperty(x => x.UpdatedAt, updatedAt),
                     cancellationToken);
         }

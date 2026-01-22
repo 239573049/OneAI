@@ -31,6 +31,11 @@ public static class AIProviders
     public const string GeminiAntigravity = "Gemini-Antigravity";
 
     /// <summary>
+    /// Google Gemini Business（business.gemini.google）
+    /// </summary>
+    public const string GeminiBusiness = "Gemini-Business";
+
+    /// <summary>
     /// Kiro Reverse (Amazon CodeWhisperer via Kiro)
     /// </summary>
     public const string Kiro = "Kiro";
@@ -45,6 +50,7 @@ public static class AIProviders
         Factory,
         Gemini,
         GeminiAntigravity,
+        GeminiBusiness,
         Kiro
     ];
 
@@ -68,6 +74,7 @@ public static class AIProviders
             Factory => "Factory",
             Gemini => "Google Gemini",
             GeminiAntigravity => "Google Gemini (Antigravity)",
+            GeminiBusiness => "Google Gemini (Business)",
             Kiro => "Kiro Reverse",
             _ => provider
         };

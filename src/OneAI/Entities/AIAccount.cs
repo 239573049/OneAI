@@ -2,6 +2,7 @@ using System.Text.Json;
 using OneAI.Constants;
 using OneAI.Services.ClaudeCodeOAuth;
 using OneAI.Services.FactoryOAuth;
+using OneAI.Services.GeminiBusinessOAuth;
 using OneAI.Services.OpenAIOAuth;
 using OneAI.Services.GeminiOAuth;
 using OneAI.Services.KiroOAuth;
@@ -83,6 +84,26 @@ public class AIAccount
     /// </summary>
     public int UsageCount { get; set; } = 0;
 
+    /// <summary>
+    /// 累计请求Token数量
+    /// </summary>
+    public long PromptTokens { get; set; } = 0;
+
+    /// <summary>
+    /// 累计完成Token数量
+    /// </summary>
+    public long CompletionTokens { get; set; } = 0;
+
+    /// <summary>
+    /// 累计缓存Token数量
+    /// </summary>
+    public long CacheTokens { get; set; } = 0;
+
+    /// <summary>
+    /// 累计创建缓存Token数量
+    /// </summary>
+    public long CreateCacheTokens { get; set; } = 0;
+
     public void SetOpenAIOAuth(OpenAiOauth openAiOauth)
     {
         OAuthToken = JsonSerializer.Serialize(openAiOauth, JsonSerializerOptions.Web);
@@ -128,6 +149,21 @@ public class AIAccount
         }
 
         return JsonSerializer.Deserialize<GeminiOAuthCredentialsDto>(OAuthToken, JsonSerializerOptions.Web);
+    }
+
+    public void SetGeminiBusinessOAuth(GeminiBusinessCredentialsDto credentials)
+    {
+        OAuthToken = JsonSerializer.Serialize(credentials, JsonSerializerOptions.Web);
+    }
+
+    public GeminiBusinessCredentialsDto? GetGeminiBusinessOauth()
+    {
+        if (string.IsNullOrEmpty(OAuthToken) || Provider != AIProviders.GeminiBusiness)
+        {
+            return null;
+        }
+
+        return JsonSerializer.Deserialize<GeminiBusinessCredentialsDto>(OAuthToken, JsonSerializerOptions.Web);
     }
 
     public void SetFactoryOAuth(FactoryOauth factoryOauth)

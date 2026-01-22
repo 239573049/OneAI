@@ -45,7 +45,7 @@ public class KiroOAuthService(
             ApiKey = string.Empty,
             BaseUrl = string.Empty,
             CreatedAt = DateTime.Now,
-            Email = string.IsNullOrWhiteSpace(request.Email) ? null : request.Email.Trim(),
+            Email = string.IsNullOrWhiteSpace(request.Email) ? credentials.Email : request.Email.Trim(),
             Name = string.IsNullOrWhiteSpace(request.AccountName)
                 ? "Kiro"
                 : request.AccountName.Trim(),
@@ -228,7 +228,15 @@ public class KiroOAuthService(
             request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {current.AccessToken}");
         }
 
-        request.Headers.TryAddWithoutValidation("User-Agent", $"OneAI/{KiroVersion}");
+        if (string.IsNullOrEmpty(current.MachineId))
+        {
+            request.Headers.TryAddWithoutValidation("User-Agent", $"KiroIDE-{KiroVersion}");
+        }
+        else
+        {
+            request.Headers.TryAddWithoutValidation("User-Agent", $"KiroIDE-{KiroVersion}-{current.MachineId}");
+        }
+
         request.Headers.TryAddWithoutValidation("amz-sdk-invocation-id", Guid.NewGuid().ToString());
         request.Headers.TryAddWithoutValidation("Origin", "https://app.kiro.dev");
         request.Headers.TryAddWithoutValidation("Referer", "https://app.kiro.dev/");

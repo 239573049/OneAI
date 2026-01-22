@@ -396,11 +396,12 @@ public class AnthropicService(
 
                         if (input.Stream)
                         {
-                            await requestLogService.RecordSuccess(
-                                logId,
-                                stopwatch,
-                                (int)response.StatusCode,
-                                timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
+                            var timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
+                            int? promptTokens = null;
+                            int? completionTokens = null;
+                            int? totalTokens = null;
+                            int? cacheTokens = null;
+                            int? createCacheTokens = null;
 
                             context.Response.StatusCode = (int)response.StatusCode;
                             context.Response.ContentType = "text/event-stream;charset=utf-8";
@@ -410,34 +411,140 @@ public class AnthropicService(
 
                             await context.Response.Body.FlushAsync(context.RequestAborted);
 
-                            await using var stream = await response.Content.ReadAsStreamAsync(context.RequestAborted);
-                            using var reader = new StreamReader(stream, Encoding.UTF8);
-
-                            while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
+                            try
                             {
-                                await context.Response.WriteAsync(line.TrimEnd()).ConfigureAwait(false);
-                                if (line.StartsWith("data:"))
-                                {
-                                    await context.Response.Body.WriteAsync(OpenAIConstant.NewLine);
-                                }
-                                else
-                                {
-                                    await context.Response.Body.WriteAsync(OpenAIConstant.NewLine);
-                                }
+                                await using var stream = await response.Content.ReadAsStreamAsync(context.RequestAborted);
+                                using var reader = new StreamReader(stream, Encoding.UTF8);
 
-                                await context.Response.Body.FlushAsync(context.RequestAborted);
+                                while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
+                                {
+                                    await context.Response.WriteAsync(line.TrimEnd()).ConfigureAwait(false);
+                                    if (line.StartsWith("data:"))
+                                    {
+                                        await context.Response.Body.WriteAsync(OpenAIConstant.NewLine);
+                                    }
+                                    else
+                                    {
+                                        await context.Response.Body.WriteAsync(OpenAIConstant.NewLine);
+                                    }
+
+                                    await context.Response.Body.FlushAsync(context.RequestAborted);
+
+                                    if (!line.StartsWith("data:", StringComparison.Ordinal))
+                                    {
+                                        continue;
+                                    }
+
+                                    var data = line["data:".Length..].TrimStart();
+                                    if (string.Equals(data, "[DONE]", StringComparison.Ordinal))
+                                    {
+                                        continue;
+                                    }
+
+                                    UpdateUsageFromAnthropicPayload(
+                                        data,
+                                        ref promptTokens,
+                                        ref completionTokens,
+                                        ref totalTokens,
+                                        ref cacheTokens,
+                                        ref createCacheTokens);
+                                }
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                logger.LogInformation("客户端取消 Claude 流式请求");
+                                await requestLogService.RecordSuccess(
+                                    logId,
+                                    stopwatch,
+                                    (int)response.StatusCode,
+                                    timeToFirstByteMs: timeToFirstByteMs,
+                                    promptTokens: promptTokens,
+                                    completionTokens: completionTokens,
+                                    totalTokens: totalTokens,
+                                    cacheTokens: cacheTokens,
+                                    createCacheTokens: createCacheTokens);
+                                await aiAccountService.RecordTokenUsage(
+                                    account.Id,
+                                    promptTokens,
+                                    completionTokens,
+                                    cacheTokens,
+                                    createCacheTokens);
+                                return;
+                            }
+                            catch (Exception streamEx)
+                            {
+                                logger.LogError(streamEx,
+                                    "Claude 流式传输过程中发生异常");
+                                await requestLogService.RecordSuccess(
+                                    logId,
+                                    stopwatch,
+                                    (int)response.StatusCode,
+                                    timeToFirstByteMs: timeToFirstByteMs,
+                                    promptTokens: promptTokens,
+                                    completionTokens: completionTokens,
+                                    totalTokens: totalTokens,
+                                    cacheTokens: cacheTokens,
+                                    createCacheTokens: createCacheTokens);
+                                await aiAccountService.RecordTokenUsage(
+                                    account.Id,
+                                    promptTokens,
+                                    completionTokens,
+                                    cacheTokens,
+                                    createCacheTokens);
+                                return;
                             }
 
+                            await requestLogService.RecordSuccess(
+                                logId,
+                                stopwatch,
+                                (int)response.StatusCode,
+                                timeToFirstByteMs: timeToFirstByteMs,
+                                promptTokens: promptTokens,
+                                completionTokens: completionTokens,
+                                totalTokens: totalTokens,
+                                cacheTokens: cacheTokens,
+                                createCacheTokens: createCacheTokens);
+                            await aiAccountService.RecordTokenUsage(
+                                account.Id,
+                                promptTokens,
+                                completionTokens,
+                                cacheTokens,
+                                createCacheTokens);
                             return;
                         }
 
+                        var timeToFirstByte = stopwatch.ElapsedMilliseconds;
                         var body = await response.Content.ReadAsStringAsync(context.RequestAborted);
+                        int? bodyPromptTokens = null;
+                        int? bodyCompletionTokens = null;
+                        int? bodyTotalTokens = null;
+                        int? bodyCacheTokens = null;
+                        int? bodyCreateCacheTokens = null;
+
+                        UpdateUsageFromAnthropicPayload(
+                            body,
+                            ref bodyPromptTokens,
+                            ref bodyCompletionTokens,
+                            ref bodyTotalTokens,
+                            ref bodyCacheTokens,
+                            ref bodyCreateCacheTokens);
 
                         await requestLogService.RecordSuccess(
                             logId,
                             stopwatch,
                             (int)response.StatusCode,
-                            timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
+                            timeToFirstByteMs: timeToFirstByte,
+                            promptTokens: bodyPromptTokens,
+                            completionTokens: bodyCompletionTokens,
+                            totalTokens: bodyTotalTokens,
+                            cacheTokens: bodyCacheTokens,
+                            createCacheTokens: bodyCreateCacheTokens);
+                        await aiAccountService.RecordTokenUsage(
+                            account.Id,
+                            bodyPromptTokens,
+                            bodyCompletionTokens,
+                            bodyCacheTokens,
+                            bodyCreateCacheTokens);
 
                         context.Response.StatusCode = (int)response.StatusCode;
                         context.Response.ContentType =
@@ -714,11 +821,12 @@ public class AnthropicService(
 
                     if (input.Stream)
                     {
-                        await requestLogService.RecordSuccess(
-                            logId,
-                            stopwatch,
-                            (int)response.StatusCode,
-                            timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
+                        var timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
+                        int? promptTokens = null;
+                        int? completionTokens = null;
+                        int? totalTokens = null;
+                        int? cacheTokens = null;
+                        int? createCacheTokens = null;
 
                         context.Response.StatusCode = (int)response.StatusCode;
                         context.Response.ContentType = "text/event-stream;charset=utf-8";
@@ -728,34 +836,140 @@ public class AnthropicService(
 
                         await context.Response.Body.FlushAsync(context.RequestAborted);
 
-                        await using var stream = await response.Content.ReadAsStreamAsync(context.RequestAborted);
-                        using var reader = new StreamReader(stream, Encoding.UTF8);
-
-                        while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
+                        try
                         {
-                            await context.Response.WriteAsync(line).ConfigureAwait(false);
-                            if (line.StartsWith("data:"))
-                            {
-                                await context.Response.Body.WriteAsync(OpenAIConstant.DoubleNewLine);
-                            }
-                            else
-                            {
-                                await context.Response.Body.WriteAsync(OpenAIConstant.NewLine);
-                            }
+                            await using var stream = await response.Content.ReadAsStreamAsync(context.RequestAborted);
+                            using var reader = new StreamReader(stream, Encoding.UTF8);
 
-                            await context.Response.Body.FlushAsync(context.RequestAborted);
+                            while (await reader.ReadLineAsync().ConfigureAwait(false) is { } line)
+                            {
+                                await context.Response.WriteAsync(line).ConfigureAwait(false);
+                                if (line.StartsWith("data:"))
+                                {
+                                    await context.Response.Body.WriteAsync(OpenAIConstant.DoubleNewLine);
+                                }
+                                else
+                                {
+                                    await context.Response.Body.WriteAsync(OpenAIConstant.NewLine);
+                                }
+
+                                await context.Response.Body.FlushAsync(context.RequestAborted);
+
+                                if (!line.StartsWith("data:", StringComparison.Ordinal))
+                                {
+                                    continue;
+                                }
+
+                                var data = line["data:".Length..].TrimStart();
+                                if (string.Equals(data, "[DONE]", StringComparison.Ordinal))
+                                {
+                                    continue;
+                                }
+
+                                UpdateUsageFromAnthropicPayload(
+                                    data,
+                                    ref promptTokens,
+                                    ref completionTokens,
+                                    ref totalTokens,
+                                    ref cacheTokens,
+                                    ref createCacheTokens);
+                            }
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            logger.LogInformation("客户端取消 Factory 流式请求");
+                            await requestLogService.RecordSuccess(
+                                logId,
+                                stopwatch,
+                                (int)response.StatusCode,
+                                timeToFirstByteMs: timeToFirstByteMs,
+                                promptTokens: promptTokens,
+                                completionTokens: completionTokens,
+                                totalTokens: totalTokens,
+                                cacheTokens: cacheTokens,
+                                createCacheTokens: createCacheTokens);
+                            await aiAccountService.RecordTokenUsage(
+                                account.Id,
+                                promptTokens,
+                                completionTokens,
+                                cacheTokens,
+                                createCacheTokens);
+                            return;
+                        }
+                        catch (Exception streamEx)
+                        {
+                            logger.LogError(streamEx,
+                                "Factory 流式传输过程中发生异常");
+                            await requestLogService.RecordSuccess(
+                                logId,
+                                stopwatch,
+                                (int)response.StatusCode,
+                                timeToFirstByteMs: timeToFirstByteMs,
+                                promptTokens: promptTokens,
+                                completionTokens: completionTokens,
+                                totalTokens: totalTokens,
+                                cacheTokens: cacheTokens,
+                                createCacheTokens: createCacheTokens);
+                            await aiAccountService.RecordTokenUsage(
+                                account.Id,
+                                promptTokens,
+                                completionTokens,
+                                cacheTokens,
+                                createCacheTokens);
+                            return;
                         }
 
+                        await requestLogService.RecordSuccess(
+                            logId,
+                            stopwatch,
+                            (int)response.StatusCode,
+                            timeToFirstByteMs: timeToFirstByteMs,
+                            promptTokens: promptTokens,
+                            completionTokens: completionTokens,
+                            totalTokens: totalTokens,
+                            cacheTokens: cacheTokens,
+                            createCacheTokens: createCacheTokens);
+                        await aiAccountService.RecordTokenUsage(
+                            account.Id,
+                            promptTokens,
+                            completionTokens,
+                            cacheTokens,
+                            createCacheTokens);
                         return;
                     }
 
+                    var timeToFirstByte = stopwatch.ElapsedMilliseconds;
                     var body = await response.Content.ReadAsStringAsync(context.RequestAborted);
+                    int? bodyPromptTokens = null;
+                    int? bodyCompletionTokens = null;
+                    int? bodyTotalTokens = null;
+                    int? bodyCacheTokens = null;
+                    int? bodyCreateCacheTokens = null;
+
+                    UpdateUsageFromAnthropicPayload(
+                        body,
+                        ref bodyPromptTokens,
+                        ref bodyCompletionTokens,
+                        ref bodyTotalTokens,
+                        ref bodyCacheTokens,
+                        ref bodyCreateCacheTokens);
 
                     await requestLogService.RecordSuccess(
                         logId,
                         stopwatch,
                         (int)response.StatusCode,
-                        timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
+                        timeToFirstByteMs: timeToFirstByte,
+                        promptTokens: bodyPromptTokens,
+                        completionTokens: bodyCompletionTokens,
+                        totalTokens: bodyTotalTokens,
+                        cacheTokens: bodyCacheTokens,
+                        createCacheTokens: bodyCreateCacheTokens);
+                    await aiAccountService.RecordTokenUsage(
+                        account.Id,
+                        bodyPromptTokens,
+                        bodyCompletionTokens,
+                        bodyCacheTokens,
+                        bodyCreateCacheTokens);
 
                     context.Response.StatusCode = (int)response.StatusCode;
                     context.Response.ContentType =
@@ -922,18 +1136,29 @@ public class AnthropicService(
 
                     if (input.Stream)
                     {
+                        var timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
+                        var (streamPromptTokens, streamCompletionTokens, streamTotalTokens) =
+                            await StreamAnthropicResponse(
+                                context,
+                                response,
+                                input.Model,
+                                estimatedInputTokens,
+                                returnThoughts);
+
                         await requestLogService.RecordSuccess(
                             logId,
                             stopwatch,
                             (int)response.StatusCode,
-                            timeToFirstByteMs: stopwatch.ElapsedMilliseconds);
-
-                        await StreamAnthropicResponse(
-                            context,
-                            response,
-                            input.Model,
-                            estimatedInputTokens,
-                            returnThoughts);
+                            timeToFirstByteMs: timeToFirstByteMs,
+                            promptTokens: streamPromptTokens,
+                            completionTokens: streamCompletionTokens,
+                            totalTokens: streamTotalTokens);
+                        await aiAccountService.RecordTokenUsage(
+                            account.Id,
+                            streamPromptTokens,
+                            streamCompletionTokens,
+                            cacheTokens: null,
+                            createCacheTokens: null);
 
                         return;
                     }
@@ -965,6 +1190,12 @@ public class AnthropicService(
                         promptTokens: promptTokens,
                         completionTokens: completionTokens,
                         totalTokens: totalTokens);
+                    await aiAccountService.RecordTokenUsage(
+                        account.Id,
+                        promptTokens,
+                        completionTokens,
+                        cacheTokens: null,
+                        createCacheTokens: null);
 
                     context.Response.StatusCode = (int)response.StatusCode;
                     context.Response.ContentType = "application/json";
@@ -1137,7 +1368,7 @@ public class AnthropicService(
         await context.Response.WriteAsJsonAsync(new { input_tokens = tokens });
     }
 
-    private async Task StreamAnthropicResponse(
+    private async Task<(int? PromptTokens, int? CompletionTokens, int? TotalTokens)> StreamAnthropicResponse(
         HttpContext context,
         HttpResponseMessage response,
         string model,
@@ -1456,6 +1687,11 @@ public class AnthropicService(
         {
             logger.LogError(ex, "Antigravity 流式传输过程中发生异常");
         }
+
+        var promptTokens = state.HasInputTokens ? state.InputTokens : fallbackInputTokens;
+        var completionTokens = state.HasOutputTokens ? state.OutputTokens : 0;
+        var totalTokens = promptTokens + completionTokens;
+        return (promptTokens, completionTokens, totalTokens);
     }
 
     private async Task<HttpResponseMessage> SendAntigravityRequest(
@@ -2671,6 +2907,95 @@ public class AnthropicService(
             doc = null!;
             return false;
         }
+    }
+
+    private static void UpdateUsageFromAnthropicPayload(
+        string payload,
+        ref int? promptTokens,
+        ref int? completionTokens,
+        ref int? totalTokens,
+        ref int? cacheTokens,
+        ref int? createCacheTokens)
+    {
+        if (string.IsNullOrWhiteSpace(payload))
+        {
+            return;
+        }
+
+        if (!TryParseJson(payload, out var doc))
+        {
+            return;
+        }
+
+        using (doc)
+        {
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("usage", out var usage) && usage.ValueKind == JsonValueKind.Object)
+            {
+                ApplyAnthropicUsage(usage, ref promptTokens, ref completionTokens, ref totalTokens, ref cacheTokens,
+                    ref createCacheTokens);
+            }
+
+            if (root.TryGetProperty("message", out var message)
+                && message.ValueKind == JsonValueKind.Object
+                && message.TryGetProperty("usage", out var messageUsage)
+                && messageUsage.ValueKind == JsonValueKind.Object)
+            {
+                ApplyAnthropicUsage(messageUsage, ref promptTokens, ref completionTokens, ref totalTokens,
+                    ref cacheTokens, ref createCacheTokens);
+            }
+        }
+    }
+
+    private static void ApplyAnthropicUsage(
+        JsonElement usage,
+        ref int? promptTokens,
+        ref int? completionTokens,
+        ref int? totalTokens,
+        ref int? cacheTokens,
+        ref int? createCacheTokens)
+    {
+        if (TryGetIntProperty(usage, "input_tokens", out var inputTokens))
+        {
+            promptTokens = inputTokens;
+        }
+
+        if (TryGetIntProperty(usage, "output_tokens", out var outputTokens))
+        {
+            completionTokens = outputTokens;
+        }
+
+        if (TryGetIntProperty(usage, "cache_read_input_tokens", out var cacheReadTokens))
+        {
+            cacheTokens = cacheReadTokens;
+        }
+
+        if (TryGetIntProperty(usage, "cache_creation_input_tokens", out var cacheCreationTokens))
+        {
+            createCacheTokens = cacheCreationTokens;
+        }
+
+        if (promptTokens.HasValue && completionTokens.HasValue)
+        {
+            totalTokens = promptTokens.Value + completionTokens.Value;
+        }
+    }
+
+    private static bool TryGetIntProperty(JsonElement element, string propertyName, out int value)
+    {
+        value = default;
+        if (!element.TryGetProperty(propertyName, out var prop))
+        {
+            return false;
+        }
+
+        if (prop.ValueKind != JsonValueKind.Number)
+        {
+            return false;
+        }
+
+        return prop.TryGetInt32(out value);
     }
 
     private static bool IsGeminiTokenExpired(GeminiOAuthCredentialsDto geminiOAuth)
