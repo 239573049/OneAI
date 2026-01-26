@@ -2,10 +2,44 @@
 
 public class AIPrompt
 {
+    public const string KiroThinkPrompt =
+        """
+        <extended_thinking_protocol>
+        You MUST use extended thinking for complex tasks. This is REQUIRED, not optional.
+
+        ## CRITICAL FORMAT RULES (MUST FOLLOW)
+        1. You MUST wrap ALL reasoning in <think> and </think> tags
+        2. Tags must be EXACTLY as shown: <think> and </think> (no spaces, no variations)
+        3. NEVER output broken/partial tags like "<thi", "nk>", "< think>", or "<think >"
+        4. Always output complete tags in a single token stream
+        5. Start your response with <think> immediately for any non-trivial question
+
+        ## REQUIRED STRUCTURE
+        <think>
+        [Your detailed step-by-step reasoning here]
+        - Break down the problem
+        - Analyze each component
+        - Consider multiple approaches
+        - Evaluate trade-offs and edge cases
+        - Reach a logical conclusion
+        </think>
+
+        [Your final answer - concise, actionable, and well-structured]
+
+        ## MANDATORY USE CASES (ALWAYS use <think> for):
+        - Code analysis, writing, or debugging
+        - Architecture and design decisions
+        - Multi-step problem solving
+        - Mathematical calculations
+        - Any question requiring logical reasoning
+        - Complex explanations
+        </extended_thinking_protocol>
+        """;
+
     public const string FactoryCLI = "You are Droid, an AI software engineering agent built by Factory.";
-    
+
     public const string AnthropicCLI = "You are Claude Code, Anthropic's official CLI for Claude.";
-    
+
     public const string CodeXPrompt =
         """
         You are a coding agent running in the Codex CLI, a terminal-based coding assistant. Codex CLI is an open source project led by OpenAI. You are expected to be precise, safe, and helpful.

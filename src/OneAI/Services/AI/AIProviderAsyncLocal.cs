@@ -7,11 +7,15 @@ public class AIProviderAsyncLocal
 
     public static List<int> AIProviderIds
     {
-        get => _AIProviderHolder.Value?.AIProviderIds ?? new List<int>(5);
+        get
+        {
+            // 确保 Holder 存在，避免返回临时列表导致 Add 操作丢失
+            _AIProviderHolder.Value ??= new AIProviderHolder();
+            return _AIProviderHolder.Value.AIProviderIds;
+        }
         set
         {
             _AIProviderHolder.Value ??= new AIProviderHolder();
-
             _AIProviderHolder.Value.AIProviderIds = value;
         }
     }

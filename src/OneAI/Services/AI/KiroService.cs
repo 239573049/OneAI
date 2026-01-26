@@ -300,12 +300,15 @@ public sealed class KiroService(
 
                 if (input.Stream)
                 {
+                    var thinkingEnabled = input.Thinking != null &&
+                        string.Equals(input.Thinking.Type, "enabled", StringComparison.OrdinalIgnoreCase);
                     var (streamOutputTokens, streamTimeToFirstByteMs) = await StreamAnthropicResponse(
                         context,
                         response,
                         input.Model,
                         inputTokens,
-                        stopwatch);
+                        stopwatch,
+                        thinkingEnabled);
                     await requestLogService.RecordSuccess(
                         logId,
                         stopwatch,
@@ -345,7 +348,8 @@ public sealed class KiroService(
                     cacheTokens: null,
                     createCacheTokens: null);
 
-                var responsePayload = BuildAnthropicResponse(content, toolCalls, input.Model, inputTokens);
+                var responsePayload = BuildAnthropicResponse(content, toolCalls, input.Model, inputTokens,
+                    input.Thinking != null && string.Equals(input.Thinking.Type, "enabled", StringComparison.OrdinalIgnoreCase));
                 context.Response.ContentType = "application/json";
                 await context.Response.WriteAsync(responsePayload.ToJsonString(JsonOptions.DefaultOptions));
                 return;
@@ -778,13 +782,20 @@ public sealed class KiroService(
         HttpResponseMessage response,
         string responseModel,
         int inputTokens,
-        Stopwatch stopwatch)
+        Stopwatch stopwatch,
+        bool thinkingEnabled = false)
     {
         var responseStarted = false;
 
         var contentBlockOpen = false;
         ResponseEventType? currentBlockType = null;
-        
+
+        // Thinking state tracking
+        var thinkingBlockOpen = false;
+        var inThinkTag = false;
+        var thinkingSignature = thinkingEnabled ? GenerateThinkingSignature() : null;
+        var accumulatedContent = new StringBuilder();
+
         async Task EnsureStreamStartedAsync()
         {
             if (responseStarted)
@@ -820,11 +831,53 @@ public sealed class KiroService(
             };
 
             await WriteSseJsonAsync(context, messageStart, context.RequestAborted);
+        }
+
+        async Task OpenThinkingBlockAsync(int blockIndex)
+        {
+            if (thinkingBlockOpen) return;
+
+            var thinkingBlockStart = new JsonObject
+            {
+                ["type"] = "content_block_start",
+                ["index"] = blockIndex,
+                ["content_block"] = new JsonObject
+                {
+                    ["type"] = "thinking",
+                    ["thinking"] = string.Empty
+                }
+            };
+
+            if (!string.IsNullOrWhiteSpace(thinkingSignature))
+            {
+                ((JsonObject)thinkingBlockStart["content_block"]!)["signature"] = thinkingSignature;
+            }
+
+            await WriteSseJsonAsync(context, thinkingBlockStart, context.RequestAborted);
+            thinkingBlockOpen = true;
+            currentBlockType = ResponseEventType.Thinking;
+        }
+
+        async Task CloseThinkingBlockAsync(int blockIndex)
+        {
+            if (!thinkingBlockOpen) return;
+
+            await WriteSseJsonAsync(context, new JsonObject
+            {
+                ["type"] = "content_block_stop",
+                ["index"] = blockIndex
+            }, context.RequestAborted);
+            thinkingBlockOpen = false;
+        }
+
+        async Task OpenTextBlockAsync(int blockIndex)
+        {
+            if (contentBlockOpen && currentBlockType == ResponseEventType.Content) return;
 
             var contentBlockStart = new JsonObject
             {
                 ["type"] = "content_block_start",
-                ["index"] = 0,
+                ["index"] = blockIndex,
                 ["content_block"] = new JsonObject
                 {
                     ["type"] = "text",
@@ -835,6 +888,42 @@ public sealed class KiroService(
             await WriteSseJsonAsync(context, contentBlockStart, context.RequestAborted);
             contentBlockOpen = true;
             currentBlockType = ResponseEventType.Content;
+        }
+
+        async Task EmitThinkingDeltaAsync(string text, int blockIndex)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+
+            var delta = new JsonObject
+            {
+                ["type"] = "content_block_delta",
+                ["index"] = blockIndex,
+                ["delta"] = new JsonObject
+                {
+                    ["type"] = "thinking_delta",
+                    ["thinking"] = text
+                }
+            };
+
+            await WriteSseJsonAsync(context, delta, context.RequestAborted);
+        }
+
+        async Task EmitTextDeltaAsync(string text, int blockIndex)
+        {
+            if (string.IsNullOrEmpty(text)) return;
+
+            var delta = new JsonObject
+            {
+                ["type"] = "content_block_delta",
+                ["index"] = blockIndex,
+                ["delta"] = new JsonObject
+                {
+                    ["type"] = "text_delta",
+                    ["text"] = text
+                }
+            };
+
+            await WriteSseJsonAsync(context, delta, context.RequestAborted);
         }
 
         var toolCalls = new List<KiroToolCall>();
@@ -862,27 +951,181 @@ public sealed class KiroService(
                         continue;
                     }
 
-                    currentBlockType = ResponseEventType.Content;
-
                     lastContent = ev.Content;
                     totalOutputTokens += CountTokens(ev.Content);
 
-                    var delta = new JsonObject
+                    if (thinkingEnabled)
                     {
-                        ["type"] = "content_block_delta",
-                        ["index"] = index,
-                        ["delta"] = new JsonObject
-                        {
-                            ["type"] = "text_delta",
-                            ["text"] = ev.Content
-                        }
-                    };
+                        // Process content with think tag parsing
+                        // Accumulate content to handle tags split across chunks
+                        accumulatedContent.Append(ev.Content);
 
-                    await WriteSseJsonAsync(context, delta, context.RequestAborted);
+                        await ProcessThinkTagsAsync();
+
+                        async Task ProcessThinkTagsAsync()
+                        {
+                            var content = accumulatedContent.ToString();
+                            var processed = 0;
+
+                            while (processed < content.Length)
+                            {
+                                var remaining = content.Substring(processed);
+
+                                if (inThinkTag)
+                                {
+                                    // Look for closing </think> tag
+                                    var closeTagIndex = remaining.IndexOf("</think>", StringComparison.OrdinalIgnoreCase);
+                                    if (closeTagIndex >= 0)
+                                    {
+                                        // Found complete closing tag
+                                        var thinkingContent = remaining.Substring(0, closeTagIndex);
+                                        if (!string.IsNullOrEmpty(thinkingContent))
+                                        {
+                                            if (!thinkingBlockOpen)
+                                            {
+                                                await OpenThinkingBlockAsync(index);
+                                            }
+                                            await EmitThinkingDeltaAsync(thinkingContent, index);
+                                        }
+
+                                        // Close thinking block
+                                        await CloseThinkingBlockAsync(index);
+                                        index++;
+                                        inThinkTag = false;
+                                        processed += closeTagIndex + "</think>".Length;
+                                    }
+                                    else
+                                    {
+                                        // Check for partial closing tag at the end
+                                        // Could be: <, </, </t, </th, </thi, </thin, </think
+                                        var partialMatch = FindPartialTagMatch(remaining, "</think>");
+
+                                        if (partialMatch.HasPartial)
+                                        {
+                                            // Emit content before the potential partial tag
+                                            var safeContent = remaining.Substring(0, partialMatch.StartIndex);
+                                            if (!string.IsNullOrEmpty(safeContent))
+                                            {
+                                                if (!thinkingBlockOpen)
+                                                {
+                                                    await OpenThinkingBlockAsync(index);
+                                                }
+                                                await EmitThinkingDeltaAsync(safeContent, index);
+                                            }
+                                            // Keep the partial tag in buffer for next chunk
+                                            accumulatedContent.Clear();
+                                            accumulatedContent.Append(remaining.Substring(partialMatch.StartIndex));
+                                            return;
+                                        }
+                                        else
+                                        {
+                                            // No partial tag, emit all as thinking content
+                                            if (!thinkingBlockOpen)
+                                            {
+                                                await OpenThinkingBlockAsync(index);
+                                            }
+                                            await EmitThinkingDeltaAsync(remaining, index);
+                                            accumulatedContent.Clear();
+                                            return;
+                                        }
+                                    }
+                                }
+                                else
+                                {
+                                    // Look for opening <think> tag
+                                    var openTagIndex = remaining.IndexOf("<think>", StringComparison.OrdinalIgnoreCase);
+                                    if (openTagIndex >= 0)
+                                    {
+                                        // Found complete opening tag
+                                        var textContent = remaining.Substring(0, openTagIndex);
+                                        if (!string.IsNullOrEmpty(textContent))
+                                        {
+                                            if (!contentBlockOpen || currentBlockType != ResponseEventType.Content)
+                                            {
+                                                await OpenTextBlockAsync(index);
+                                            }
+                                            await EmitTextDeltaAsync(textContent, index);
+                                        }
+
+                                        // Close text block if open and switch to thinking
+                                        if (contentBlockOpen && currentBlockType == ResponseEventType.Content)
+                                        {
+                                            await WriteSseJsonAsync(context, new JsonObject
+                                            {
+                                                ["type"] = "content_block_stop",
+                                                ["index"] = index
+                                            }, context.RequestAborted);
+                                            contentBlockOpen = false;
+                                            index++;
+                                        }
+
+                                        inThinkTag = true;
+                                        processed += openTagIndex + "<think>".Length;
+                                    }
+                                    else
+                                    {
+                                        // Check for partial opening tag at the end
+                                        // Could be: <, <t, <th, <thi, <thin, <think
+                                        var partialMatch = FindPartialTagMatch(remaining, "<think>");
+
+                                        if (partialMatch.HasPartial)
+                                        {
+                                            // Emit content before the potential partial tag
+                                            var safeContent = remaining.Substring(0, partialMatch.StartIndex);
+                                            if (!string.IsNullOrEmpty(safeContent))
+                                            {
+                                                if (!contentBlockOpen || currentBlockType != ResponseEventType.Content)
+                                                {
+                                                    await OpenTextBlockAsync(index);
+                                                }
+                                                await EmitTextDeltaAsync(safeContent, index);
+                                            }
+                                            // Keep the partial tag in buffer for next chunk
+                                            accumulatedContent.Clear();
+                                            accumulatedContent.Append(remaining.Substring(partialMatch.StartIndex));
+                                            return;
+                                        }
+                                        else
+                                        {
+                                            // No partial tag, emit all as text content
+                                            if (!contentBlockOpen || currentBlockType != ResponseEventType.Content)
+                                            {
+                                                await OpenTextBlockAsync(index);
+                                            }
+                                            await EmitTextDeltaAsync(remaining, index);
+                                            accumulatedContent.Clear();
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+
+                            accumulatedContent.Clear();
+                        }
+                    }
+                    else
+                    {
+                        // Original behavior without thinking
+                        currentBlockType = ResponseEventType.Content;
+
+                        if (!contentBlockOpen)
+                        {
+                            await OpenTextBlockAsync(index);
+                        }
+
+                        await EmitTextDeltaAsync(ev.Content, index);
+                    }
                 }
                 else if (ev is { Type: KiroStreamEventType.ToolUse, ToolUse: not null, ToolUse.Stop: false } &&
                          string.IsNullOrEmpty(ev.ToolUse.Input))
                 {
+                    // Close any open thinking block first
+                    if (thinkingBlockOpen)
+                    {
+                        await CloseThinkingBlockAsync(index);
+                        index++;
+                    }
+
                     if (contentBlockOpen && currentBlockType == ResponseEventType.Content)
                     {
                         await WriteSseJsonAsync(context, new JsonObject
@@ -963,47 +1206,34 @@ public sealed class KiroService(
             toolCalls.Add(currentTool.ToToolCall());
         }
 
+        // Handle any remaining buffered content
+        if (thinkingEnabled && accumulatedContent.Length > 0)
+        {
+            var remaining = accumulatedContent.ToString();
+            if (inThinkTag)
+            {
+                if (!thinkingBlockOpen)
+                {
+                    await OpenThinkingBlockAsync(index);
+                }
+                await EmitThinkingDeltaAsync(remaining, index);
+            }
+            else
+            {
+                if (!contentBlockOpen || currentBlockType != ResponseEventType.Content)
+                {
+                    await OpenTextBlockAsync(index);
+                }
+                await EmitTextDeltaAsync(remaining, index);
+            }
+        }
 
-        // if (toolCalls.Count > 0)
-        // {
-        //     for (var i = 0; i < toolCalls.Count; i++)
-        //     {
-        //         var toolCall = toolCalls[i];
-        //         var inputJson = BuildToolInputNode(toolCall.Arguments);
-        //         // await WriteSseJsonAsync(context, new JsonObject
-        //         // {
-        //         //     ["type"] = "content_block_start",
-        //         //     ["index"] = i + 1,
-        //         //     ["content_block"] = new JsonObject
-        //         //     {
-        //         //         ["type"] = "tool_use",
-        //         //         ["id"] = toolCall.Id,
-        //         //         ["name"] = toolCall.Name,
-        //         //         ["input"] = new JsonObject()
-        //         //     }
-        //         // }, context.RequestAborted);
-        //
-        //         var partialJson = inputJson.ToJsonString(JsonOptions.DefaultOptions);
-        //
-        //         await WriteSseJsonAsync(context, new JsonObject
-        //         {
-        //             ["type"] = "content_block_delta",
-        //             ["index"] = i + 1,
-        //             ["delta"] = new JsonObject
-        //             {
-        //                 ["type"] = "input_json_delta",
-        //                 ["partial_json"] = partialJson
-        //             }
-        //         }, context.RequestAborted);
-        //
-        //         totalOutputTokens += CountTokens(partialJson);
-        //         await WriteSseJsonAsync(context, new JsonObject
-        //         {
-        //             ["type"] = "content_block_stop",
-        //             ["index"] = i + 1
-        //         }, context.RequestAborted);
-        //     }
-        // }
+        // Close any open thinking block
+        if (thinkingBlockOpen)
+        {
+            await CloseThinkingBlockAsync(index);
+            index++;
+        }
 
         if (contentBlockOpen)
         {
@@ -1409,6 +1639,42 @@ public sealed class KiroService(
 
         var runtimeVersion = Environment.Version.ToString();
         return (osName, runtimeVersion);
+    }
+
+    private static string GenerateThinkingSignature()
+    {
+        // Generate a base64-encoded signature for thinking blocks
+        var bytes = new byte[32];
+        RandomNumberGenerator.Fill(bytes);
+        return Convert.ToBase64String(bytes);
+    }
+
+    /// <summary>
+    /// Find partial tag match at the end of content.
+    /// Handles cases like: content ending with "&lt;", "&lt;t", "&lt;th", "&lt;thi", "&lt;thin", "&lt;think" for opening tag
+    /// or "&lt;", "&lt;/", "&lt;/t", "&lt;/th", etc. for closing tag
+    /// </summary>
+    private static (bool HasPartial, int StartIndex) FindPartialTagMatch(string content, string tag)
+    {
+        if (string.IsNullOrEmpty(content) || string.IsNullOrEmpty(tag))
+            return (false, -1);
+
+        // Check from the end of content for any prefix of the tag
+        // We need to check if content ends with any prefix of the tag
+        var maxCheckLength = Math.Min(content.Length, tag.Length - 1);
+
+        for (var prefixLen = 1; prefixLen <= maxCheckLength; prefixLen++)
+        {
+            var suffix = content.Substring(content.Length - prefixLen);
+            var tagPrefix = tag.Substring(0, prefixLen);
+
+            if (string.Equals(suffix, tagPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return (true, content.Length - prefixLen);
+            }
+        }
+
+        return (false, -1);
     }
 
     private static string GenerateMachineId(KiroOAuthCredentialsDto credentials)
@@ -1938,27 +2204,35 @@ public sealed class KiroService(
 
     private static string? BuildAnthropicSystemPrompt(AnthropicInput input)
     {
+        var builder = new StringBuilder();
+
+        // Add thinking prompt if thinking is enabled
+        if (input.Thinking != null && string.Equals(input.Thinking.Type, "enabled", StringComparison.OrdinalIgnoreCase))
+        {
+            builder.Append(AIPrompt.KiroThinkPrompt);
+        }
+
         if (!string.IsNullOrWhiteSpace(input.System))
         {
-            return input.System;
-        }
-
-        if (input.Systems == null || input.Systems.Count == 0)
-        {
-            return null;
-        }
-
-        var builder = new StringBuilder();
-        foreach (var item in input.Systems)
-        {
-            if (item.Type == "text" && !string.IsNullOrWhiteSpace(item.Text))
+            if (builder.Length > 0)
             {
-                if (builder.Length > 0)
+                builder.Append("\n\n");
+            }
+            builder.Append(input.System);
+        }
+        else if (input.Systems != null && input.Systems.Count > 0)
+        {
+            foreach (var item in input.Systems)
+            {
+                if (item.Type == "text" && !string.IsNullOrWhiteSpace(item.Text))
                 {
-                    builder.Append('\n');
-                }
+                    if (builder.Length > 0)
+                    {
+                        builder.Append('\n');
+                    }
 
-                builder.Append(item.Text);
+                    builder.Append(item.Text);
+                }
             }
         }
 
@@ -1968,6 +2242,8 @@ public sealed class KiroService(
     private static List<KiroMessage> ConvertAnthropicMessages(AnthropicInput input)
     {
         var result = new List<KiroMessage>();
+        var thinkingEnabled = input.Thinking != null &&
+            string.Equals(input.Thinking.Type, "enabled", StringComparison.OrdinalIgnoreCase);
 
         foreach (var message in input.Messages)
         {
@@ -1981,6 +2257,19 @@ public sealed class KiroService(
                     if (content.Type == "text")
                     {
                         part = new KiroMessagePart("text") { Text = content.Text ?? content.Content?.ToString() };
+                    }
+                    else if (content.Type == "thinking" || content.Type == "redacted_thinking")
+                    {
+                        // Convert thinking block to <think> tagged text for Kiro
+                        if (thinkingEnabled)
+                        {
+                            var thinkingText = content.Thinking ?? content.Text ?? content.Content?.ToString() ?? string.Empty;
+                            if (!string.IsNullOrEmpty(thinkingText))
+                            {
+                                part = new KiroMessagePart("text") { Text = $"<think>{thinkingText}</think>" };
+                            }
+                        }
+                        // If thinking is not enabled, skip thinking blocks
                     }
                     else if (content.Type == "tool_use")
                     {
@@ -2397,7 +2686,8 @@ public sealed class KiroService(
         string content,
         List<KiroToolCall> toolCalls,
         string model,
-        int inputTokens)
+        int inputTokens,
+        bool thinkingEnabled = false)
     {
         var messageId = Guid.NewGuid().ToString();
         var contentArray = new JsonArray();
@@ -2423,12 +2713,32 @@ public sealed class KiroService(
         }
         else
         {
-            contentArray.Add(new JsonObject
+            // Parse <think> tags if thinking is enabled
+            if (thinkingEnabled)
             {
-                ["type"] = "text",
-                ["text"] = content
-            });
-            outputTokens += CountTokens(content);
+                var parsedBlocks = ParseThinkTagsFromContent(content);
+                foreach (var block in parsedBlocks)
+                {
+                    contentArray.Add(block);
+                    if (block["type"]?.ToString() == "thinking")
+                    {
+                        outputTokens += CountTokens(block["thinking"]?.ToString());
+                    }
+                    else
+                    {
+                        outputTokens += CountTokens(block["text"]?.ToString());
+                    }
+                }
+            }
+            else
+            {
+                contentArray.Add(new JsonObject
+                {
+                    ["type"] = "text",
+                    ["text"] = content
+                });
+                outputTokens += CountTokens(content);
+            }
         }
 
         return new JsonObject
@@ -2448,6 +2758,108 @@ public sealed class KiroService(
             },
             ["content"] = contentArray
         };
+    }
+
+    /// <summary>
+    /// Parse content with &lt;think&gt; tags and return content blocks
+    /// </summary>
+    private static List<JsonObject> ParseThinkTagsFromContent(string content)
+    {
+        var blocks = new List<JsonObject>();
+        if (string.IsNullOrEmpty(content))
+        {
+            return blocks;
+        }
+
+        var remaining = content;
+        var thinkingSignature = GenerateThinkingSignature();
+
+        while (remaining.Length > 0)
+        {
+            var openTagIndex = remaining.IndexOf("<think>", StringComparison.OrdinalIgnoreCase);
+
+            if (openTagIndex < 0)
+            {
+                // No more think tags, add remaining as text
+                if (!string.IsNullOrWhiteSpace(remaining))
+                {
+                    blocks.Add(new JsonObject
+                    {
+                        ["type"] = "text",
+                        ["text"] = remaining
+                    });
+                }
+                break;
+            }
+
+            // Add text before <think> tag
+            if (openTagIndex > 0)
+            {
+                var textBefore = remaining.Substring(0, openTagIndex);
+                if (!string.IsNullOrWhiteSpace(textBefore))
+                {
+                    blocks.Add(new JsonObject
+                    {
+                        ["type"] = "text",
+                        ["text"] = textBefore
+                    });
+                }
+            }
+
+            // Find closing </think> tag
+            var afterOpenTag = remaining.Substring(openTagIndex + "<think>".Length);
+            var closeTagIndex = afterOpenTag.IndexOf("</think>", StringComparison.OrdinalIgnoreCase);
+
+            if (closeTagIndex < 0)
+            {
+                // No closing tag found, treat rest as thinking content
+                if (!string.IsNullOrWhiteSpace(afterOpenTag))
+                {
+                    var thinkingBlock = new JsonObject
+                    {
+                        ["type"] = "thinking",
+                        ["thinking"] = afterOpenTag
+                    };
+                    if (!string.IsNullOrWhiteSpace(thinkingSignature))
+                    {
+                        thinkingBlock["signature"] = thinkingSignature;
+                    }
+                    blocks.Add(thinkingBlock);
+                }
+                break;
+            }
+
+            // Extract thinking content
+            var thinkingContent = afterOpenTag.Substring(0, closeTagIndex);
+            if (!string.IsNullOrWhiteSpace(thinkingContent))
+            {
+                var thinkingBlock = new JsonObject
+                {
+                    ["type"] = "thinking",
+                    ["thinking"] = thinkingContent
+                };
+                if (!string.IsNullOrWhiteSpace(thinkingSignature))
+                {
+                    thinkingBlock["signature"] = thinkingSignature;
+                }
+                blocks.Add(thinkingBlock);
+            }
+
+            // Continue with content after </think>
+            remaining = afterOpenTag.Substring(closeTagIndex + "</think>".Length);
+        }
+
+        // If no blocks were added, add empty text block
+        if (blocks.Count == 0)
+        {
+            blocks.Add(new JsonObject
+            {
+                ["type"] = "text",
+                ["text"] = string.Empty
+            });
+        }
+
+        return blocks;
     }
 
     private static JsonObject BuildOpenAiResponse(
@@ -2834,6 +3246,7 @@ public sealed class KiroService(
     {
         Content,
         ToolUse,
+        Thinking,
     }
 
     private sealed class KiroStreamEvent(KiroStreamEventType type)
