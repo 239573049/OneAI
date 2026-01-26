@@ -261,6 +261,7 @@ public class ResponsesService
 
                         request.Store = false;
                         request.ServiceTier = null;
+                        request.MaxOutputTokens = null;
 
                         HttpResponseMessage response;
                         try
