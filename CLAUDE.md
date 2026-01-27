@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-OneAI is a full-stack AI account management system built with React + .NET 10. It manages multiple AI service accounts (OpenAI, Claude, Gemini) with OAuth integration, request logging, and quota tracking.
+OneAI is a full-stack AI account management system built with React + .NET 10. It manages multiple AI service accounts (OpenAI, Claude, Gemini, Factory, Kiro) with OAuth integration, request logging, and quota tracking.
 
 **Architecture**: Split frontend/backend monorepo
 - Frontend: `web/` - React 19 + TypeScript + Vite + shadcn/ui
@@ -17,8 +17,10 @@ OneAI is a full-stack AI account management system built with React + .NET 10. I
 dotnet run                           # Start API at http://localhost:5000
 dotnet build                         # Build project
 dotnet publish -c Release -o publish # Production build
-dotnet ef migrations add <Name>      # Create migration
-dotnet ef database update            # Apply migrations
+dotnet ef migrations add <Name> --context AppDbContext      # Create app migration
+dotnet ef migrations add <Name> --context LogDbContext      # Create log migration
+dotnet ef database update --context AppDbContext            # Apply app migrations
+dotnet ef database update --context LogDbContext            # Apply log migrations
 ```
 
 API documentation available at: `http://localhost:5000/scalar`
@@ -56,10 +58,11 @@ npm run preview  # Preview production build
 - OAuth helpers per provider:
   - OpenAI: `OpenAiOAuthHelper` (Authorization Code + PKCE)
   - Claude: `ClaudeCodeOAuthHelper` (Authorization Code + PKCE)
-  - Gemini: `GeminiAntigravityOAuthHelper`, `GeminiOAuthHelper` (Authorization Code + PKCE)
-  - Factory: `FactoryOAuthService` (Device Authorization Flow via WorkOS)
+  - Gemini: `GeminiOAuthHelper`, `GeminiAntigravityOAuthHelper` (Authorization Code + PKCE)
+  - Gemini Business: `GeminiBusinessOAuthService` (Authorization Code + PKCE)
+  - Factory: `FactoryOAuthService` (Device Authorization Flow via WorkOS, RFC 8628)
+  - Kiro: `KiroOAuthService` (Amazon CodeWhisperer via Kiro OAuth)
 - OAuth tokens stored in `AIAccount.OAuthToken` as JSON
-- Factory uses WorkOS Device Authorization Flow (RFC 8628) - user authorizes via device code, polls token endpoint
 
 **Quota Tracking**: `AccountQuotaCacheService` (singleton) maintains in-memory cache of account quotas with rate limiting logic.
 
@@ -113,8 +116,8 @@ Configured in `src/OneAI/Program.cs` lines 154-163. Currently allows:
 - Supports both API key (`ApiKey`) and OAuth (`OAuthToken` JSON field)
 - `IsEnabled`: Soft disable flag
 - `IsRateLimited`: Quota exceeded flag
-- `Provider`: Service name (OpenAI, Claude, Factory, Gemini, Gemini-Antigravity)
-- Extension methods for OAuth serialization: `GetClaudeOauth()`, `SetClaudeOAuth()`, `GetFactoryOAuth()`, `SetFactoryOAuth()`, etc.
+- `Provider`: Service name (OpenAI, Claude, Factory, Gemini, Gemini-Antigravity, Gemini-Business, Kiro)
+- Extension methods for OAuth serialization: `GetOpenAiOauth()`, `GetClaudeOauth()`, `GetGeminiOauth()`, `GetGeminiBusinessOauth()`, `GetFactoryOauth()`, `GetKiroOauth()` and corresponding setters
 
 **AIRequestLog**: Request logging for analytics
 - Linked to `AIAccount` via `AccountId`
@@ -160,10 +163,10 @@ Configured in `src/OneAI/Program.cs` lines 154-163. Currently allows:
 
 ### Adding a Database Entity
 1. Create entity in `src/OneAI/Entities/MyEntity.cs`
-2. Add `DbSet<MyEntity>` to `AppDbContext.cs`
+2. Add `DbSet<MyEntity>` to `AppDbContext.cs` (or `LogDbContext.cs` for log-related entities)
 3. Configure in `OnModelCreating` if needed
-4. Run: `dotnet ef migrations add AddMyEntity`
-5. Run: `dotnet ef database update`
+4. Run: `dotnet ef migrations add AddMyEntity --context AppDbContext`
+5. Run: `dotnet ef database update --context AppDbContext`
 
 ## Code Style
 

@@ -82,6 +82,16 @@ public class HourlyByModelDto
     public double SuccessRate { get; set; }
 
     /// <summary>
+    /// 输入Token消耗（Prompt Tokens）
+    /// </summary>
+    public long PromptTokens { get; set; }
+
+    /// <summary>
+    /// 输出Token消耗（Completion Tokens）
+    /// </summary>
+    public long CompletionTokens { get; set; }
+
+    /// <summary>
     /// 总Token消耗
     /// </summary>
     public long TotalTokens { get; set; }

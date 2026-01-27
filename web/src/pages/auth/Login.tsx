@@ -1,28 +1,15 @@
 import { useState } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
 import { useNavigate } from 'react-router-dom'
-import { Eye, EyeOff, Loader2, HelpCircle } from 'lucide-react'
+import { Eye, EyeOff, Loader2, Sparkles, Bot, User, Lock } from 'lucide-react'
 import {
   Button as AnimateUIButton,
 } from '@/components/animate-ui/components/buttons/button'
 import { Input } from '@/components/animate-ui/components/input'
 import { Label } from '@/components/animate-ui/components/label'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/animate-ui/components/card'
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from '@/components/animate-ui/components/animate/tooltip'
 import { authService } from '@/services/auth'
 import { setToken } from '@/services/api'
 import type { LoginRequest } from '@/types/auth'
-import { scaleInCenter } from '@/lib/animations'
 import { ThemeToggle } from '@/components/theme-toggle'
 
 export default function Login() {
@@ -59,68 +46,179 @@ export default function Login() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-gradient-to-br from-slate-50 via-blue-50 to-slate-100 dark:from-slate-950 dark:via-slate-900 dark:to-slate-800 p-4 relative overflow-hidden">
+    <div className="flex min-h-screen relative overflow-hidden">
       {/* Theme Toggle */}
-      <div className="absolute top-4 right-4 z-20">
+      <div className="absolute top-6 right-6 z-20">
         <ThemeToggle />
       </div>
 
-      {/* Animated background elements */}
-      <div className="absolute inset-0 overflow-hidden pointer-events-none">
+      {/* Left Panel - Branding */}
+      <div className="hidden lg:flex lg:w-1/2 relative bg-gradient-to-br from-violet-600 via-purple-600 to-indigo-700 dark:from-violet-900 dark:via-purple-900 dark:to-indigo-950">
+        {/* Animated Grid Background */}
+        <div className="absolute inset-0 opacity-20">
+          <div className="absolute inset-0" style={{
+            backgroundImage: `linear-gradient(rgba(255,255,255,0.1) 1px, transparent 1px),
+                             linear-gradient(90deg, rgba(255,255,255,0.1) 1px, transparent 1px)`,
+            backgroundSize: '50px 50px'
+          }} />
+        </div>
+
+        {/* Floating Orbs */}
         <motion.div
-          className="absolute w-96 h-96 rounded-full bg-gradient-to-r from-blue-400/20 to-cyan-400/20 blur-3xl dark:from-blue-500/10 dark:to-cyan-500/10"
+          className="absolute w-72 h-72 rounded-full bg-white/10 blur-3xl"
+          animate={{
+            x: [0, 50, 0],
+            y: [0, 30, 0],
+            scale: [1, 1.1, 1],
+          }}
+          transition={{ duration: 10, repeat: Infinity, ease: 'easeInOut' }}
+          style={{ top: '10%', left: '10%' }}
+        />
+        <motion.div
+          className="absolute w-96 h-96 rounded-full bg-pink-500/20 blur-3xl"
+          animate={{
+            x: [0, -40, 0],
+            y: [0, 50, 0],
+            scale: [1, 1.2, 1],
+          }}
+          transition={{ duration: 12, repeat: Infinity, ease: 'easeInOut', delay: 1 }}
+          style={{ bottom: '10%', right: '5%' }}
+        />
+        <motion.div
+          className="absolute w-64 h-64 rounded-full bg-cyan-400/15 blur-3xl"
           animate={{
             x: [0, 30, 0],
-            y: [0, 20, 0],
+            y: [0, -40, 0],
           }}
-          transition={{ duration: 8, repeat: Infinity, ease: 'easeInOut' }}
-          style={{ top: '-50px', left: '-50px' }}
+          transition={{ duration: 8, repeat: Infinity, ease: 'easeInOut', delay: 2 }}
+          style={{ top: '50%', left: '30%' }}
         />
-        <motion.div
-          className="absolute w-96 h-96 rounded-full bg-gradient-to-r from-purple-400/20 to-pink-400/20 blur-3xl dark:from-purple-500/10 dark:to-pink-500/10"
-          animate={{
-            x: [0, -30, 0],
-            y: [0, -20, 0],
-          }}
-          transition={{ duration: 8, repeat: Infinity, ease: 'easeInOut', delay: 0.5 }}
-          style={{ bottom: '-50px', right: '-50px' }}
-        />
+
+        {/* Content */}
+        <div className="relative z-10 flex flex-col justify-center px-12 xl:px-20 text-white">
+          <motion.div
+            initial={{ opacity: 0, y: 30 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.8, delay: 0.2 }}
+          >
+            {/* Logo */}
+            <motion.div
+              className="flex items-center gap-3 mb-8"
+              whileHover={{ scale: 1.02 }}
+            >
+              <div className="relative">
+                <div className="w-14 h-14 rounded-2xl bg-white/20 backdrop-blur-sm flex items-center justify-center">
+                  <Bot className="w-8 h-8" />
+                </div>
+                <motion.div
+                  className="absolute -top-1 -right-1 w-4 h-4 rounded-full bg-green-400"
+                  animate={{ scale: [1, 1.2, 1] }}
+                  transition={{ duration: 2, repeat: Infinity }}
+                />
+              </div>
+              <div>
+                <h1 className="text-3xl font-bold tracking-tight">OneAI</h1>
+                <p className="text-white/70 text-sm">AI Account Manager</p>
+              </div>
+            </motion.div>
+
+            {/* Tagline */}
+            <h2 className="text-4xl xl:text-5xl font-bold leading-tight mb-6">
+              统一管理
+              <br />
+              <span className="text-transparent bg-clip-text bg-gradient-to-r from-cyan-300 to-pink-300">
+                多平台 AI 账户
+              </span>
+            </h2>
+            <p className="text-lg text-white/80 mb-10 max-w-md leading-relaxed">
+              集中管理 OpenAI、Claude、Gemini 等多个 AI 服务账户，
+              实时监控配额使用，智能负载均衡。
+            </p>
+
+            {/* Features */}
+            <div className="space-y-4">
+              {[
+                { icon: Sparkles, text: '多平台账户统一管理' },
+                { icon: Sparkles, text: '实时配额监控与预警' },
+                { icon: Sparkles, text: '请求日志与数据分析' },
+              ].map((feature, index) => (
+                <motion.div
+                  key={index}
+                  className="flex items-center gap-3"
+                  initial={{ opacity: 0, x: -20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  transition={{ delay: 0.5 + index * 0.1 }}
+                >
+                  <div className="w-8 h-8 rounded-lg bg-white/10 flex items-center justify-center">
+                    <feature.icon className="w-4 h-4" />
+                  </div>
+                  <span className="text-white/90">{feature.text}</span>
+                </motion.div>
+              ))}
+            </div>
+          </motion.div>
+        </div>
       </div>
 
-      {/* Content */}
-      <motion.div {...scaleInCenter} className="relative z-10 w-full max-w-md">
-        <Card className="w-full" hoverable={false} variant="elevated">
-          <CardHeader className="space-y-1">
-            <motion.div
-              initial={{ opacity: 0, y: -10 }}
+      {/* Right Panel - Login Form */}
+      <div className="w-full lg:w-1/2 flex items-center justify-center p-6 sm:p-12 bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-950 dark:to-slate-900">
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.6 }}
+          className="w-full max-w-md"
+        >
+          {/* Mobile Logo */}
+          <motion.div
+            className="lg:hidden flex items-center justify-center gap-3 mb-10"
+            initial={{ opacity: 0, scale: 0.9 }}
+            animate={{ opacity: 1, scale: 1 }}
+            transition={{ delay: 0.1 }}
+          >
+            <div className="w-12 h-12 rounded-xl bg-gradient-to-br from-violet-600 to-indigo-600 flex items-center justify-center text-white">
+              <Bot className="w-7 h-7" />
+            </div>
+            <div>
+              <h1 className="text-2xl font-bold">OneAI</h1>
+              <p className="text-muted-foreground text-xs">AI Account Manager</p>
+            </div>
+          </motion.div>
+
+          {/* Form Header */}
+          <div className="text-center lg:text-left mb-8">
+            <motion.h2
+              className="text-2xl sm:text-3xl font-bold text-foreground"
+              initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.1, duration: 0.5 }}
+              transition={{ delay: 0.2 }}
             >
-              <CardTitle className="text-2xl font-bold text-center">
-                欢迎回来
-              </CardTitle>
-            </motion.div>
-            <motion.div
-              initial={{ opacity: 0, y: -10 }}
+              欢迎回来
+            </motion.h2>
+            <motion.p
+              className="text-muted-foreground mt-2"
+              initial={{ opacity: 0, y: 10 }}
               animate={{ opacity: 1, y: 0 }}
-              transition={{ delay: 0.15, duration: 0.5 }}
+              transition={{ delay: 0.25 }}
             >
-              <CardDescription className="text-center">
-                请输入您的账号密码登录
-              </CardDescription>
-            </motion.div>
-          </CardHeader>
-          <CardContent>
-            <form onSubmit={handleSubmit} className="space-y-4">
-              <motion.div
-                className="space-y-2"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: 0.2, duration: 0.5 }}
-              >
-                <Label htmlFor="username" required animated>
-                  用户名
-                </Label>
+              请输入您的账号密码登录系统
+            </motion.p>
+          </div>
+
+          {/* Login Form */}
+          <form onSubmit={handleSubmit} className="space-y-5">
+            <motion.div
+              className="space-y-2"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.3 }}
+            >
+              <Label htmlFor="username" className="text-sm font-medium">
+                用户名
+              </Label>
+              <div className="relative">
+                <div className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground">
+                  <User className="h-4 w-4" />
+                </div>
                 <Input
                   id="username"
                   name="username"
@@ -131,123 +229,119 @@ export default function Login() {
                   required
                   disabled={loading}
                   autoComplete="username"
+                  className="pl-10 h-11"
                   animated
                 />
-              </motion.div>
+              </div>
+            </motion.div>
 
-              <motion.div
-                className="space-y-2"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: 0.25, duration: 0.5 }}
-              >
-                <div className="flex items-center justify-between">
-                  <Label htmlFor="password" required animated>
-                    密码
-                  </Label>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <AnimateUIButton
-                        type="button"
-                        variant="link"
-                        className="px-0 text-xs inline-flex items-center gap-1"
-                        disabled={loading}
-                        onClick={() => {
-                          // TODO: 实现忘记密码功能
-                          console.log('忘记密码')
-                        }}
-                      >
-                        <HelpCircle className="h-3 w-3" />
-                        忘记密码？
-                      </AnimateUIButton>
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      <p>密码重置功能即将上线</p>
-                    </TooltipContent>
-                  </Tooltip>
+            <motion.div
+              className="space-y-2"
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.35 }}
+            >
+              <Label htmlFor="password" className="text-sm font-medium">
+                密码
+              </Label>
+              <div className="relative">
+                <div className="absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground">
+                  <Lock className="h-4 w-4" />
                 </div>
-                <div className="relative">
-                  <Input
-                    id="password"
-                    name="password"
-                    type={showPassword ? 'text' : 'password'}
-                    placeholder="请输入密码"
-                    value={formData.password}
-                    onChange={handleChange}
-                    required
-                    disabled={loading}
-                    autoComplete="current-password"
-                    animated
-                  />
-                  <motion.button
-                    type="button"
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
-                    onClick={() => setShowPassword(!showPassword)}
-                    disabled={loading}
-                    whileHover={{ scale: 1.1 }}
-                    whileTap={{ scale: 0.95 }}
-                  >
-                    {showPassword ? (
-                      <Eye className="h-4 w-4" />
-                    ) : (
-                      <EyeOff className="h-4 w-4" />
-                    )}
-                  </motion.button>
-                </div>
-              </motion.div>
-
-              <AnimatePresence>
-                {error && (
-                  <motion.div
-                    initial={{ opacity: 0, y: -10, x: 0 }}
-                    animate={{
-                      opacity: 1,
-                      y: 0,
-                      x: [0, -10, 10, -10, 10, 0]
-                    }}
-                    exit={{ opacity: 0, y: -10 }}
-                    transition={{
-                      opacity: { type: 'spring', stiffness: 400, damping: 40 },
-                      y: { type: 'spring', stiffness: 400, damping: 40 },
-                      x: { duration: 0.5, ease: 'easeInOut' }
-                    }}
-                    className="text-sm text-destructive bg-destructive/10 border border-destructive/20 rounded-md p-3"
-                  >
-                    {error}
-                  </motion.div>
-                )}
-              </AnimatePresence>
-
-              <motion.div
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: 0.3, duration: 0.5 }}
-              >
-                <AnimateUIButton
-                  type="submit"
-                  className="w-full"
+                <Input
+                  id="password"
+                  name="password"
+                  type={showPassword ? 'text' : 'password'}
+                  placeholder="请输入密码"
+                  value={formData.password}
+                  onChange={handleChange}
+                  required
                   disabled={loading}
+                  autoComplete="current-password"
+                  className="pl-10 pr-10 h-11"
+                  animated
+                />
+                <motion.button
+                  type="button"
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors"
+                  onClick={() => setShowPassword(!showPassword)}
+                  disabled={loading}
+                  whileHover={{ scale: 1.1 }}
+                  whileTap={{ scale: 0.95 }}
                 >
-                  {loading ? (
-                    <motion.span
-                      className="inline-flex items-center gap-2"
-                      animate={{ opacity: [0.5, 1] }}
-                      transition={{ duration: 0.5, repeat: Infinity }}
-                    >
-                      <motion.span animate={{ rotate: 360 }} transition={{ duration: 1, repeat: Infinity, ease: 'linear' }}>
-                        <Loader2 className="h-4 w-4" />
-                      </motion.span>
-                      登录中
-                    </motion.span>
+                  {showPassword ? (
+                    <Eye className="h-4 w-4" />
                   ) : (
-                    '登录'
+                    <EyeOff className="h-4 w-4" />
                   )}
-                </AnimateUIButton>
-              </motion.div>
-            </form>
-          </CardContent>
-        </Card>
-      </motion.div>
+                </motion.button>
+              </div>
+            </motion.div>
+
+            <AnimatePresence>
+              {error && (
+                <motion.div
+                  initial={{ opacity: 0, y: -10, height: 0 }}
+                  animate={{
+                    opacity: 1,
+                    y: 0,
+                    height: 'auto',
+                    x: [0, -8, 8, -8, 8, 0]
+                  }}
+                  exit={{ opacity: 0, y: -10, height: 0 }}
+                  transition={{
+                    opacity: { duration: 0.2 },
+                    height: { duration: 0.2 },
+                    x: { duration: 0.4, ease: 'easeInOut' }
+                  }}
+                  className="text-sm text-destructive bg-destructive/10 border border-destructive/20 rounded-lg p-3 flex items-center gap-2"
+                >
+                  <div className="w-5 h-5 rounded-full bg-destructive/20 flex items-center justify-center flex-shrink-0">
+                    <span className="text-xs">!</span>
+                  </div>
+                  {error}
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            <motion.div
+              initial={{ opacity: 0, y: 15 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ delay: 0.4 }}
+              className="pt-2"
+            >
+              <AnimateUIButton
+                type="submit"
+                className="w-full h-11 text-base font-medium bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700 dark:from-violet-600 dark:to-indigo-600"
+                disabled={loading}
+              >
+                {loading ? (
+                  <motion.span
+                    className="inline-flex items-center gap-2"
+                    animate={{ opacity: [0.7, 1] }}
+                    transition={{ duration: 0.6, repeat: Infinity }}
+                  >
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    登录中...
+                  </motion.span>
+                ) : (
+                  '登录'
+                )}
+              </AnimateUIButton>
+            </motion.div>
+          </form>
+
+          {/* Footer */}
+          <motion.p
+            className="text-center text-xs text-muted-foreground mt-8"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            transition={{ delay: 0.6 }}
+          >
+            OneAI - 智能 AI 账户管理平台
+          </motion.p>
+        </motion.div>
+      </div>
     </div>
   )
 }

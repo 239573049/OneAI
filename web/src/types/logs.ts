@@ -108,6 +108,8 @@ export interface HourlyByModelDto {
   totalRequests: number;
   successRequests: number;
   successRate: number;
+  promptTokens: number;
+  completionTokens: number;
   totalTokens: number;
   avgDurationMs: number;
 }

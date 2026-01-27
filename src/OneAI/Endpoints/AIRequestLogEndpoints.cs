@@ -313,6 +313,8 @@ public static class AIRequestLogEndpoints
                 TotalRequests = s.TotalRequests,
                 SuccessRequests = s.SuccessRequests,
                 SuccessRate = s.SuccessRate,
+                PromptTokens = s.TotalPromptTokens,
+                CompletionTokens = s.TotalCompletionTokens,
                 TotalTokens = s.TotalTokens,
                 AvgDurationMs = s.AvgDurationMs
             }).ToList();
