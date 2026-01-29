@@ -186,6 +186,8 @@ export interface KiroBatchAccountItem {
     used: number
     remaining: number
   }
+  clientId?: string
+  clientSecret?: string
 }
 
 /**

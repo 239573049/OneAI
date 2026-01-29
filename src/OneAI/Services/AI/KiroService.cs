@@ -131,6 +131,7 @@ public sealed class KiroService(
         var messages = ConvertAnthropicMessages(input);
         var requestModel = ResolveKiroModel(input.Model);
         var inputTokens = EstimateInputTokens(systemPrompt, messages, tools);
+        var cacheTokens = EstimateCacheTokens(systemPrompt, messages, tools);
         HttpStatusCode? lastStatusCode = null;
         string? lastErrorMessage = null;
 
@@ -165,6 +166,7 @@ public sealed class KiroService(
                     {
                         continue;
                     }
+
                     break;
                 }
 
@@ -301,28 +303,36 @@ public sealed class KiroService(
                 if (input.Stream)
                 {
                     var thinkingEnabled = input.Thinking != null &&
-                        string.Equals(input.Thinking.Type, "enabled", StringComparison.OrdinalIgnoreCase);
-                    var (streamOutputTokens, streamTimeToFirstByteMs) = await StreamAnthropicResponse(
+                                          string.Equals(input.Thinking.Type, "enabled",
+                                              StringComparison.OrdinalIgnoreCase);
+                    var (streamOutputTokens, streamTimeToFirstByteMs, streamTokenUsage) = await StreamAnthropicResponse(
                         context,
                         response,
                         input.Model,
                         inputTokens,
+                        cacheTokens,
                         stopwatch,
                         thinkingEnabled);
+
+                    // 使用计算出的真实token数
+                    var finalInputTokens = streamTokenUsage?.InputTokens ?? inputTokens;
+                    var finalCacheReadTokens = streamTokenUsage?.CacheReadInputTokens ?? 0;
+                    var finalCacheCreateTokens = streamTokenUsage?.CacheCreationInputTokens ?? 0;
+
                     await requestLogService.RecordSuccess(
                         logId,
                         stopwatch,
                         StatusCodes.Status200OK,
                         timeToFirstByteMs: streamTimeToFirstByteMs,
-                        promptTokens: inputTokens,
+                        promptTokens: finalInputTokens,
                         completionTokens: streamOutputTokens,
-                        totalTokens: inputTokens + streamOutputTokens);
+                        totalTokens: finalInputTokens + streamOutputTokens);
                     await aiAccountService.RecordTokenUsage(
                         account.Id,
-                        inputTokens,
+                        finalInputTokens,
                         streamOutputTokens,
-                        cacheTokens: null,
-                        createCacheTokens: null);
+                        cacheTokens: finalCacheReadTokens,
+                        createCacheTokens: finalCacheCreateTokens);
                     return;
                 }
 
@@ -349,7 +359,8 @@ public sealed class KiroService(
                     createCacheTokens: null);
 
                 var responsePayload = BuildAnthropicResponse(content, toolCalls, input.Model, inputTokens,
-                    input.Thinking != null && string.Equals(input.Thinking.Type, "enabled", StringComparison.OrdinalIgnoreCase));
+                    input.Thinking != null &&
+                    string.Equals(input.Thinking.Type, "enabled", StringComparison.OrdinalIgnoreCase));
                 context.Response.ContentType = "application/json";
                 await context.Response.WriteAsync(responsePayload.ToJsonString(JsonOptions.DefaultOptions));
                 return;
@@ -420,6 +431,7 @@ public sealed class KiroService(
         var tools = BuildToolSpecificationsFromOpenAi(request.Tools);
         var requestModel = ResolveKiroModel(request.Model);
         var inputTokens = EstimateInputTokens(systemPrompt, messages, tools);
+        var cacheTokens = EstimateCacheTokens(systemPrompt, messages, tools);
         HttpStatusCode? lastStatusCode = null;
         string? lastErrorMessage = null;
 
@@ -454,6 +466,7 @@ public sealed class KiroService(
                     {
                         continue;
                     }
+
                     break;
                 }
 
@@ -602,20 +615,25 @@ public sealed class KiroService(
 
                 if (request.Stream == true)
                 {
-                    var (streamOutputTokens, streamTimeToFirstByteMs) = await StreamOpenAiResponse(
+                    var (streamOutputTokens, streamTimeToFirstByteMs, streamTokenUsage) = await StreamOpenAiResponse(
                         context,
                         response,
                         request.Model,
                         inputTokens,
+                        cacheTokens,
                         stopwatch);
+
+                    // 使用计算出的真实token数
+                    var finalInputTokens = streamTokenUsage?.InputTokens ?? inputTokens;
+
                     await requestLogService.RecordSuccess(
                         logId,
                         stopwatch,
                         StatusCodes.Status200OK,
                         timeToFirstByteMs: streamTimeToFirstByteMs,
-                        promptTokens: inputTokens,
+                        promptTokens: finalInputTokens,
                         completionTokens: streamOutputTokens,
-                        totalTokens: inputTokens + streamOutputTokens);
+                        totalTokens: finalInputTokens + streamOutputTokens);
                     return;
                 }
 
@@ -777,11 +795,12 @@ public sealed class KiroService(
         }
     }
 
-    private async Task<(int OutputTokens, long? TimeToFirstByteMs)> StreamAnthropicResponse(
+    private async Task<(int OutputTokens, long? TimeToFirstByteMs, KiroTokenUsage? TokenUsage)> StreamAnthropicResponse(
         HttpContext context,
         HttpResponseMessage response,
         string responseModel,
         int inputTokens,
+        int cacheTokens,
         Stopwatch stopwatch,
         bool thinkingEnabled = false)
     {
@@ -795,6 +814,10 @@ public sealed class KiroService(
         var inThinkTag = false;
         var thinkingSignature = thinkingEnabled ? GenerateThinkingSignature() : null;
         var accumulatedContent = new StringBuilder();
+
+        // Usage tracking
+        double? usageCredits = null;
+        double? contextUsagePercentage = null;
 
         async Task EnsureStreamStartedAsync()
         {
@@ -974,7 +997,8 @@ public sealed class KiroService(
                                 if (inThinkTag)
                                 {
                                     // Look for closing </think> tag
-                                    var closeTagIndex = remaining.IndexOf("</think>", StringComparison.OrdinalIgnoreCase);
+                                    var closeTagIndex =
+                                        remaining.IndexOf("</think>", StringComparison.OrdinalIgnoreCase);
                                     if (closeTagIndex >= 0)
                                     {
                                         // Found complete closing tag
@@ -985,6 +1009,7 @@ public sealed class KiroService(
                                             {
                                                 await OpenThinkingBlockAsync(index);
                                             }
+
                                             await EmitThinkingDeltaAsync(thinkingContent, index);
                                         }
 
@@ -1010,8 +1035,10 @@ public sealed class KiroService(
                                                 {
                                                     await OpenThinkingBlockAsync(index);
                                                 }
+
                                                 await EmitThinkingDeltaAsync(safeContent, index);
                                             }
+
                                             // Keep the partial tag in buffer for next chunk
                                             accumulatedContent.Clear();
                                             accumulatedContent.Append(remaining.Substring(partialMatch.StartIndex));
@@ -1024,6 +1051,7 @@ public sealed class KiroService(
                                             {
                                                 await OpenThinkingBlockAsync(index);
                                             }
+
                                             await EmitThinkingDeltaAsync(remaining, index);
                                             accumulatedContent.Clear();
                                             return;
@@ -1044,6 +1072,7 @@ public sealed class KiroService(
                                             {
                                                 await OpenTextBlockAsync(index);
                                             }
+
                                             await EmitTextDeltaAsync(textContent, index);
                                         }
 
@@ -1078,8 +1107,10 @@ public sealed class KiroService(
                                                 {
                                                     await OpenTextBlockAsync(index);
                                                 }
+
                                                 await EmitTextDeltaAsync(safeContent, index);
                                             }
+
                                             // Keep the partial tag in buffer for next chunk
                                             accumulatedContent.Clear();
                                             accumulatedContent.Append(remaining.Substring(partialMatch.StartIndex));
@@ -1092,6 +1123,7 @@ public sealed class KiroService(
                                             {
                                                 await OpenTextBlockAsync(index);
                                             }
+
                                             await EmitTextDeltaAsync(remaining, index);
                                             accumulatedContent.Clear();
                                             return;
@@ -1198,6 +1230,16 @@ public sealed class KiroService(
                     }, context.RequestAborted);
                     contentBlockOpen = false;
                 }
+                else if (ev.Type == KiroStreamEventType.Usage && ev.UsageInfo != null)
+                {
+                    // 收集usage信息
+                    usageCredits = ev.UsageInfo.Usage;
+                }
+                else if (ev.Type == KiroStreamEventType.ContextUsage && ev.ContextUsagePercentage.HasValue)
+                {
+                    // 收集contextUsagePercentage信息
+                    contextUsagePercentage = ev.ContextUsagePercentage;
+                }
             }
         }
 
@@ -1216,6 +1258,7 @@ public sealed class KiroService(
                 {
                     await OpenThinkingBlockAsync(index);
                 }
+
                 await EmitThinkingDeltaAsync(remaining, index);
             }
             else
@@ -1224,6 +1267,7 @@ public sealed class KiroService(
                 {
                     await OpenTextBlockAsync(index);
                 }
+
                 await EmitTextDeltaAsync(remaining, index);
             }
         }
@@ -1245,6 +1289,17 @@ public sealed class KiroService(
             contentBlockOpen = false;
         }
 
+        // 计算真实的token使用情况
+        KiroTokenUsage? tokenUsage = null;
+        if (usageCredits.HasValue && contextUsagePercentage.HasValue)
+        {
+            tokenUsage = CalculateTokenUsage(responseModel, usageCredits.Value, contextUsagePercentage.Value, totalOutputTokens, cacheTokens);
+        }
+
+        var finalInputTokens = tokenUsage?.InputTokens ?? inputTokens;
+        var finalCacheCreationTokens = tokenUsage?.CacheCreationInputTokens ?? 0;
+        var finalCacheReadTokens = tokenUsage?.CacheReadInputTokens ?? 0;
+
         var stopReason = toolCalls.Count > 0 ? "tool_use" : "end_turn";
         await WriteSseJsonAsync(context, new JsonObject
         {
@@ -1254,17 +1309,17 @@ public sealed class KiroService(
                 ["stop_reason"] = stopReason,
                 ["usage"] = new JsonObject
                 {
-                    ["input_tokens"] = inputTokens,
-                    ["cache_creation_input_tokens"] = 0,
-                    ["cache_read_input_tokens"] = 0,
+                    ["input_tokens"] = finalInputTokens,
+                    ["cache_creation_input_tokens"] = finalCacheCreationTokens,
+                    ["cache_read_input_tokens"] = finalCacheReadTokens,
                     ["output_tokens"] = totalOutputTokens
                 }
             },
             ["usage"] = new JsonObject
             {
-                ["input_tokens"] = inputTokens,
-                ["cache_creation_input_tokens"] = 0,
-                ["cache_read_input_tokens"] = 0,
+                ["input_tokens"] = finalInputTokens,
+                ["cache_creation_input_tokens"] = finalCacheCreationTokens,
+                ["cache_read_input_tokens"] = finalCacheReadTokens,
                 ["output_tokens"] = totalOutputTokens
             }
         }, context.RequestAborted);
@@ -1279,19 +1334,24 @@ public sealed class KiroService(
             timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
         }
 
-        return (totalOutputTokens, timeToFirstByteMs);
+        return (totalOutputTokens, timeToFirstByteMs, tokenUsage);
     }
 
-    private async Task<(int OutputTokens, long? TimeToFirstByteMs)> StreamOpenAiResponse(
+    private async Task<(int OutputTokens, long? TimeToFirstByteMs, KiroTokenUsage? TokenUsage)> StreamOpenAiResponse(
         HttpContext context,
         HttpResponseMessage response,
         string responseModel,
         int inputTokens,
+        int cacheTokens,
         Stopwatch stopwatch)
     {
         var responseId = Guid.NewGuid().ToString();
         var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         var responseStarted = false;
+
+        // Usage tracking
+        double? usageCredits = null;
+        double? contextUsagePercentage = null;
 
         async Task EnsureStreamStartedAsync()
         {
@@ -1398,6 +1458,16 @@ public sealed class KiroService(
                     toolCalls.Add(currentTool.ToToolCall());
                     currentTool = null;
                 }
+                else if (ev.Type == KiroStreamEventType.Usage && ev.UsageInfo != null)
+                {
+                    // 收集usage信息
+                    usageCredits = ev.UsageInfo.Usage;
+                }
+                else if (ev.Type == KiroStreamEventType.ContextUsage && ev.ContextUsagePercentage.HasValue)
+                {
+                    // 收集contextUsagePercentage信息
+                    contextUsagePercentage = ev.ContextUsagePercentage;
+                }
             }
         }
 
@@ -1472,7 +1542,14 @@ public sealed class KiroService(
             timeToFirstByteMs = stopwatch.ElapsedMilliseconds;
         }
 
-        return (totalOutputTokens, timeToFirstByteMs);
+        // 计算真实的token使用情况
+        KiroTokenUsage? tokenUsage = null;
+        if (usageCredits.HasValue && contextUsagePercentage.HasValue)
+        {
+            tokenUsage = CalculateTokenUsage(responseModel, usageCredits.Value, contextUsagePercentage.Value, totalOutputTokens, cacheTokens);
+        }
+
+        return (totalOutputTokens, timeToFirstByteMs, tokenUsage);
     }
 
     public async Task<KiroUsageLimitsResponse?> GetUsageLimitsAsync(AIAccount account)
@@ -1530,6 +1607,7 @@ public sealed class KiroService(
         {
             request.Headers.TryAddWithoutValidation("User-Agent", $"KiroIDE-{KiroVersion}-{credentials.MachineId}");
         }
+
         request.Headers.Add("amz-sdk-invocation-id", Guid.NewGuid().ToString());
         request.Headers.Add("Origin", "https://app.kiro.dev");
         request.Headers.Add("Referer", "https://app.kiro.dev/");
@@ -1689,9 +1767,10 @@ public sealed class KiroService(
         return Convert.ToHexString(hash).ToLowerInvariant();
     }
 
-    private async Task<(bool Success, KiroOAuthCredentialsDto? Credentials, string? ErrorMessage)> EnsureValidTokenAsync(
-        AIAccount account,
-        AIAccountService aiAccountService)
+    private async Task<(bool Success, KiroOAuthCredentialsDto? Credentials, string? ErrorMessage)>
+        EnsureValidTokenAsync(
+            AIAccount account,
+            AIAccountService aiAccountService)
     {
         var credentials = account.GetKiroOauth();
         if (credentials == null)
@@ -2218,6 +2297,7 @@ public sealed class KiroService(
             {
                 builder.Append("\n\n");
             }
+
             builder.Append(input.System);
         }
         else if (input.Systems != null && input.Systems.Count > 0)
@@ -2243,7 +2323,7 @@ public sealed class KiroService(
     {
         var result = new List<KiroMessage>();
         var thinkingEnabled = input.Thinking != null &&
-            string.Equals(input.Thinking.Type, "enabled", StringComparison.OrdinalIgnoreCase);
+                              string.Equals(input.Thinking.Type, "enabled", StringComparison.OrdinalIgnoreCase);
 
         foreach (var message in input.Messages)
         {
@@ -2263,7 +2343,8 @@ public sealed class KiroService(
                         // Convert thinking block to <think> tagged text for Kiro
                         if (thinkingEnabled)
                         {
-                            var thinkingText = content.Thinking ?? content.Text ?? content.Content?.ToString() ?? string.Empty;
+                            var thinkingText = content.Thinking ??
+                                               content.Text ?? content.Content?.ToString() ?? string.Empty;
                             if (!string.IsNullOrEmpty(thinkingText))
                             {
                                 part = new KiroMessagePart("text") { Text = $"<think>{thinkingText}</think>" };
@@ -2439,6 +2520,57 @@ public sealed class KiroService(
         }
 
         return total;
+    }
+
+    /// <summary>
+    /// 估算启用了 cache_control 的 token 数量
+    /// 遍历 messages 中所有带有 CachePoint 的部分，计算其 token 数
+    /// </summary>
+    private static int EstimateCacheTokens(string? systemPrompt, List<KiroMessage> messages, JsonArray? tools)
+    {
+        var cacheTokens = 0;
+        
+        // 检查 system prompt 是否有 cache（通常 system prompt 会被缓存）
+        // 在 Kiro 中，如果第一条消息有 cachePoint，则 system prompt 也会被缓存
+        var firstMessageHasCache = messages.Count > 0 && 
+                                   messages[0].Parts.Any(p => p.CachePoint != null);
+        
+        if (firstMessageHasCache && !string.IsNullOrWhiteSpace(systemPrompt))
+        {
+            cacheTokens += CountTokens(systemPrompt);
+        }
+
+        // 遍历所有消息，找出带有 CachePoint 的部分
+        foreach (var message in messages)
+        {
+            foreach (var part in message.Parts)
+            {
+                if (part.CachePoint != null)
+                {
+                    // 这个 part 启用了 cache，计算其 token 数
+                    if (!string.IsNullOrWhiteSpace(part.Text))
+                    {
+                        cacheTokens += CountTokens(part.Text);
+                    }
+                    else if (!string.IsNullOrWhiteSpace(part.Content))
+                    {
+                        cacheTokens += CountTokens(part.Content);
+                    }
+                    else if (part.Input != null)
+                    {
+                        cacheTokens += CountTokens(part.Input.ToJsonString(JsonOptions.DefaultOptions));
+                    }
+                }
+            }
+        }
+
+        // tools 通常也会被缓存（如果有 cache 启用）
+        if (firstMessageHasCache && tools != null)
+        {
+            cacheTokens += CountTokens(tools.ToJsonString(JsonOptions.DefaultOptions));
+        }
+
+        return cacheTokens;
     }
 
     private static int CountTokens(string? text)
@@ -2789,6 +2921,7 @@ public sealed class KiroService(
                         ["text"] = remaining
                     });
                 }
+
                 break;
             }
 
@@ -2824,8 +2957,10 @@ public sealed class KiroService(
                     {
                         thinkingBlock["signature"] = thinkingSignature;
                     }
+
                     blocks.Add(thinkingBlock);
                 }
+
                 break;
             }
 
@@ -2842,6 +2977,7 @@ public sealed class KiroService(
                 {
                     thinkingBlock["signature"] = thinkingSignature;
                 }
+
                 blocks.Add(thinkingBlock);
             }
 
@@ -2964,13 +3100,16 @@ public sealed class KiroService(
 
         while (true)
         {
+            // Console.WriteLine("Test" + remaining);
             var contentStart = remaining.IndexOf("{\"content\":", searchStart, StringComparison.Ordinal);
             var nameStart = remaining.IndexOf("{\"name\":", searchStart, StringComparison.Ordinal);
             var followupStart = remaining.IndexOf("{\"followupPrompt\":", searchStart, StringComparison.Ordinal);
             var inputStart = remaining.IndexOf("{\"input\":", searchStart, StringComparison.Ordinal);
             var stopStart = remaining.IndexOf("{\"stop\":", searchStart, StringComparison.Ordinal);
+            var usageStart = remaining.IndexOf("{\"unit\":", searchStart, StringComparison.Ordinal);
+            var contextUsageStart = remaining.IndexOf("{\"contextUsagePercentage\":", searchStart, StringComparison.Ordinal);
 
-            var candidates = new[] { contentStart, nameStart, followupStart, inputStart, stopStart }
+            var candidates = new[] { contentStart, nameStart, followupStart, inputStart, stopStart, usageStart, contextUsageStart }
                 .Where(pos => pos >= 0)
                 .ToList();
 
@@ -3072,11 +3211,33 @@ public sealed class KiroService(
                         ToolInput = inputOnlyElement.GetString()
                     });
                 }
-                else if (root.TryGetProperty("stop", out var stopOnlyElement))
+                else if (root.TryGetProperty("stop", out var stopOnlyElement)
+                         && !root.TryGetProperty("unit", out _))
                 {
                     events.Add(new KiroStreamEvent(KiroStreamEventType.ToolUseStop)
                     {
                         ToolStop = stopOnlyElement.ValueKind == JsonValueKind.True
+                    });
+                }
+                else if (root.TryGetProperty("unit", out var unitElement)
+                         && root.TryGetProperty("usage", out var usageElement))
+                {
+                    // 解析 usage 事件: {"unit":"credit","unitPlural":"credits","usage":0.11362439111111113}
+                    events.Add(new KiroStreamEvent(KiroStreamEventType.Usage)
+                    {
+                        UsageInfo = new KiroUsageInfo
+                        {
+                            Unit = unitElement.GetString(),
+                            Usage = usageElement.GetDouble()
+                        }
+                    });
+                }
+                else if (root.TryGetProperty("contextUsagePercentage", out var contextUsageElement))
+                {
+                    // 解析 contextUsage 事件: {"contextUsagePercentage":11.416999816894531}
+                    events.Add(new KiroStreamEvent(KiroStreamEventType.ContextUsage)
+                    {
+                        ContextUsagePercentage = contextUsageElement.GetDouble()
                     });
                 }
             }
@@ -3099,6 +3260,71 @@ public sealed class KiroService(
         }
 
         return (events, remaining);
+    }
+
+    /// <summary>
+    /// 根据usage和contextUsagePercentage计算token使用详情
+    /// 通过比较实际成本和预期成本（全部普通input）的差值，精确计算cache_read tokens
+    /// 只计算命中缓存的情况，创建缓存时当作普通input处理
+    /// </summary>
+    private static KiroTokenUsage CalculateTokenUsage(
+        string model,
+        double usageCredits,
+        double contextUsagePercentage,
+        int estimatedOutputTokens,
+        int estimatedCacheTokens = 0)
+    {
+        var result = new KiroTokenUsage();
+
+        // 获取模型价格配置
+        if (!ModelPricing.TryGetValue(model, out var pricing))
+        {
+            pricing = ModelPricing["claude-sonnet-4-5-20250929"];
+        }
+
+        // 从contextUsagePercentage计算总输入tokens
+        var totalInputTokens = (int)(pricing.MaxContextTokens * contextUsagePercentage / 100.0);
+        result.OutputTokens = estimatedOutputTokens;
+        result.TotalCost = usageCredits;
+
+        // 计算如果全部是普通 input 的预期成本（不包含 output）
+        var expectedInputCost = totalInputTokens / 1_000_000.0 * pricing.InputPrice;
+        
+        // 如果 usageCredits < expectedInputCost，说明命中了缓存
+        // 因为 cache_read ($0.30/MTok) 比普通 input ($3/MTok) 便宜 90%
+        // 
+        // 公式推导：
+        // actualCost = normalInputTokens * inputPrice + cacheReadTokens * cacheReadPrice + outputCost
+        // expectedCost = totalInputTokens * inputPrice + outputCost
+        // 
+        // 差值 = expectedCost - actualCost 
+        //      = totalInputTokens * inputPrice - normalInputTokens * inputPrice - cacheReadTokens * cacheReadPrice
+        //      = cacheReadTokens * inputPrice - cacheReadTokens * cacheReadPrice
+        //      = cacheReadTokens * (inputPrice - cacheReadPrice)
+        //
+        // 所以：cacheReadTokens = 差值 / (inputPrice - cacheReadPrice)
+        
+        if (usageCredits < expectedInputCost)
+        {
+            // 命中缓存：实际成本 < 预期成本
+            var costSaved = expectedInputCost - usageCredits;
+            var cacheReadTokens = (int)(costSaved / (pricing.InputPrice - pricing.CacheReadPrice) * 1_000_000.0);
+            cacheReadTokens = Math.Min(cacheReadTokens, totalInputTokens);
+            cacheReadTokens = Math.Max(cacheReadTokens, 0);
+            
+            result.InputTokens = totalInputTokens - cacheReadTokens;
+            result.CacheCreationInputTokens = 0;
+            result.CacheReadInputTokens = cacheReadTokens;
+        }
+        else
+        {
+            // 未命中缓存：全部当作普通 input
+            result.InputTokens = totalInputTokens;
+            result.CacheCreationInputTokens = 0;
+            result.CacheReadInputTokens = 0;
+        }
+
+        return result;
     }
 
     private static async Task WriteAnthropicError(HttpContext context, int statusCode, string message, string errorType)
@@ -3239,7 +3465,9 @@ public sealed class KiroService(
         Content,
         ToolUse,
         ToolUseInput,
-        ToolUseStop
+        ToolUseStop,
+        Usage,
+        ContextUsage
     }
 
     public enum ResponseEventType
@@ -3256,7 +3484,60 @@ public sealed class KiroService(
         public KiroToolUseEvent? ToolUse { get; init; }
         public string? ToolInput { get; init; }
         public bool? ToolStop { get; init; }
+        public KiroUsageInfo? UsageInfo { get; init; }
+        public double? ContextUsagePercentage { get; init; }
     }
 
     private sealed record KiroToolUseEvent(string Name, string ToolUseId, string? Input, bool Stop);
+
+    /// <summary>
+    /// Kiro usage info from stream event
+    /// </summary>
+    private sealed class KiroUsageInfo
+    {
+        public string? Unit { get; init; }
+        public double Usage { get; init; }
+    }
+
+    /// <summary>
+    /// Claude模型价格配置 (单位: $/MTok)
+    /// </summary>
+    private static readonly Dictionary<string, KiroModelPricing> ModelPricing = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["claude-sonnet-4-5-20250929"] = new(3.0, 15.0, 3.75, 0.30, 200000),
+        ["claude-sonnet-4-5"] = new(3.0, 15.0, 3.75, 0.30, 200000),
+        ["claude-haiku-4-5-20251001"] = new(1.0, 5.0, 1.25, 0.10, 200000),
+        ["claude-haiku-4-5"] = new(1.0, 5.0, 1.25, 0.10, 200000),
+        ["claude-opus-4-5-20251101"] = new(5.0, 25.0, 6.25, 0.50, 200000),
+        ["claude-opus-4-5"] = new(5.0, 25.0, 6.25, 0.50, 200000),
+        ["claude-sonnet-4-20250514"] = new(3.0, 15.0, 3.75, 0.30, 200000),
+        ["claude-3-7-sonnet-20250219"] = new(3.0, 15.0, 3.75, 0.30, 200000),
+    };
+
+    /// <summary>
+    /// 模型价格配置记录
+    /// </summary>
+    /// <param name="InputPrice">输入价格 $/MTok</param>
+    /// <param name="OutputPrice">输出价格 $/MTok</param>
+    /// <param name="CacheCreatePrice">创建缓存价格 $/MTok</param>
+    /// <param name="CacheReadPrice">读取缓存价格 $/MTok</param>
+    /// <param name="MaxContextTokens">最大上下文token数</param>
+    private sealed record KiroModelPricing(
+        double InputPrice,
+        double OutputPrice,
+        double CacheCreatePrice,
+        double CacheReadPrice,
+        int MaxContextTokens);
+
+    /// <summary>
+    /// Token使用详情
+    /// </summary>
+    public sealed class KiroTokenUsage
+    {
+        public int InputTokens { get; set; }
+        public int OutputTokens { get; set; }
+        public int CacheCreationInputTokens { get; set; }
+        public int CacheReadInputTokens { get; set; }
+        public double TotalCost { get; set; }
+    }
 }

@@ -337,7 +337,7 @@ export function BatchImportKiroDialog({ open, onOpenChange, onImportCompleted }:
                       className="w-full rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground font-mono focus:outline-none focus:ring-2 focus:ring-primary"
                     />
                     <p className="text-xs text-muted-foreground">
-                      字段说明：accessToken, refreshToken, email, profileArn, expiresAt, authMethod(默认social)
+                      字段说明：accessToken, refreshToken, email, profileArn, expiresAt, authMethod(默认social), clientId, clientSecret
                     </p>
                   </div>
 
