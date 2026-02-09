@@ -2722,9 +2722,18 @@ public sealed class KiroService(
             {
                 contentBuilder.Append(ev.Content);
             }
-            else if (ev.Type == KiroStreamEventType.ToolUse && ev.ToolUse != null)
+            else if (ev is { Type: KiroStreamEventType.ToolUse, ToolUse: not null })
             {
-                currentTool = new ToolCallAccumulator(ev.ToolUse.ToolUseId, ev.ToolUse.Name);
+                if (currentTool != null && !string.Equals(currentTool.ToolUseId, ev.ToolUse.ToolUseId, StringComparison.Ordinal))
+                {
+                    toolCalls.Add(currentTool.ToToolCall());
+                    currentTool = null;
+                }
+
+                if (currentTool == null)
+                {
+                    currentTool = new ToolCallAccumulator(ev.ToolUse.ToolUseId, ev.ToolUse.Name);
+                }
                 if (!string.IsNullOrEmpty(ev.ToolUse.Input))
                 {
                     currentTool.Input.Append(ev.ToolUse.Input);
