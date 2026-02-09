@@ -28,7 +28,9 @@
       "Bash(cmd //c \"taskkill /F /PID 42880\")",
       "Bash(git add:*)",
       "Bash(docker build:*)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "Bash(Select-String -Pattern \"error|succeed|failed|Build\")"
     ]
-  }
+  },
+  "prefersReducedMotion": true
 }

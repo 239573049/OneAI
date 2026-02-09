@@ -45,6 +45,7 @@ public class ResponsesService
         ResponsesInput request,
         AIAccountService aiAccountService)
     {
+        request.Store = false;
         const int maxRetries = 15;
         string? lastErrorMessage = null;
         HttpStatusCode? lastStatusCode = null;
@@ -66,7 +67,7 @@ public class ResponsesService
             AIProviderAsyncLocal.AIProviderIds = new List<int>(maxRetries);
 
             for (int attempt = 1; attempt <= maxRetries; attempt++)
-            {   
+            {
                 // 检查响应是否已经开始写入（一旦开始写入Body就不能重试）
                 if (context.Response.HasStarted)
                 {
@@ -254,7 +255,7 @@ public class ResponsesService
                     if (request.Stream == true)
                     {
                         // 判断当前请求是否包含了Codex的提示词
-                        if (string.IsNullOrEmpty(request.Instructions))
+                        if (request.Instructions == null && string.IsNullOrEmpty(request.Instructions))
                         {
                             request.Instructions = AIPrompt.CodeXPrompt;
                         }

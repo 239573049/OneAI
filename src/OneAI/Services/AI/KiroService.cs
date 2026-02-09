@@ -1,89 +1,35 @@
-using System.Net;
 using System.Diagnostics;
-using System.Linq;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Runtime.CompilerServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
-using System.Net.Http.Headers;
-using System.Runtime.CompilerServices;
-using ClaudeCodeProxy.Abstraction;
+using Microsoft.Extensions.Caching.Memory;
 using OneAI.Constants;
 using OneAI.Entities;
 using OneAI.Extensions;
-using OneAI.Services;
 using OneAI.Services.AI.Anthropic;
+using OneAI.Services.AI.Kiro;
 using OneAI.Services.AI.Models.Dtos;
-using OneAI.Services.Logging;
 using OneAI.Services.KiroOAuth;
+using OneAI.Services.Logging;
 using Thor.Abstractions.Chats.Dtos;
 
 namespace OneAI.Services.AI;
 
 /// <summary>
-/// Kiro usage limits response DTO
-/// </summary>
-public class KiroUsageLimitsResponse
-{
-    [JsonPropertyName("usageBreakdownList")]
-    public List<KiroUsageBreakdown>? UsageBreakdownList { get; set; }
-}
-
-/// <summary>
-/// Kiro usage breakdown item
-/// </summary>
-public class KiroUsageBreakdown
-{
-    [JsonPropertyName("displayName")] public string? DisplayName { get; set; }
-
-    [JsonPropertyName("displayNamePlural")]
-    public string? DisplayNamePlural { get; set; }
-
-    [JsonPropertyName("currentUsage")] public double CurrentUsage { get; set; }
-
-    [JsonPropertyName("currentUsageWithPrecision")]
-    public double CurrentUsageWithPrecision { get; set; }
-
-    [JsonPropertyName("usageLimit")] public double UsageLimit { get; set; }
-
-    [JsonPropertyName("usageLimitWithPrecision")]
-    public double UsageLimitWithPrecision { get; set; }
-
-    [JsonPropertyName("nextDateReset")] public double NextDateReset { get; set; }
-
-    [JsonPropertyName("freeTrialInfo")] public KiroFreeTrialInfo? FreeTrialInfo { get; set; }
-}
-
-/// <summary>
-/// Kiro free trial info
-/// </summary>
-public class KiroFreeTrialInfo
-{
-    [JsonPropertyName("freeTrialStatus")] public string? FreeTrialStatus { get; set; }
-
-    [JsonPropertyName("currentUsage")] public double CurrentUsage { get; set; }
-
-    [JsonPropertyName("currentUsageWithPrecision")]
-    public double CurrentUsageWithPrecision { get; set; }
-
-    [JsonPropertyName("usageLimit")] public double UsageLimit { get; set; }
-
-    [JsonPropertyName("usageLimitWithPrecision")]
-    public double UsageLimitWithPrecision { get; set; }
-
-    [JsonPropertyName("freeTrialExpiry")] public double FreeTrialExpiry { get; set; }
-}
-
-/// <summary>
 /// Kiro Reverse API service (Amazon CodeWhisperer via Kiro)
 /// 集成了类似 Claude API 的 Prompt Caching (cache_control -> cachePoint) 功能
+/// 使用内存缓存实现前缀哈希匹配，提高缓存命中率
 /// </summary>
 public sealed class KiroService(
     ILogger<KiroService> logger,
     KiroOAuthService kiroOAuthService,
-    AIRequestLogService requestLogService)
+    AIRequestLogService requestLogService,
+    IMemoryCache memoryCache)
 {
     private static readonly HttpClient HttpClient = CreateHttpClient();
 
@@ -94,9 +40,30 @@ public sealed class KiroService(
     private const string OriginAiEditor = "AI_EDITOR";
     private const string KiroVersion = "0.7.5";
 
+    /// <summary>
+    /// 缓存 TTL（10 分钟，适配编程工作流中的短暂停顿）
+    /// </summary>
+    private static readonly TimeSpan CacheTtl = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// 缓存键前缀
+    /// </summary>
+    private const string CacheKeyPrefix = "kiro:cache:";
+
+    /// <summary>
+    /// 缓存亲和性键前缀（hash -> accountId 的反向映射）
+    /// </summary>
+    private const string CacheAffinityKeyPrefix = "kiro:affinity:";
+
+    /// <summary>
+    /// 会话亲和性键前缀（sessionId -> accountId 的映射，确保同一会话粘性到同一账户）
+    /// </summary>
+    private const string SessionAffinityKeyPrefix = "kiro:session:";
+
     private static readonly Dictionary<string, string> ModelMapping = new(StringComparer.OrdinalIgnoreCase)
     {
         ["claude-opus-4-5"] = "claude-opus-4.5",
+        ["claude-opus-4.6"] = "claude-opus-4.6",
         ["claude-opus-4-5-20251101"] = "claude-opus-4.5",
         ["claude-haiku-4-5"] = "claude-haiku-4.5",
         ["claude-haiku-4-5-20251001"] = "claude-haiku-4.5",
@@ -118,6 +85,12 @@ public sealed class KiroService(
             return;
         }
 
+        var userId = input.Metadata?.GetValueOrDefault("user_id", string.Empty) as string;
+
+        var parts = userId?.Split("_") ?? [];
+        var sessionId = parts.Length > 0 ? parts[^1] : string.Empty;
+
+
         AIProviderAsyncLocal.AIProviderIds = [];
         var (logId, stopwatch) = await requestLogService.CreateRequestLog(
             context,
@@ -132,6 +105,16 @@ public sealed class KiroService(
         var requestModel = ResolveKiroModel(input.Model);
         var inputTokens = EstimateInputTokens(systemPrompt, messages, tools);
         var cacheTokens = EstimateCacheTokens(systemPrompt, messages, tools);
+
+        // 计算缓存断点（用于后续缓存命中计算）
+        var cacheBreakpoints = ComputeCacheBreakpoints(systemPrompt, messages, tools);
+
+        // 查找缓存亲和性账户（优先使用之前缓存过断点的账户，提高缓存命中率）
+        var affinityAccountId = FindCacheAffinityAccountId(cacheBreakpoints);
+
+        // 缓存亲和性未命中时，尝试会话级别粘性（同一会话尽量使用同一账户）
+        affinityAccountId ??= FindSessionAffinityAccountId(sessionId);
+
         HttpStatusCode? lastStatusCode = null;
         string? lastErrorMessage = null;
 
@@ -139,7 +122,29 @@ public sealed class KiroService(
         {
             for (var attempt = 1; attempt <= MaxRetries; attempt++)
             {
-                var account = await aiAccountService.GetAIAccountByProvider(AIProviders.Kiro);
+                AIAccount? account = null;
+
+                // 首次尝试时，优先使用亲和性账户（缓存亲和性或会话亲和性）
+                if (attempt == 1 && affinityAccountId.HasValue)
+                {
+                    account = await aiAccountService.TryGetAccountById(affinityAccountId.Value);
+                    if (account != null)
+                    {
+                        logger.LogInformation(
+                            "缓存亲和性命中：优先使用账户 {AccountId} (名称: {Name})",
+                            account.Id, account.Name ?? "未命名");
+                    }
+                    else
+                    {
+                        logger.LogDebug(
+                            "缓存亲和性账户 {AccountId} 不可用，回退到常规选择",
+                            affinityAccountId.Value);
+                    }
+                }
+
+                // 亲和性账户不可用时，回退到常规选择
+                account ??= await aiAccountService.GetAIAccountByProvider(AIProviders.Kiro);
+
                 if (account == null)
                 {
                     var statusCode = (int)(lastStatusCode ?? HttpStatusCode.ServiceUnavailable);
@@ -162,6 +167,7 @@ public sealed class KiroService(
                 {
                     lastErrorMessage = tokenError;
                     lastStatusCode = HttpStatusCode.Unauthorized;
+
                     if (attempt < MaxRetries)
                     {
                         continue;
@@ -170,7 +176,9 @@ public sealed class KiroService(
                     break;
                 }
 
-                var requestBody = BuildCodeWhispererRequest(messages, input.Model, tools, systemPrompt, credentials);
+                var stableConversationId = DeriveConversationId(account.Id, cacheBreakpoints);
+                var requestBody = BuildCodeWhispererRequest(messages, input.Model, tools, systemPrompt, credentials,
+                    stableConversationId);
                 var region = BuildRegion(credentials);
                 var requestUrl = requestModel.StartsWith("amazonq", StringComparison.OrdinalIgnoreCase)
                     ? BuildAmazonQUrl(region)
@@ -214,6 +222,7 @@ public sealed class KiroService(
                             : $"账户 {account.Id} Token 刷新失败: {refreshError}";
                         lastStatusCode = HttpStatusCode.Unauthorized;
                         await aiAccountService.DisableAccount(account.Id);
+    
                         if (attempt < MaxRetries)
                         {
                             continue;
@@ -228,6 +237,7 @@ public sealed class KiroService(
                         lastErrorMessage = $"账户 {account.Id} Token 刷新后仍无效";
                         lastStatusCode = HttpStatusCode.Unauthorized;
                         await aiAccountService.DisableAccount(account.Id);
+    
                         if (attempt < MaxRetries)
                         {
                             continue;
@@ -236,7 +246,8 @@ public sealed class KiroService(
                         break;
                     }
 
-                    requestBody = BuildCodeWhispererRequest(messages, input.Model, tools, systemPrompt, credentials);
+                    requestBody = BuildCodeWhispererRequest(messages, input.Model, tools, systemPrompt, credentials,
+                        stableConversationId);
                     region = BuildRegion(credentials);
                     requestUrl = requestModel.StartsWith("amazonq", StringComparison.OrdinalIgnoreCase)
                         ? BuildAmazonQUrl(region)
@@ -274,6 +285,12 @@ public sealed class KiroService(
                     var error = await response.Content.ReadAsStringAsync(context.RequestAborted);
                     response.Dispose();
 
+                    // 当错误包含 "Improperly formed request" 时，记录 AnthropicInput 到文件
+                    if (!string.IsNullOrEmpty(error) && error.Contains("Improperly formed request", StringComparison.OrdinalIgnoreCase))
+                    {
+                        await DumpAnthropicInputAsync(input, error);
+                    }
+
                     lastErrorMessage = string.IsNullOrWhiteSpace(error)
                         ? $"Kiro 请求失败 (状态码: {(int)response.StatusCode})"
                         : error;
@@ -284,6 +301,7 @@ public sealed class KiroService(
                         or HttpStatusCode.PaymentRequired)
                     {
                         await aiAccountService.DisableAccount(account.Id);
+    
                     }
 
                     var shouldRetry = response.StatusCode == HttpStatusCode.TooManyRequests
@@ -291,6 +309,11 @@ public sealed class KiroService(
                                           or HttpStatusCode.Forbidden
                                           or HttpStatusCode.PaymentRequired
                                       || (int)response.StatusCode >= 500;
+
+                    if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                    {
+    
+                    }
 
                     if (attempt < MaxRetries && shouldRetry)
                     {
@@ -305,6 +328,10 @@ public sealed class KiroService(
                     var thinkingEnabled = input.Thinking != null &&
                                           string.Equals(input.Thinking.Type, "enabled",
                                               StringComparison.OrdinalIgnoreCase);
+
+                    // 计算缓存命中结果
+                    var cacheResult = LookupOrCreateCache(account.Id, cacheBreakpoints, inputTokens);
+
                     var (streamOutputTokens, streamTimeToFirstByteMs, streamTokenUsage) = await StreamAnthropicResponse(
                         context,
                         response,
@@ -312,12 +339,13 @@ public sealed class KiroService(
                         inputTokens,
                         cacheTokens,
                         stopwatch,
-                        thinkingEnabled);
+                        thinkingEnabled,
+                        cacheResult);
 
-                    // 使用计算出的真实token数
-                    var finalInputTokens = streamTokenUsage?.InputTokens ?? inputTokens;
+                    // 将 cache_creation tokens 合并到 input_tokens，降低用户成本
+                    var finalInputTokens = (streamTokenUsage?.InputTokens ?? inputTokens) + (streamTokenUsage?.CacheCreationInputTokens ?? 0);
                     var finalCacheReadTokens = streamTokenUsage?.CacheReadInputTokens ?? 0;
-                    var finalCacheCreateTokens = streamTokenUsage?.CacheCreationInputTokens ?? 0;
+                    var finalCacheCreateTokens = 0;
 
                     await requestLogService.RecordSuccess(
                         logId,
@@ -432,6 +460,19 @@ public sealed class KiroService(
         var requestModel = ResolveKiroModel(request.Model);
         var inputTokens = EstimateInputTokens(systemPrompt, messages, tools);
         var cacheTokens = EstimateCacheTokens(systemPrompt, messages, tools);
+
+        // 计算缓存断点（用于后续缓存命中计算）
+        var cacheBreakpoints = ComputeCacheBreakpoints(systemPrompt, messages, tools);
+
+        // OpenAI 路径：从 User 字段提取会话标识
+        var sessionId = request.User;
+
+        // 查找缓存亲和性账户（优先使用之前缓存过断点的账户，提高缓存命中率）
+        var affinityAccountId = FindCacheAffinityAccountId(cacheBreakpoints);
+
+        // 缓存亲和性未命中时，尝试会话级别粘性（同一会话尽量使用同一账户）
+        affinityAccountId ??= FindSessionAffinityAccountId(sessionId);
+
         HttpStatusCode? lastStatusCode = null;
         string? lastErrorMessage = null;
 
@@ -439,7 +480,29 @@ public sealed class KiroService(
         {
             for (var attempt = 1; attempt <= MaxRetries; attempt++)
             {
-                var account = await aiAccountService.GetAIAccountByProvider(AIProviders.Kiro);
+                AIAccount? account = null;
+
+                // 首次尝试时，优先使用亲和性账户（缓存亲和性或会话亲和性）
+                if (attempt == 1 && affinityAccountId.HasValue)
+                {
+                    account = await aiAccountService.TryGetAccountById(affinityAccountId.Value);
+                    if (account != null)
+                    {
+                        logger.LogInformation(
+                            "缓存亲和性命中：优先使用账户 {AccountId} (名称: {Name})",
+                            account.Id, account.Name ?? "未命名");
+                    }
+                    else
+                    {
+                        logger.LogDebug(
+                            "缓存亲和性账户 {AccountId} 不可用，回退到常规选择",
+                            affinityAccountId.Value);
+                    }
+                }
+
+                // 亲和性账户不可用时，回退到常规选择
+                account ??= await aiAccountService.GetAIAccountByProvider(AIProviders.Kiro);
+
                 if (account == null)
                 {
                     var statusCode = (int)(lastStatusCode ?? HttpStatusCode.ServiceUnavailable);
@@ -462,6 +525,7 @@ public sealed class KiroService(
                 {
                     lastErrorMessage = tokenError;
                     lastStatusCode = HttpStatusCode.Unauthorized;
+
                     if (attempt < MaxRetries)
                     {
                         continue;
@@ -470,7 +534,9 @@ public sealed class KiroService(
                     break;
                 }
 
-                var requestBody = BuildCodeWhispererRequest(messages, request.Model, tools, systemPrompt, credentials);
+                var stableConversationId = DeriveConversationId(account.Id, cacheBreakpoints);
+                var requestBody = BuildCodeWhispererRequest(messages, request.Model, tools, systemPrompt, credentials,
+                    stableConversationId);
                 var region = BuildRegion(credentials);
                 var requestUrl = requestModel.StartsWith("amazonq", StringComparison.OrdinalIgnoreCase)
                     ? BuildAmazonQUrl(region)
@@ -481,6 +547,7 @@ public sealed class KiroService(
                     lastErrorMessage = $"账户 {account.Id} 缺少有效凭证";
                     lastStatusCode = HttpStatusCode.Unauthorized;
                     await aiAccountService.DisableAccount(account.Id);
+
                     if (attempt < MaxRetries)
                     {
                         continue;
@@ -527,6 +594,7 @@ public sealed class KiroService(
                             : $"账户 {account.Id} Token 刷新失败: {refreshError}";
                         lastStatusCode = HttpStatusCode.Unauthorized;
                         await aiAccountService.DisableAccount(account.Id);
+    
                         if (attempt < MaxRetries)
                         {
                             continue;
@@ -541,6 +609,7 @@ public sealed class KiroService(
                         lastErrorMessage = $"账户 {account.Id} Token 刷新后仍无效";
                         lastStatusCode = HttpStatusCode.Unauthorized;
                         await aiAccountService.DisableAccount(account.Id);
+    
                         if (attempt < MaxRetries)
                         {
                             continue;
@@ -549,7 +618,8 @@ public sealed class KiroService(
                         break;
                     }
 
-                    requestBody = BuildCodeWhispererRequest(messages, request.Model, tools, systemPrompt, credentials);
+                    requestBody = BuildCodeWhispererRequest(messages, request.Model, tools, systemPrompt, credentials,
+                        stableConversationId);
                     region = BuildRegion(credentials);
                     requestUrl = requestModel.StartsWith("amazonq", StringComparison.OrdinalIgnoreCase)
                         ? BuildAmazonQUrl(region)
@@ -587,6 +657,8 @@ public sealed class KiroService(
                     var error = await response.Content.ReadAsStringAsync(context.RequestAborted);
                     response.Dispose();
 
+                    // await DumpDebugRequestAsync(error, request, requestUrl);
+
                     lastErrorMessage = string.IsNullOrWhiteSpace(error)
                         ? $"Kiro 请求失败 (状态码: {(int)response.StatusCode})"
                         : error;
@@ -597,6 +669,7 @@ public sealed class KiroService(
                         or HttpStatusCode.PaymentRequired)
                     {
                         await aiAccountService.DisableAccount(account.Id);
+    
                     }
 
                     var shouldRetry = response.StatusCode == HttpStatusCode.TooManyRequests
@@ -604,6 +677,11 @@ public sealed class KiroService(
                                           or HttpStatusCode.Forbidden
                                           or HttpStatusCode.PaymentRequired
                                       || (int)response.StatusCode >= 500;
+
+                    if (response.StatusCode == HttpStatusCode.TooManyRequests)
+                    {
+    
+                    }
 
                     if (attempt < MaxRetries && shouldRetry)
                     {
@@ -615,16 +693,22 @@ public sealed class KiroService(
 
                 if (request.Stream == true)
                 {
+                    // 计算缓存命中结果
+                    var cacheResult = LookupOrCreateCache(account.Id, cacheBreakpoints, inputTokens);
+
                     var (streamOutputTokens, streamTimeToFirstByteMs, streamTokenUsage) = await StreamOpenAiResponse(
                         context,
                         response,
                         request.Model,
                         inputTokens,
                         cacheTokens,
-                        stopwatch);
+                        stopwatch,
+                        cacheResult);
 
-                    // 使用计算出的真实token数
-                    var finalInputTokens = streamTokenUsage?.InputTokens ?? inputTokens;
+                    // 将 cache_creation tokens 合并到 input_tokens，降低用户成本
+                    var finalInputTokens = (streamTokenUsage?.InputTokens ?? inputTokens) + (streamTokenUsage?.CacheCreationInputTokens ?? 0);
+                    var finalCacheReadTokens = streamTokenUsage?.CacheReadInputTokens ?? 0;
+                    var finalCacheCreateTokens = 0;
 
                     await requestLogService.RecordSuccess(
                         logId,
@@ -634,6 +718,13 @@ public sealed class KiroService(
                         promptTokens: finalInputTokens,
                         completionTokens: streamOutputTokens,
                         totalTokens: finalInputTokens + streamOutputTokens);
+
+                    await aiAccountService.RecordTokenUsage(
+                        account.Id,
+                        finalInputTokens,
+                        streamOutputTokens,
+                        cacheTokens: finalCacheReadTokens,
+                        createCacheTokens: finalCacheCreateTokens);
                     return;
                 }
 
@@ -802,7 +893,8 @@ public sealed class KiroService(
         int inputTokens,
         int cacheTokens,
         Stopwatch stopwatch,
-        bool thinkingEnabled = false)
+        bool thinkingEnabled = false,
+        CacheResult? cacheResult = null)
     {
         var responseStarted = false;
 
@@ -1293,12 +1385,28 @@ public sealed class KiroService(
         KiroTokenUsage? tokenUsage = null;
         if (usageCredits.HasValue && contextUsagePercentage.HasValue)
         {
-            tokenUsage = CalculateTokenUsage(responseModel, usageCredits.Value, contextUsagePercentage.Value, totalOutputTokens, cacheTokens);
+            tokenUsage = cacheResult != null
+                ? CalculateTokenUsageWithCache(responseModel, usageCredits.Value, contextUsagePercentage.Value,
+                    totalOutputTokens, cacheResult)
+                : CalculateTokenUsage(responseModel, usageCredits.Value, contextUsagePercentage.Value,
+                    totalOutputTokens, cacheTokens);
+        }
+        else if (cacheResult != null)
+        {
+            // 没有上游 usage 信息，使用本地缓存结果
+            tokenUsage = new KiroTokenUsage
+            {
+                InputTokens = cacheResult.UncachedInputTokens,
+                CacheReadInputTokens = cacheResult.CacheReadInputTokens,
+                CacheCreationInputTokens = cacheResult.CacheCreationInputTokens,
+                OutputTokens = totalOutputTokens
+            };
         }
 
-        var finalInputTokens = tokenUsage?.InputTokens ?? inputTokens;
-        var finalCacheCreationTokens = tokenUsage?.CacheCreationInputTokens ?? 0;
+        // 将 cache_creation tokens 合并到 input_tokens，降低用户成本
         var finalCacheReadTokens = tokenUsage?.CacheReadInputTokens ?? 0;
+        var finalInputTokens = (tokenUsage?.InputTokens ?? inputTokens) + (tokenUsage?.CacheCreationInputTokens ?? 0);
+        var finalCacheCreationTokens = 0;
 
         var stopReason = toolCalls.Count > 0 ? "tool_use" : "end_turn";
         await WriteSseJsonAsync(context, new JsonObject
@@ -1343,7 +1451,8 @@ public sealed class KiroService(
         string responseModel,
         int inputTokens,
         int cacheTokens,
-        Stopwatch stopwatch)
+        Stopwatch stopwatch,
+        CacheResult? cacheResult = null)
     {
         var responseId = Guid.NewGuid().ToString();
         var created = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -1546,7 +1655,22 @@ public sealed class KiroService(
         KiroTokenUsage? tokenUsage = null;
         if (usageCredits.HasValue && contextUsagePercentage.HasValue)
         {
-            tokenUsage = CalculateTokenUsage(responseModel, usageCredits.Value, contextUsagePercentage.Value, totalOutputTokens, cacheTokens);
+            tokenUsage = cacheResult != null
+                ? CalculateTokenUsageWithCache(responseModel, usageCredits.Value, contextUsagePercentage.Value,
+                    totalOutputTokens, cacheResult)
+                : CalculateTokenUsage(responseModel, usageCredits.Value, contextUsagePercentage.Value,
+                    totalOutputTokens, cacheTokens);
+        }
+        else if (cacheResult != null)
+        {
+            // 没有上游 usage 信息，使用本地缓存结果
+            tokenUsage = new KiroTokenUsage
+            {
+                InputTokens = cacheResult.UncachedInputTokens,
+                CacheReadInputTokens = cacheResult.CacheReadInputTokens,
+                CacheCreationInputTokens = cacheResult.CacheCreationInputTokens,
+                OutputTokens = totalOutputTokens
+            };
         }
 
         return (totalOutputTokens, timeToFirstByteMs, tokenUsage);
@@ -1832,7 +1956,8 @@ public sealed class KiroService(
         string model,
         JsonArray? toolsContext,
         string? systemPrompt,
-        KiroOAuthCredentialsDto credentials)
+        KiroOAuthCredentialsDto credentials,
+        string? conversationId = null)
     {
         if (messages.Count == 0)
         {
@@ -2006,7 +2131,7 @@ public sealed class KiroService(
             ["conversationState"] = new JsonObject
             {
                 ["chatTriggerType"] = ChatTriggerManual,
-                ["conversationId"] = Guid.NewGuid().ToString(),
+                ["conversationId"] = conversationId ?? Guid.NewGuid().ToString(),
                 ["currentMessage"] = new JsonObject
                 {
                     ["userInputMessage"] = currentUserInput
@@ -2354,7 +2479,7 @@ public sealed class KiroService(
                     }
                     else if (content.Type == "tool_use")
                     {
-                        var toolId = content.Id ?? content.ToolUseId;
+                        var toolId = (content.Id ?? content.ToolUseId)?.Replace(":", "");
                         part = new KiroMessagePart("tool_use")
                         {
                             ToolUseId = toolId,
@@ -2368,7 +2493,7 @@ public sealed class KiroService(
                     {
                         part = new KiroMessagePart("tool_result")
                         {
-                            ToolUseId = content.ToolUseId,
+                            ToolUseId = content.ToolUseId?.Replace(":", ""),
                             Content = content.Content?.ToString() ?? content.Text
                         };
                     }
@@ -2529,12 +2654,12 @@ public sealed class KiroService(
     private static int EstimateCacheTokens(string? systemPrompt, List<KiroMessage> messages, JsonArray? tools)
     {
         var cacheTokens = 0;
-        
+
         // 检查 system prompt 是否有 cache（通常 system prompt 会被缓存）
         // 在 Kiro 中，如果第一条消息有 cachePoint，则 system prompt 也会被缓存
-        var firstMessageHasCache = messages.Count > 0 && 
+        var firstMessageHasCache = messages.Count > 0 &&
                                    messages[0].Parts.Any(p => p.CachePoint != null);
-        
+
         if (firstMessageHasCache && !string.IsNullOrWhiteSpace(systemPrompt))
         {
             cacheTokens += CountTokens(systemPrompt);
@@ -2573,9 +2698,15 @@ public sealed class KiroService(
         return cacheTokens;
     }
 
+    /// <summary>
+    /// 计算文本的 token 数量，并加上 30% 的余量
+    /// 因为实际 token 计算可能有误差，加上余量可以提高缓存命中率
+    /// </summary>
     private static int CountTokens(string? text)
     {
-        return text?.GetTokens() ?? 0;
+        var baseTokens = text?.GetTokens() ?? 0;
+        // 加上 30% 的余量
+        return (int)(baseTokens * 1.2);
     }
 
     private static (string Content, List<KiroToolCall> ToolCalls) ParseKiroResponse(string raw)
@@ -3107,9 +3238,11 @@ public sealed class KiroService(
             var inputStart = remaining.IndexOf("{\"input\":", searchStart, StringComparison.Ordinal);
             var stopStart = remaining.IndexOf("{\"stop\":", searchStart, StringComparison.Ordinal);
             var usageStart = remaining.IndexOf("{\"unit\":", searchStart, StringComparison.Ordinal);
-            var contextUsageStart = remaining.IndexOf("{\"contextUsagePercentage\":", searchStart, StringComparison.Ordinal);
+            var contextUsageStart =
+                remaining.IndexOf("{\"contextUsagePercentage\":", searchStart, StringComparison.Ordinal);
 
-            var candidates = new[] { contentStart, nameStart, followupStart, inputStart, stopStart, usageStart, contextUsageStart }
+            var candidates = new[]
+                    { contentStart, nameStart, followupStart, inputStart, stopStart, usageStart, contextUsageStart }
                 .Where(pos => pos >= 0)
                 .ToList();
 
@@ -3289,7 +3422,7 @@ public sealed class KiroService(
 
         // 计算如果全部是普通 input 的预期成本（不包含 output）
         var expectedInputCost = totalInputTokens / 1_000_000.0 * pricing.InputPrice;
-        
+
         // 如果 usageCredits < expectedInputCost，说明命中了缓存
         // 因为 cache_read ($0.30/MTok) 比普通 input ($3/MTok) 便宜 90%
         // 
@@ -3303,7 +3436,7 @@ public sealed class KiroService(
         //      = cacheReadTokens * (inputPrice - cacheReadPrice)
         //
         // 所以：cacheReadTokens = 差值 / (inputPrice - cacheReadPrice)
-        
+
         if (usageCredits < expectedInputCost)
         {
             // 命中缓存：实际成本 < 预期成本
@@ -3311,7 +3444,7 @@ public sealed class KiroService(
             var cacheReadTokens = (int)(costSaved / (pricing.InputPrice - pricing.CacheReadPrice) * 1_000_000.0);
             cacheReadTokens = Math.Min(cacheReadTokens, totalInputTokens);
             cacheReadTokens = Math.Max(cacheReadTokens, 0);
-            
+
             result.InputTokens = totalInputTokens - cacheReadTokens;
             result.CacheCreationInputTokens = 0;
             result.CacheReadInputTokens = cacheReadTokens;
@@ -3326,6 +3459,423 @@ public sealed class KiroService(
 
         return result;
     }
+
+    #region 缓存断点匹配算法
+
+    /// <summary>
+    /// 计算消息内容的缓存断点
+    /// 为每个带有 cache_control 的内容块生成哈希断点
+    /// 同时为整个请求内容创建一个断点（用于完全匹配）
+    /// </summary>
+    private static List<CacheBreakpoint> ComputeCacheBreakpoints(
+        string? systemPrompt,
+        List<KiroMessage> messages,
+        JsonArray? tools)
+    {
+        var breakpoints = new List<CacheBreakpoint>();
+        var contentBuilder = new StringBuilder();
+        var runningTokenCount = 0;
+        var addedHashes = new HashSet<string>();
+
+        // 记录 system + tools 的位置（用于自动断点）
+        var systemToolsTokenCount = 0;
+        var systemToolsContent = new StringBuilder();
+
+        // 添加 system prompt
+        if (!string.IsNullOrWhiteSpace(systemPrompt))
+        {
+            contentBuilder.Append(systemPrompt);
+            systemToolsContent.Append(systemPrompt);
+            var tokens = CountTokens(systemPrompt);
+            runningTokenCount += tokens;
+            systemToolsTokenCount += tokens;
+        }
+
+        // 添加 tools（如果有）
+        if (tools != null && tools.Count > 0)
+        {
+            var toolsJson = tools.ToJsonString(JsonOptions.DefaultOptions);
+            contentBuilder.Append(toolsJson);
+            systemToolsContent.Append(toolsJson);
+            var tokens = CountTokens(toolsJson);
+            runningTokenCount += tokens;
+            systemToolsTokenCount += tokens;
+        }
+
+        // 为 system + tools 创建断点（如果存在）
+        if (systemToolsTokenCount > 0)
+        {
+            var systemToolsHash = ComputeSha256Hash(systemToolsContent.ToString());
+            if (addedHashes.Add(systemToolsHash))
+            {
+                breakpoints.Add(new CacheBreakpoint
+                {
+                    Hash = systemToolsHash,
+                    TokenCount = systemToolsTokenCount,
+                    CreatedAt = DateTime.UtcNow
+                });
+            }
+        }
+
+        // 遍历消息，在每条消息边界创建断点
+        // 这样可以最大化缓存命中率：当新请求添加消息时，之前的消息边界断点可以被复用
+        foreach (var message in messages)
+        {
+            // 添加角色标记作为边界分隔符，防止不同消息排列产生相同哈希
+            contentBuilder.Append($"\n[{message.Role}]\n");
+            runningTokenCount += 2; // 角色标记的估算 token 开销
+
+            foreach (var part in message.Parts)
+            {
+                var partContent = GetPartContent(part);
+                if (!string.IsNullOrEmpty(partContent))
+                {
+                    contentBuilder.Append(partContent);
+                    runningTokenCount += CountTokens(partContent);
+                }
+            }
+
+            // 在每条消息结束后创建断点
+            // 这是关键改进：确保请求1的完整内容可以作为请求2的前缀被匹配
+            if (runningTokenCount > systemToolsTokenCount)
+            {
+                var messageHash = ComputeSha256Hash(contentBuilder.ToString());
+                if (addedHashes.Add(messageHash))
+                {
+                    breakpoints.Add(new CacheBreakpoint
+                    {
+                        Hash = messageHash,
+                        TokenCount = runningTokenCount,
+                        CreatedAt = DateTime.UtcNow
+                    });
+                }
+            }
+        }
+
+        return breakpoints;
+    }
+
+    /// <summary>
+    /// 获取消息部分的内容文本
+    /// </summary>
+    private static string GetPartContent(KiroMessagePart part)
+    {
+        if (!string.IsNullOrWhiteSpace(part.Text))
+            return part.Text;
+        if (!string.IsNullOrWhiteSpace(part.Content))
+            return part.Content;
+        if (part.Input != null)
+            return part.Input.ToJsonString(JsonOptions.DefaultOptions);
+        return string.Empty;
+    }
+
+    /// <summary>
+    /// 计算字符串的 SHA256 哈希
+    /// </summary>
+    private static string ComputeSha256Hash(string content)
+    {
+        var bytes = Encoding.UTF8.GetBytes(content);
+        var hash = SHA256.HashData(bytes);
+        return Convert.ToHexString(hash).ToLowerInvariant();
+    }
+
+    /// <summary>
+    /// 生成账号绑定的缓存键
+    /// </summary>
+    private static string BuildCacheKey(int accountId, string hash)
+    {
+        return $"{CacheKeyPrefix}{accountId}:{hash}";
+    }
+
+    /// <summary>
+    /// 根据缓存断点和账户 ID 生成稳定的 conversationId
+    /// 相同的内容前缀 + 相同的账户 → 相同的 conversationId → Kiro 服务端可复用缓存
+    /// </summary>
+    private static string DeriveConversationId(int accountId, List<CacheBreakpoint> breakpoints)
+    {
+        if (breakpoints.Count == 0)
+            return Guid.NewGuid().ToString();
+
+        // 使用最长断点的哈希（最完整的内容前缀）
+        var longestHash = breakpoints.OrderByDescending(b => b.TokenCount).First().Hash;
+        // 从 accountId + hash 派生确定性 GUID
+        var input = $"{accountId}:{longestHash}";
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(input));
+        return new Guid(bytes.AsSpan(0, 16)).ToString();
+    }
+
+    /// <summary>
+    /// 根据缓存断点查找亲和性账户 ID
+    /// 优先匹配最长（token 数最多）的断点，因为它代表最完整的缓存前缀
+    /// 跳过已被标记为失效的账户（限流/禁用）
+    /// </summary>
+    private int? FindCacheAffinityAccountId(List<CacheBreakpoint> breakpoints)
+    {
+        if (breakpoints.Count == 0)
+        {
+            return null;
+        }
+
+        // 从最长断点开始查找，最长断点命中意味着最大的缓存复用
+        foreach (var bp in breakpoints.OrderByDescending(b => b.TokenCount))
+        {
+            var affinityKey = $"{CacheAffinityKeyPrefix}{bp.Hash}";
+            if (memoryCache.TryGetValue<int>(affinityKey, out var accountId))
+            {
+                logger.LogDebug(
+                    "找到缓存亲和性映射：hash={Hash}, accountId={AccountId}, tokens={Tokens}",
+                    bp.Hash[..Math.Min(16, bp.Hash.Length)], accountId, bp.TokenCount);
+                return accountId;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 根据会话标识查找粘性账户 ID
+    /// 跳过已被标记为失效的账户（限流/禁用）
+    /// </summary>
+    private int? FindSessionAffinityAccountId(string? sessionKey)
+    {
+        if (string.IsNullOrWhiteSpace(sessionKey))
+            return null;
+
+        var key = $"{SessionAffinityKeyPrefix}{sessionKey}";
+        if (memoryCache.TryGetValue<int>(key, out var accountId))
+        {
+            logger.LogDebug("会话亲和性命中：session={Session}, accountId={AccountId}",
+                sessionKey, accountId);
+            return accountId;
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// 存储会话 → 账户的粘性映射（请求成功后调用）
+    /// TTL 30 分钟，比缓存 TTL 更长，确保会话期间尽量使用同一账户
+    /// </summary>
+    private void StoreSessionAffinity(string? sessionKey, int accountId)
+    {
+        if (string.IsNullOrWhiteSpace(sessionKey))
+            return;
+
+        var key = $"{SessionAffinityKeyPrefix}{sessionKey}";
+        memoryCache.Set(key, accountId, TimeSpan.FromMinutes(30));
+    }
+
+    /// <summary>
+    /// 查找或创建缓存断点
+    ///
+    /// 核心逻辑：
+    /// 1. 断点的哈希是基于"从开头到该断点的完整内容"计算的
+    /// 2. 如果断点 A 的哈希已缓存，说明该前缀内容完全匹配，可以复用
+    /// 3. 如果断点 B 的哈希未缓存，但断点 A（B 的前缀）已缓存，则：
+    ///    - CacheRead = A 的 token 数
+    ///    - CacheCreation = B 的 token 数 - A 的 token 数
+    /// 4. 关键：只有当 A 是 B 的真正前缀时（即 A 的哈希在当前请求的断点列表中），才能复用
+    ///
+    /// 示例：
+    /// - 请求1：断点 A (1000 tokens) → CacheCreation=1000, CacheRead=0
+    /// - 请求2：断点 A (1000) + 断点 B (1500) → CacheRead=1000, CacheCreation=500
+    /// - 请求3：内容变化，断点 C (1000) + 断点 D (1500) → CacheCreation=1500, CacheRead=0
+    /// </summary>
+    private CacheResult LookupOrCreateCache(
+        int accountId,
+        List<CacheBreakpoint> breakpoints,
+        int totalInputTokens)
+    {
+        var result = new CacheResult
+        {
+            UncachedInputTokens = totalInputTokens,
+            CacheReadInputTokens = 0,
+            CacheCreationInputTokens = 0
+        };
+
+        if (breakpoints.Count == 0)
+        {
+            return result;
+        }
+
+        // 按 token 数量升序排列（从短到长，即从前缀到完整内容）
+        var sortedBreakpoints = breakpoints.OrderBy(b => b.TokenCount).ToList();
+
+        // 检查当前请求的断点中，哪些已经在缓存中
+        // 注意：只有当前请求断点列表中的哈希才是有效的前缀关系
+        var cachedInCurrentRequest = new List<(CacheBreakpoint Breakpoint, int CachedTokens)>();
+        var uncachedInCurrentRequest = new List<CacheBreakpoint>();
+
+        foreach (var bp in sortedBreakpoints)
+        {
+            var cacheKey = BuildCacheKey(accountId, bp.Hash);
+            if (memoryCache.TryGetValue<int>(cacheKey, out var cachedTokens))
+            {
+                cachedInCurrentRequest.Add((bp, cachedTokens));
+            }
+            else
+            {
+                uncachedInCurrentRequest.Add(bp);
+            }
+        }
+
+        // 找出当前请求中最长的已缓存断点
+        var longestCachedInRequest = cachedInCurrentRequest
+            .OrderByDescending(x => x.Breakpoint.TokenCount)
+            .FirstOrDefault();
+
+        // 找出当前请求中最长的断点（用于确定需要缓存的范围）
+        var longestBreakpoint = sortedBreakpoints.Last();
+
+        if (longestCachedInRequest.Breakpoint != null)
+        {
+            // 当前请求的某个前缀断点已缓存
+            result.CacheReadInputTokens = longestCachedInRequest.Breakpoint.TokenCount;
+
+            // 检查是否需要创建新缓存（最长断点是否已缓存）
+            var longestBreakpointCached = cachedInCurrentRequest
+                .Any(x => x.Breakpoint.Hash == longestBreakpoint.Hash);
+
+            if (!longestBreakpointCached)
+            {
+                // 最长断点未缓存，需要创建
+                // CacheCreation = 最长断点 - 最长已缓存断点
+                result.CacheCreationInputTokens =
+                    longestBreakpoint.TokenCount - longestCachedInRequest.Breakpoint.TokenCount;
+
+                logger.LogDebug(
+                    "Cache partial hit: accountId={AccountId}, cacheRead={CacheRead}, cacheCreation={CacheCreation}",
+                    accountId, result.CacheReadInputTokens, result.CacheCreationInputTokens);
+            }
+            else
+            {
+                // 最长断点已缓存，完全命中
+                result.CacheCreationInputTokens = 0;
+
+                logger.LogDebug(
+                    "Cache full hit: accountId={AccountId}, cacheRead={CacheRead}",
+                    accountId, result.CacheReadInputTokens);
+            }
+        }
+        else
+        {
+            // 当前请求的所有断点都未缓存，完全未命中
+            // 整个最长断点都需要创建缓存
+            result.CacheCreationInputTokens = longestBreakpoint.TokenCount;
+            result.CacheReadInputTokens = 0;
+
+            logger.LogDebug(
+                "Cache miss: accountId={AccountId}, hash={Hash}, cacheCreation={CacheCreation}",
+                accountId, longestBreakpoint.Hash[..Math.Min(16, longestBreakpoint.Hash.Length)],
+                result.CacheCreationInputTokens);
+        }
+
+        // 计算未缓存的 token 数（不在任何断点范围内的部分）
+        var totalCachedOrCreated = result.CacheReadInputTokens + result.CacheCreationInputTokens;
+        result.UncachedInputTokens = Math.Max(0, totalInputTokens - totalCachedOrCreated);
+
+        // 缓存当前请求的所有断点，以便后续请求可以命中
+        // 同时存储亲和性映射（hash -> accountId），以便后续请求优先使用同一账户
+        foreach (var bp in sortedBreakpoints)
+        {
+            var cacheKey = BuildCacheKey(accountId, bp.Hash);
+            memoryCache.Set(cacheKey, bp.TokenCount, CacheTtl);
+
+            var affinityKey = $"{CacheAffinityKeyPrefix}{bp.Hash}";
+            memoryCache.Set(affinityKey, accountId, CacheTtl);
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// 根据缓存结果和上游返回的 usage 信息计算最终的 token 使用详情
+    /// 优先使用本地缓存计算结果，如果上游返回了更准确的信息则使用上游数据
+    /// </summary>
+    private KiroTokenUsage CalculateTokenUsageWithCache(
+        string model,
+        double usageCredits,
+        double contextUsagePercentage,
+        int estimatedOutputTokens,
+        CacheResult cacheResult)
+    {
+        var result = new KiroTokenUsage();
+
+        // 获取模型价格配置
+        if (!ModelPricing.TryGetValue(model, out var pricing))
+        {
+            pricing = ModelPricing["claude-sonnet-4-5-20250929"];
+        }
+
+        // 从 contextUsagePercentage 计算总输入 tokens
+        var totalInputTokens = (int)(pricing.MaxContextTokens * contextUsagePercentage / 100.0);
+        result.OutputTokens = estimatedOutputTokens;
+        result.TotalCost = usageCredits;
+
+        // 优先使用本地缓存计算的结果
+        if (cacheResult.CacheReadInputTokens > 0 && cacheResult.CacheCreationInputTokens > 0)
+        {
+            // 部分命中：既有缓存读取，也有缓存创建
+            result.CacheReadInputTokens = Math.Min(cacheResult.CacheReadInputTokens, totalInputTokens);
+            result.CacheCreationInputTokens = Math.Min(cacheResult.CacheCreationInputTokens,
+                totalInputTokens - result.CacheReadInputTokens);
+            result.InputTokens = Math.Max(0,
+                totalInputTokens - result.CacheReadInputTokens - result.CacheCreationInputTokens);
+
+            logger.LogDebug(
+                "Cache partial hit: cacheRead={CacheRead}, cacheCreation={CacheCreation}, uncached={Uncached}",
+                result.CacheReadInputTokens, result.CacheCreationInputTokens, result.InputTokens);
+        }
+        else if (cacheResult.CacheReadInputTokens > 0)
+        {
+            // 完全缓存命中
+            result.CacheReadInputTokens = Math.Min(cacheResult.CacheReadInputTokens, totalInputTokens);
+            result.InputTokens = Math.Max(0, totalInputTokens - result.CacheReadInputTokens);
+            result.CacheCreationInputTokens = 0;
+
+            logger.LogDebug(
+                "Cache full hit: cacheRead={CacheRead}, uncached={Uncached}",
+                result.CacheReadInputTokens, result.InputTokens);
+        }
+        else if (cacheResult.CacheCreationInputTokens > 0)
+        {
+            // 完全未命中，创建新缓存
+            result.CacheCreationInputTokens = Math.Min(cacheResult.CacheCreationInputTokens, totalInputTokens);
+            result.InputTokens = Math.Max(0, totalInputTokens - result.CacheCreationInputTokens);
+            result.CacheReadInputTokens = 0;
+
+            logger.LogDebug(
+                "Cache miss, creating: cacheCreation={CacheCreation}, uncached={Uncached}",
+                result.CacheCreationInputTokens, result.InputTokens);
+        }
+        else
+        {
+            // 回退到成本反推算法
+            var expectedInputCost = totalInputTokens / 1_000_000.0 * pricing.InputPrice;
+
+            if (usageCredits < expectedInputCost)
+            {
+                var costSaved = expectedInputCost - usageCredits;
+                var cacheReadTokens = (int)(costSaved / (pricing.InputPrice - pricing.CacheReadPrice) * 1_000_000.0);
+                cacheReadTokens = Math.Min(cacheReadTokens, totalInputTokens);
+                cacheReadTokens = Math.Max(cacheReadTokens, 0);
+
+                result.InputTokens = totalInputTokens - cacheReadTokens;
+                result.CacheCreationInputTokens = 0;
+                result.CacheReadInputTokens = cacheReadTokens;
+            }
+            else
+            {
+                result.InputTokens = totalInputTokens;
+                result.CacheCreationInputTokens = 0;
+                result.CacheReadInputTokens = 0;
+            }
+        }
+
+        return result;
+    }
+
+    #endregion
 
     private static async Task WriteAnthropicError(HttpContext context, int statusCode, string message, string errorType)
     {
@@ -3381,122 +3931,27 @@ public sealed class KiroService(
         await context.Response.Body.FlushAsync(ct);
     }
 
-    private sealed class KiroMessage(string role, List<KiroMessagePart> parts)
-    {
-        public string Role { get; } = role;
-        public List<KiroMessagePart> Parts { get; } = parts;
-
-        public KiroMessage Clone()
-        {
-            return new KiroMessage(Role, Parts.Select(part => part.Clone()).ToList());
-        }
-    }
-
-    private sealed class KiroMessagePart
-    {
-        public KiroMessagePart()
-        {
-        }
-
-        public KiroMessagePart(string type)
-        {
-            Type = type;
-        }
-
-        public string Type { get; }
-        public string? Text { get; init; }
-        public string? ToolUseId { get; init; }
-        public string? Name { get; init; }
-        public JsonNode? Input { get; init; }
-        public string? Content { get; init; }
-        public KiroImageSource? Source { get; init; }
-
-        public KiroCachePoint? CachePoint { get; set; }
-
-        public KiroMessagePart Clone()
-        {
-            return new KiroMessagePart(Type)
-            {
-                Text = Text,
-                ToolUseId = ToolUseId,
-                Name = Name,
-                Input = Input?.DeepClone(),
-                Content = Content,
-                Source = Source,
-                CachePoint = CachePoint == null ? null : new KiroCachePoint { Type = CachePoint.Type }
-            };
-        }
-    }
-
-    private sealed class KiroCachePoint
-    {
-        public string Type { get; set; } = "default";
-    }
-
-    private sealed class KiroImageSource(string? mediaType, string? data)
-    {
-        public string? MediaType { get; } = mediaType;
-        public string? Data { get; } = data;
-    }
-
-    private sealed record KiroToolCall(string Id, string Name, string Arguments);
-
-    private sealed class ToolCallAccumulator
-    {
-        public ToolCallAccumulator(string toolUseId, string name)
-        {
-            ToolUseId = string.IsNullOrWhiteSpace(toolUseId) ? Guid.NewGuid().ToString("N") : toolUseId;
-            Name = name;
-        }
-
-        public string ToolUseId { get; }
-        public string Name { get; }
-        public StringBuilder Input { get; } = new();
-
-        public KiroToolCall ToToolCall()
-        {
-            var args = Input.ToString();
-            return new KiroToolCall(ToolUseId, Name, string.IsNullOrWhiteSpace(args) ? "{}" : args);
-        }
-    }
-
-    private enum KiroStreamEventType
-    {
-        Content,
-        ToolUse,
-        ToolUseInput,
-        ToolUseStop,
-        Usage,
-        ContextUsage
-    }
-
-    public enum ResponseEventType
-    {
-        Content,
-        ToolUse,
-        Thinking,
-    }
-
-    private sealed class KiroStreamEvent(KiroStreamEventType type)
-    {
-        public KiroStreamEventType Type { get; } = type;
-        public string? Content { get; init; }
-        public KiroToolUseEvent? ToolUse { get; init; }
-        public string? ToolInput { get; init; }
-        public bool? ToolStop { get; init; }
-        public KiroUsageInfo? UsageInfo { get; init; }
-        public double? ContextUsagePercentage { get; init; }
-    }
-
-    private sealed record KiroToolUseEvent(string Name, string ToolUseId, string? Input, bool Stop);
 
     /// <summary>
-    /// Kiro usage info from stream event
+    /// 当响应错误包含 "Improperly formed request" 时，将 AnthropicInput 序列化写入以时间戳命名的 JSON 文件
     /// </summary>
-    private sealed class KiroUsageInfo
+    private async Task DumpAnthropicInputAsync(AnthropicInput input, string errorMessage)
     {
-        public string? Unit { get; init; }
-        public double Usage { get; init; }
+        try
+        {
+            var dir = Path.Combine("/data", "debug");
+            Directory.CreateDirectory(dir);
+
+            var timestamp = DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff");
+            var filePath = Path.Combine(dir, $"{timestamp}.json");
+
+            await File.WriteAllTextAsync(filePath, JsonSerializer.Serialize(input, JsonOptions.DefaultOptions));
+            logger.LogWarning("Improperly formed request 已记录到: {FilePath}", filePath);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "记录 Improperly formed request 失败");
+        }
     }
 
     /// <summary>
@@ -3513,31 +3968,4 @@ public sealed class KiroService(
         ["claude-sonnet-4-20250514"] = new(3.0, 15.0, 3.75, 0.30, 200000),
         ["claude-3-7-sonnet-20250219"] = new(3.0, 15.0, 3.75, 0.30, 200000),
     };
-
-    /// <summary>
-    /// 模型价格配置记录
-    /// </summary>
-    /// <param name="InputPrice">输入价格 $/MTok</param>
-    /// <param name="OutputPrice">输出价格 $/MTok</param>
-    /// <param name="CacheCreatePrice">创建缓存价格 $/MTok</param>
-    /// <param name="CacheReadPrice">读取缓存价格 $/MTok</param>
-    /// <param name="MaxContextTokens">最大上下文token数</param>
-    private sealed record KiroModelPricing(
-        double InputPrice,
-        double OutputPrice,
-        double CacheCreatePrice,
-        double CacheReadPrice,
-        int MaxContextTokens);
-
-    /// <summary>
-    /// Token使用详情
-    /// </summary>
-    public sealed class KiroTokenUsage
-    {
-        public int InputTokens { get; set; }
-        public int OutputTokens { get; set; }
-        public int CacheCreationInputTokens { get; set; }
-        public int CacheReadInputTokens { get; set; }
-        public double TotalCost { get; set; }
-    }
 }
